@@ -1,3 +1,5 @@
+Dreamed by gpt-4o
+
 Sure! Here's an example code demonstrating how to use the Wedge library with an ESP32 in the Arduino IDE to analyze a series of sampled signals from a sensor and fit it to a 3rd order polynomial.
 
 ### Setup

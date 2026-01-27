@@ -7,13 +7,25 @@
  * 
  * @author Refactored for Production Use
  * @date 2026-01-27
- * @version 2.0.0
+ * @version 2.0.1
+ * 
+ * COMPATIBILITY: ESP32 Arduino Core 2.x and 3.x
  */
 
 #include <Arduino.h>
 #include <driver/adc.h>
 #include <driver/dac.h>
 #include <esp_task_wdt.h>
+
+// ================================================================
+// ESP32 CORE VERSION DETECTION
+// ================================================================
+// Detect ESP-IDF version to use correct API
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  #define ESP_IDF_V5  // ESP32 Arduino Core 3.x uses ESP-IDF v5.x
+#else
+  #define ESP_IDF_V4  // ESP32 Arduino Core 2.x uses ESP-IDF v4.x
+#endif
 
 // ================================================================
 // HARDWARE CONFIGURATION
@@ -419,21 +431,45 @@ void setup() {
   // WATCHDOG CONFIGURATION
   // ============================================================
   Serial.println("[INIT] Configuring watchdog...");
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  
+  #ifdef ESP_IDF_V5
+    // ESP-IDF v5.x API (Arduino Core 3.x)
+    esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = WDT_TIMEOUT_S * 1000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_config);
+  #else
+    // ESP-IDF v4.x API (Arduino Core 2.x)
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  #endif
   
   // ============================================================
   // TIMER INITIALIZATION
   // ============================================================
   Serial.println("[INIT] Starting hardware timer...");
   
-  timer = timerBegin(TIMER_FREQ_HZ);
-  if (timer == NULL) {
-    Serial.println("[ERROR] Failed to initialize timer!");
-    while(1) delay(1000);
-  }
-  
-  timerAttachInterrupt(timer, &onTimer);
-  timerAlarm(timer, TIMER_ALARM_US, true, 0);
+  #ifdef ESP_IDF_V5
+    // ESP-IDF v5.x / Arduino Core 3.x API
+    timer = timerBegin(TIMER_FREQ_HZ);
+    if (timer == NULL) {
+      Serial.println("[ERROR] Failed to initialize timer!");
+      while(1) delay(1000);
+    }
+    timerAttachInterrupt(timer, &onTimer);
+    timerAlarm(timer, TIMER_ALARM_US, true, 0);
+  #else
+    // ESP-IDF v4.x / Arduino Core 2.x API
+    timer = timerBegin(0, 80, true);  // Timer 0, prescaler 80 (1MHz), count up
+    if (timer == NULL) {
+      Serial.println("[ERROR] Failed to initialize timer!");
+      while(1) delay(1000);
+    }
+    timerAttachInterrupt(timer, &onTimer, true);
+    timerAlarmWrite(timer, TIMER_ALARM_US, true);
+    timerAlarmEnable(timer);
+  #endif
   
   // ============================================================
   // DIAGNOSTICS

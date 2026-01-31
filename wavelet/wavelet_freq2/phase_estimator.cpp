@@ -3,12 +3,11 @@
 
 PhaseEstimator::PhaseEstimator() 
   : history_buffers(nullptr),
-    correlation_buffer(nullptr),
-    residual_buffer(nullptr),
     history_count(0),
     history_write_idx(0),
     current_state(PE_INITIALIZING),
     last_phase_shift(0.0f),
+    cache_count(0),
     expected_next_shift(0.0f),
     correction_cooldown(0),
     correction_was_applied(false),
@@ -17,7 +16,11 @@ PhaseEstimator::PhaseEstimator()
     buffer_time_interval(0.0f),
     last_freq_estimate(50.0f),
     samples_per_cycle(128),
+    correlation_buffer(nullptr),
+    residual_buffer(nullptr),
     initialized(false) {
+  memset(&config, 0, sizeof(config));
+  memset(phase_trend_cache, 0, sizeof(phase_trend_cache));
 }
 
 PhaseEstimator::~PhaseEstimator() {
@@ -77,6 +80,8 @@ void PhaseEstimator::reset() {
   history_write_idx = 0;
   current_state = PE_INITIALIZING;
   last_phase_shift = 0.0f;
+  cache_count = 0;
+  memset(phase_trend_cache, 0, sizeof(phase_trend_cache));
   expected_next_shift = 0.0f;
   correction_cooldown = 0;
   correction_was_applied = false;
@@ -174,8 +179,10 @@ float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint1
   }
   
   // Convert offset to phase (radians)
-  // Positive offset means target is ahead of reference
-  float phase_rad = (2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
+  // Positive phase means target signal leads the reference (happened earlier)
+  // We use negative here because a positive best_offset means target reached
+  // the value LATER than reference in the buffer (larger index).
+  float phase_rad = -(2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
   
   // Normalize to [-π, π]
   while (phase_rad > M_PI) phase_rad -= 2.0f * M_PI;
@@ -323,7 +330,7 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
     const uint16_t* target = get_history_buffer(hist_idx);
     
     // Compute raw phase shift: how much target leads/lags reference
-    // Positive = target is ahead, negative = target is behind
+    // Positive = target leads (happened earlier), negative = target lags
     float raw_phase = compute_phase_shift(reference, target);
     
     // Accumulate phase - this represents total phase drift over time
@@ -354,12 +361,19 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
   result.recent_phase_shift = (valid_count >= 2) ? 
     (result.phase_trend[valid_count - 1] - result.phase_trend[valid_count - 2]) : 0.0f;
   
+  // Cache the trend for frequency estimation
+  cache_count = valid_count;
+  for (uint8_t i = 0; i < valid_count; i++) {
+    phase_trend_cache[i] = result.phase_trend[i];
+  }
+
   // Analyze trend and update state machine
   analyze_trend(result);
   
   // Add frequency estimation if parameters are set
   if (buffer_time_interval > 0.0f) {
     FrequencyEstResult freq_result;
+    // Pass the phase result so it can use the trend data
     if (estimate_frequency(freq_result)) {
       result.estimated_frequency = freq_result.frequency_hz;
       result.estimated_frequency_error = freq_result.frequency_error_hz;
@@ -371,46 +385,27 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
 }
 
 bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
-  if (!initialized || history_count < 4 || buffer_time_interval <= 0.0f) {
-    result.valid = false;
-    return false;
-  }
-  
-  // Clear result
+  // Clear result first to avoid garbage values
   memset(&result, 0, sizeof(result));
   result.frequency_hz = nominal_frequency;
   result.valid = false;
+
+  if (!initialized || cache_count < 4 || buffer_time_interval <= 0.0f) {
+    return false;
+  }
   
   // Use recent phase trend to estimate frequency
   // We'll use the last 5-8 samples for good balance between responsiveness and stability
-  uint8_t trend_length = (history_count - 1 < 8) ? (history_count - 1) : 8;
-  if (trend_length < 4) {
-    return false; // Need at least 4 points
-  }
+  uint8_t trend_length = (cache_count < 8) ? cache_count : 8;
   
-  uint8_t start_idx = (history_count - 1) - trend_length;
-  
-  // Fit linear model to recent phase trend
+  // Fit linear model to recent phase trend subset
   // This gives us phase drift rate in rad/buffer
   float slope, intercept;
-  float phase_subset[8];
+  uint8_t start_idx = cache_count - trend_length;
   
-  for (uint8_t i = 0; i < trend_length; i++) {
-    phase_subset[i] = 0.0f; // Will be filled from actual trend
-  }
+  fit_linear_drift(&phase_trend_cache[start_idx], trend_length, slope, intercept);
   
-  // We need to use the actual stored phase trend, not recompute
-  // The slope from the full trend analysis is already available
-  // But let's compute for the recent window for better responsiveness
-  
-  // Actually, let's just use the linear_drift_rate that was already computed
-  // and stored in the PhaseEstResult by analyze_trend
-  
-  // For frequency estimation, use the phase drift rate
-  // phase_drift (rad/buffer) = 2π × freq_error × buffer_interval
-  // freq_error = phase_drift / (2π × buffer_interval)
-  
-  float phase_drift_per_buffer = last_phase_shift;
+  float phase_drift_per_buffer = slope;
   
   // Convert to frequency error
   float freq_error_hz = phase_drift_per_buffer / (2.0f * M_PI * buffer_time_interval);

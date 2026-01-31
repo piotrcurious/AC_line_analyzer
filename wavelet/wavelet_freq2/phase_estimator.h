@@ -64,6 +64,8 @@ private:
   // State tracking
   PhaseEstState current_state;
   float last_phase_shift;
+  float phase_trend_cache[PE_HISTORY_DEPTH];
+  uint8_t cache_count;
   float expected_next_shift; // Based on linear model
   uint32_t correction_cooldown; // Frames to wait after correction
   bool correction_was_applied;  // Tracks if we applied a correction

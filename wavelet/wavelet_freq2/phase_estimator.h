@@ -112,7 +112,8 @@ public:
   bool begin(const PhaseEstConfig* cfg = nullptr);
   
   // Set nominal frequency and timing parameters for frequency estimation
-  void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle);
+  // strobe_div_cycles is the number of nominal cycles captured between buffers (e.g. 4.0)
+  void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles = 0.0f);
   
   // Add a new frame to history
   void add_frame(const uint16_t* buffer, uint16_t size);

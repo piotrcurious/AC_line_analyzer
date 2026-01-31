@@ -40,7 +40,8 @@ void apply_phase_rad(float rad){
   double cyc = (rad / (2.0 * M_PI)) * cycles_per_grid; // desired shift in cycles
   // clamp to +/- one grid period to avoid runaway
   int32_t maxc = (int32_t)(cycles_per_grid);
-  sys.phase_pending = clamp_i32((int32_t)lrint(cyc), -maxc, maxc);
+  // Negative because advancing phase means capturing EARLIER (smaller cycle count)
+  sys.phase_pending = -clamp_i32((int32_t)lrint(cyc), -maxc, maxc);
 }
 
 void apply_phase_deg(float deg){ apply_phase_rad(deg * (M_PI/180.0f)); }
@@ -53,7 +54,7 @@ void tune_pll(float f){
 
   // Update phase estimator with new interval for accurate tracking
   float interval_s = (float)sys.cycles_per_strobe / sys.cpu_hz;
-  phase_est.set_frequency_params(NOMINAL_FREQ, interval_s, SAMPLES_PER_CYCLE);
+  phase_est.set_frequency_params(NOMINAL_FREQ, interval_s, SAMPLES_PER_CYCLE, STROBE_DIV);
 }
 
 const char* state_to_string(PhaseEstState state) {
@@ -88,9 +89,9 @@ void setup(){
     Serial.println("Phase estimator initialized successfully");
     
     // Set frequency estimation parameters
-    // Buffer interval = STROBE_DIV / frequency (time for 3 cycles)
+    // Buffer interval = STROBE_DIV / frequency
     float buffer_interval_s = STROBE_DIV / NOMINAL_FREQ;
-    phase_est.set_frequency_params(NOMINAL_FREQ, buffer_interval_s, SAMPLES_PER_CYCLE);
+    phase_est.set_frequency_params(NOMINAL_FREQ, buffer_interval_s, SAMPLES_PER_CYCLE, STROBE_DIV);
     
     Serial.printf("Frequency estimation configured: %.3f Hz nominal, %.4f s/buffer\n",
                  NOMINAL_FREQ, buffer_interval_s);
@@ -201,7 +202,8 @@ void loop(){
     
     // === APPLY PHASE CORRECTION ===
     if (phase_gain > 0.0f && fabs(pe_result.linear_drift_rate) > 1e-6f) {
-      float phase_corr = -pe_result.linear_drift_rate * phase_gain;
+      // Correct in direction of detected drift to align phase
+      float phase_corr = pe_result.linear_drift_rate * phase_gain;
       
       if (fabs(phase_corr) > 1e-6f) {
         apply_phase_rad(phase_corr);

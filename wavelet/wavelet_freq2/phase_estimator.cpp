@@ -94,12 +94,17 @@ void PhaseEstimator::reset() {
   last_freq_estimate = nominal_frequency;
 }
 
-void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle) {
+void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles) {
   nominal_frequency = nominal_hz;
   buffer_time_interval = buffer_interval_s;
   samples_per_cycle = samps_per_cycle;
   last_freq_estimate = nominal_hz;
-  strobe_cycles = nominal_hz * buffer_interval_s;
+  // If strobe_div_cycles is not provided, estimate from interval
+  if (strobe_div_cycles <= 0.0f) {
+    strobe_cycles = nominal_hz * buffer_interval_s;
+  } else {
+    strobe_cycles = strobe_div_cycles;
+  }
 }
 
 void PhaseEstimator::notify_correction_applied(float correction_rad) {
@@ -115,10 +120,11 @@ void PhaseEstimator::add_frame(const uint16_t* buffer, uint16_t size) {
   uint16_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
   if (size != buf_size) return; // Size mismatch
   
-  // Integrate frequency error since last frame (only if we have an interval)
+  // Integrate phase error between nominal clock and PLL sampling clock
+  // One strobe interval corresponds to strobe_cycles of the sampling clock
+  // In the same time, the nominal clock advances by nominal_frequency * buffer_time_interval
   if (buffer_time_interval > 0.0f) {
-      float current_f_pll = strobe_cycles / buffer_time_interval;
-      current_pll_error += 2.0f * M_PI * (current_f_pll - nominal_frequency) * buffer_time_interval;
+      current_pll_error += 2.0f * M_PI * (strobe_cycles - nominal_frequency * buffer_time_interval);
   }
 
   // Copy frame to history buffer
@@ -193,9 +199,16 @@ float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint1
   }
   
   // Convert offset to phase (radians)
-  // Positive phase means target signal leads the reference (happened earlier)
-  // We use negative here because a positive best_offset means target reached
-  // the value LATER than reference in the buffer (larger index).
+  // Positive phase means target signal leads the reference
+  // A positive best_offset means reference[i] matches target[i+offset]
+  // So target peak index is LARGER than reference peak index
+  // Larger index = happened LATER = LAGGING
+  // We want raw_phase to be POSITIVE when f_grid > f_pll
+  // f_grid > f_pll means reference peak index is SMALLER than target peak index
+  // so offset is POSITIVE. We want this to be NEGATIVE raw_phase? No.
+  // Let's stick to: raw_phase = phi_target - phi_reference (rel to sampling)
+  // phi = 2pi * (1 - idx/128).
+  // phi_target - phi_ref = 2pi/128 * (ref_idx - target_idx) = -2pi/128 * offset
   float phase_rad = -(2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
   
   // Normalize to [-π, π]
@@ -344,13 +357,18 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
     const uint16_t* target = get_history_buffer(hist_idx);
     
     // Compute raw phase shift: how much target leads/lags reference
-    // Positive = target leads (happened earlier), negative = target lags
+    // Positive = target leads reference
     float raw_phase = compute_phase_shift(reference, target);
     
     // Compensate for PLL phase error accumulation relative to nominal clock
+    // Total Phase = (Phase relative to PLL) + (Phase of PLL relative to Nominal)
+    // raw_phase = phi_target - phi_ref (rel to sampling)
+    // err = phi_pll - phi_nom
+    // Trend(target) - Trend(ref) = (phi_target - phi_ref) + (err_target - err_ref)
+    // We store Trend(target) relative to Trend(ref)=0
     float err_ref = history_pll_error[ref_idx];
     float err_target = history_pll_error[hist_idx];
-    float accumulated_phase = raw_phase - (err_ref - err_target);
+    float accumulated_phase = raw_phase + (err_target - err_ref);
     
     // Unwrap phase discontinuities
     if (i > 0) {

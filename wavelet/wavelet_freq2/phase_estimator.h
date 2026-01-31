@@ -67,6 +67,9 @@ private:
   float phase_trend_cache[PE_HISTORY_DEPTH];
   uint8_t cache_count;
   float expected_next_shift; // Based on linear model
+  float history_pll_error[PE_HISTORY_DEPTH];
+  float current_pll_error;
+  float strobe_cycles;
   uint32_t correction_cooldown; // Frames to wait after correction
   bool correction_was_applied;  // Tracks if we applied a correction
   uint32_t frames_since_correction; // Frames elapsed since correction

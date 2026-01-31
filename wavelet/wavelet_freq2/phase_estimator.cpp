@@ -9,6 +9,8 @@ PhaseEstimator::PhaseEstimator()
     last_phase_shift(0.0f),
     cache_count(0),
     expected_next_shift(0.0f),
+    current_pll_error(0.0f),
+    strobe_cycles(4.0f),
     correction_cooldown(0),
     correction_was_applied(false),
     frames_since_correction(0),
@@ -21,6 +23,7 @@ PhaseEstimator::PhaseEstimator()
     initialized(false) {
   memset(&config, 0, sizeof(config));
   memset(phase_trend_cache, 0, sizeof(phase_trend_cache));
+  memset(history_pll_error, 0, sizeof(history_pll_error));
 }
 
 PhaseEstimator::~PhaseEstimator() {
@@ -82,7 +85,9 @@ void PhaseEstimator::reset() {
   last_phase_shift = 0.0f;
   cache_count = 0;
   memset(phase_trend_cache, 0, sizeof(phase_trend_cache));
+  memset(history_pll_error, 0, sizeof(history_pll_error));
   expected_next_shift = 0.0f;
+  current_pll_error = 0.0f;
   correction_cooldown = 0;
   correction_was_applied = false;
   frames_since_correction = 0;
@@ -94,12 +99,14 @@ void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interva
   buffer_time_interval = buffer_interval_s;
   samples_per_cycle = samps_per_cycle;
   last_freq_estimate = nominal_hz;
+  strobe_cycles = nominal_hz * buffer_interval_s;
 }
 
 void PhaseEstimator::notify_correction_applied(float correction_rad) {
   correction_was_applied = true;
   frames_since_correction = 0;
   expected_next_shift = correction_rad; // Expected immediate change
+  current_pll_error += correction_rad;
 }
 
 void PhaseEstimator::add_frame(const uint16_t* buffer, uint16_t size) {
@@ -108,9 +115,16 @@ void PhaseEstimator::add_frame(const uint16_t* buffer, uint16_t size) {
   uint16_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
   if (size != buf_size) return; // Size mismatch
   
+  // Integrate frequency error since last frame (only if we have an interval)
+  if (buffer_time_interval > 0.0f) {
+      float current_f_pll = strobe_cycles / buffer_time_interval;
+      current_pll_error += 2.0f * M_PI * (current_f_pll - nominal_frequency) * buffer_time_interval;
+  }
+
   // Copy frame to history buffer
   uint16_t* dest = get_history_buffer(history_write_idx);
   memcpy(dest, buffer, buf_size * sizeof(uint16_t));
+  history_pll_error[history_write_idx] = current_pll_error;
   
   // Update circular buffer index
   history_write_idx = (history_write_idx + 1) % config.history_depth;
@@ -333,9 +347,10 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
     // Positive = target leads (happened earlier), negative = target lags
     float raw_phase = compute_phase_shift(reference, target);
     
-    // Accumulate phase - this represents total phase drift over time
-    // We expect phase to accumulate linearly with frequency error
-    float accumulated_phase = raw_phase;
+    // Compensate for PLL phase error accumulation relative to nominal clock
+    float err_ref = history_pll_error[ref_idx];
+    float err_target = history_pll_error[hist_idx];
+    float accumulated_phase = raw_phase - (err_ref - err_target);
     
     // Unwrap phase discontinuities
     if (i > 0) {
@@ -395,8 +410,8 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
   }
   
   // Use recent phase trend to estimate frequency
-  // We'll use the last 5-8 samples for good balance between responsiveness and stability
-  uint8_t trend_length = (cache_count < 8) ? cache_count : 8;
+  // We'll use a window of 6 samples for a good balance between responsiveness and stability
+  uint8_t trend_length = (cache_count < 6) ? cache_count : 6;
   
   // Fit linear model to recent phase trend subset
   // This gives us phase drift rate in rad/buffer
@@ -412,6 +427,7 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
   
   // Estimated actual frequency
   float estimated_freq = nominal_frequency + freq_error_hz;
+  float current_f_pll = strobe_cycles / buffer_time_interval;
   
   // Confidence based on current state
   float confidence = 0.0f;
@@ -439,7 +455,7 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
     result.frequency_error_hz = freq_error_hz;
     result.confidence = confidence;
     result.valid = true;
-    result.pll_correction_hz = freq_error_hz;
+    result.pll_correction_hz = estimated_freq - current_f_pll;
     
     last_freq_estimate = estimated_freq;
   } else {
@@ -448,7 +464,7 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
     result.frequency_error_hz = last_freq_estimate - nominal_frequency;
     result.confidence = 0.0f;
     result.valid = false;
-    result.pll_correction_hz = 0.0f;
+    result.pll_correction_hz = last_freq_estimate - current_f_pll;
   }
   
   return result.valid;

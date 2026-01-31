@@ -50,6 +50,10 @@ void tune_pll(float f){
   sys.grid_f = f;
   sys.cycles_per_sample = (uint32_t)((double)sys.cpu_hz / (f * SAMPLES_PER_CYCLE));
   sys.cycles_per_strobe = (uint32_t)((double)sys.cpu_hz * STROBE_DIV / f);
+
+  // Update phase estimator with new interval for accurate tracking
+  float interval_s = (float)sys.cycles_per_strobe / sys.cpu_hz;
+  phase_est.set_frequency_params(NOMINAL_FREQ, interval_s, SAMPLES_PER_CYCLE);
 }
 
 const char* state_to_string(PhaseEstState state) {
@@ -149,28 +153,25 @@ void loop(){
     }
     
     // === CONTROL STRATEGY ===
-    // More aggressive gains for faster convergence with changing frequencies
+    // Balanced gains for stability and convergence
     float phase_gain = 0.0f;
     float freq_gain = 0.0f;
     
     switch(pe_result.state) {
       case PE_STABLE:
-        // Stable - strong corrections
-        phase_gain = 0.9f;
-        freq_gain = 0.25f;  // More aggressive for faster convergence
+        phase_gain = 0.5f;
+        freq_gain = 0.15f;
         break;
         
       case PE_NONLINEAR_DRIFT:
-        // Frequency is changing - prioritize frequency correction
-        phase_gain = 0.4f;
-        freq_gain = 0.30f;  // Even more aggressive for rapid freq changes
+        phase_gain = 0.3f;
+        freq_gain = 0.25f;
         break;
         
       case PE_INITIALIZING:
       case PE_READY:
-        // Gentle startup
-        phase_gain = 0.5f;
-        freq_gain = 0.15f;
+        phase_gain = 0.4f;
+        freq_gain = 0.10f;
         break;
         
       default:
@@ -180,8 +181,9 @@ void loop(){
     }
     
     // === APPLY FREQUENCY CORRECTION ===
-    if (freq_valid && freq_gain > 0.0f && fabs(freq_result.frequency_error_hz) > 0.001f) {
-      float freq_corr = freq_result.frequency_error_hz * freq_gain;
+    // Use pll_correction_hz for error relative to current PLL frequency
+    if (freq_valid && freq_gain > 0.0f && fabs(freq_result.pll_correction_hz) > 0.001f) {
+      float freq_corr = freq_result.pll_correction_hz * freq_gain;
       float new_freq = sys.grid_f + freq_corr;
       
       // Clamp to reasonable range (±10 Hz from nominal for rapid changes)

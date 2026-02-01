@@ -15,14 +15,14 @@
 #define NOMINAL_FREQ 50.0f
 #define SOGI_K (0.7071f * 2.0f)
 
-#define PLL_KP 1.80f
+#define PLL_KP 2.0f
 #define PLL_KI 0.00f            // Added small KI for steady-state tracking
 #define SAMPLES_PER_CYCLE 200   
 
 // ADC & Normalization
 #define ADC_RESOLUTION 12
 #define V_REF 3.3f
-#define DC_ALPHA 0.05f
+#define DC_ALPHA 0.005f
 
 // Cycle Counter Utilities (ESP32 Internal)
 static inline uint32_t get_cycle_count() {
@@ -143,7 +143,7 @@ void loop() {
             updateTimingParameters(sogi.freq);
 
             // Log performance
-            Serial.printf("dHz:%.3f Mag:%.3f Err:%.3f\n", 
+            Serial.printf("dHz:%.3f, Mag:%.3f, Err:%.3f\n", 
                           sogi.freq - NOMINAL_FREQ, sogi.mag_smooth, raw_p_err);
         } else {
             sogi.integral *= 0.98f; 

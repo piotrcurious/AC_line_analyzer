@@ -40,8 +40,8 @@ void apply_phase_rad(float rad){
   double cyc = (rad / (2.0 * M_PI)) * cycles_per_grid; // desired shift in cycles
   // clamp to +/- one grid period to avoid runaway
   int32_t maxc = (int32_t)(cycles_per_grid);
-  // Negative because advancing phase means capturing EARLIER (smaller cycle count)
-  sys.phase_pending = -clamp_i32((int32_t)lrint(cyc), -maxc, maxc);
+  // No negation: negative rad/slope means f_grid > f_pll, so we want negative pending (advance)
+  sys.phase_pending = clamp_i32((int32_t)lrint(cyc), -maxc, maxc);
 }
 
 void apply_phase_deg(float deg){ apply_phase_rad(deg * (M_PI/180.0f)); }
@@ -138,8 +138,11 @@ void loop(){
       raw_buffer[i] = sys.buf[i].v;
     }
     
+    // Calculate capture jitter in radians
+    float jitter_rad = (2.0f * M_PI * sys.grid_f * sys.strobe_offset_cycles) / sys.cpu_hz;
+
     // Add frame to phase estimator history
-    phase_est.add_frame(raw_buffer, BUF_SZ);
+    phase_est.add_frame(raw_buffer, BUF_SZ, jitter_rad);
     
     // === PHASE & FREQUENCY ESTIMATION ===
     PhaseEstResult pe_result;
@@ -185,7 +188,10 @@ void loop(){
     // Use pll_correction_hz for error relative to current PLL frequency
     if (freq_valid && freq_gain > 0.0f && fabs(freq_result.pll_correction_hz) > 0.001f) {
       float freq_corr = freq_result.pll_correction_hz * freq_gain;
-      float new_freq = sys.grid_f + freq_corr;
+      // Subtract because positive drift rate means f_pll > f_grid (in new convention)
+      // Actually let's re-verify: f_grid > f_pll -> slope negative -> pll_correction negative.
+      // To increase f_pll, we must SUBTRACT the negative pll_correction.
+      float new_freq = sys.grid_f - freq_corr;
       
       // Clamp to reasonable range (±10 Hz from nominal for rapid changes)
       new_freq = fmaxf(NOMINAL_FREQ - 10.0f, fminf(NOMINAL_FREQ + 10.0f, new_freq));

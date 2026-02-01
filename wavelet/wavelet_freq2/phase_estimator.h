@@ -68,6 +68,7 @@ private:
   uint8_t cache_count;
   float expected_next_shift; // Based on linear model
   float history_pll_error[PE_HISTORY_DEPTH];
+  float history_jitter_rad[PE_HISTORY_DEPTH];
   float current_pll_error;
   float strobe_cycles;
   uint32_t correction_cooldown; // Frames to wait after correction
@@ -116,7 +117,8 @@ public:
   void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles = 0.0f);
   
   // Add a new frame to history
-  void add_frame(const uint16_t* buffer, uint16_t size);
+  // jitter_rad is the phase shift due to capture timing jitter (leading > 0)
+  void add_frame(const uint16_t* buffer, uint16_t size, float jitter_rad = 0.0f);
   
   // Notify that a phase correction was applied (for tracking)
   void notify_correction_applied(float correction_rad);

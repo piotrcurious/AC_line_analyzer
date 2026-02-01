@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iomanip>
 #include <cstring>
+#include <cstdlib>
 #include "../phase_estimator.h"
 
 #ifndef M_PI
@@ -27,6 +28,7 @@ double generate_sample(double t, double freq, int type) {
 }
 
 int main() {
+    srand(42); // Deterministic seed
     std::cout << "Starting Robust PLL Convergence Test..." << std::endl;
 
     PhaseEstimator pe;
@@ -50,11 +52,11 @@ int main() {
         const char* label;
     };
     std::vector<TestStep> steps = {
-        {50.0, 1.0, 0, "50Hz Sine"},
-        {51.0, 2.0, 0, "51Hz Sine"},
-        {49.0, 2.0, 0, "49Hz Sine"},
-        {50.0, 1.0, 0, "50Hz Sine"},
-        {50.0, 1.0, 1, "50Hz Trapezoid"}
+        {50.0, 1.5, 0, "50Hz Sine"},
+        {51.0, 2.5, 0, "51Hz Sine"},
+        {49.0, 2.5, 0, "49Hz Sine"},
+        {50.0, 2.0, 0, "50Hz Sine"},
+        {50.0, 2.0, 1, "50Hz Trapezoid"}
     };
 
     double total_time = 0.0;
@@ -66,20 +68,23 @@ int main() {
         double step_start_time = total_time;
 
         while (total_time - step_start_time < step.duration) {
-            // Simulate buffer capture
-            // The buffer starts at current_pll_time
-            // Sampling rate is current_pll_freq * SAMPLES_PER_CYCLE
+            // Simulate buffer capture with some jitter
+            // Jitter is random delay in strobe
+            double jitter_s = ((double)rand() / RAND_MAX - 0.5) * 0.0001; // +/- 100us
+            double start_time = current_pll_time + jitter_s;
+            float jitter_rad = (float)(2.0 * M_PI * step.freq * jitter_s);
+
             uint16_t buf[BUF_SZ];
             double dt = 1.0 / (current_pll_freq * SAMPLES_PER_CYCLE);
             for (int i = 0; i < BUF_SZ; i++) {
-                buf[i] = (uint16_t)generate_sample(current_pll_time + i * dt, step.freq, step.type);
+                buf[i] = (uint16_t)generate_sample(start_time + i * dt, step.freq, step.type);
             }
 
             // Update estimator with current conditions
             double interval = STROBE_DIV / current_pll_freq;
             pe.set_frequency_params(NOMINAL_FREQ, interval, SAMPLES_PER_CYCLE, STROBE_DIV);
 
-            pe.add_frame(buf, BUF_SZ);
+            pe.add_frame(buf, BUF_SZ, jitter_rad);
 
             PhaseEstResult pe_result;
             if (pe.estimate_phase(pe_result)) {
@@ -97,14 +102,19 @@ int main() {
 
                 // Apply frequency correction
                 if (freq_valid && freq_gain > 0.0f) {
-                    current_pll_freq += freq_result.pll_correction_hz * freq_gain;
+                    // Standard convention: f_grid > f_pll -> slope negative -> pll_correction negative.
+                    // Subtract to increase PLL frequency.
+                    current_pll_freq -= freq_result.pll_correction_hz * freq_gain;
                 }
 
                 // Apply phase correction
                 if (phase_gain > 0.0f && std::abs(pe_result.linear_drift_rate) > 1e-4f) {
                     float phase_corr = pe_result.linear_drift_rate * phase_gain;
-                    // Advancing phase means moving current_pll_time BACKWARDS relative to signal
-                    current_pll_time -= (phase_corr / (2.0 * M_PI)) * (1.0 / current_pll_freq);
+                    // Standard convention: f_grid > f_pll -> slope negative.
+                    // To increase current_pll_time (capture later), we would add positive.
+                    // Since slope is negative, adding it decreases time (captures earlier).
+                    // This is correct because f_grid > f_pll means we need to capture earlier to catch up.
+                    current_pll_time += (phase_corr / (2.0 * M_PI)) * (1.0 / current_pll_freq);
                     pe.notify_correction_applied(phase_corr);
                 }
 

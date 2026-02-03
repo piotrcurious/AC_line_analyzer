@@ -18,6 +18,7 @@ PhaseEstimator::PhaseEstimator()
     buffer_time_interval(0.0f),
     last_freq_estimate(50.0f),
     samples_per_cycle(128),
+    system_cpu_hz(240000000),
     correlation_buffer(nullptr),
     residual_buffer(nullptr),
     initialized(false) {
@@ -96,11 +97,12 @@ void PhaseEstimator::reset() {
   last_freq_estimate = nominal_frequency;
 }
 
-void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles) {
+void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles, uint32_t cpu_hz) {
   nominal_frequency = nominal_hz;
   buffer_time_interval = buffer_interval_s;
   samples_per_cycle = samps_per_cycle;
   last_freq_estimate = nominal_hz;
+  system_cpu_hz = cpu_hz;
   // If strobe_div_cycles is not provided, estimate from interval
   if (strobe_div_cycles <= 0.0f) {
     strobe_cycles = nominal_hz * buffer_interval_s;
@@ -116,19 +118,38 @@ void PhaseEstimator::notify_correction_applied(float correction_rad) {
   current_pll_error += correction_rad;
 }
 
-void PhaseEstimator::add_frame(const uint16_t* buffer, uint16_t size, float jitter_rad) {
+void PhaseEstimator::add_frame(const uint16_t* buffer, uint16_t size, float jitter_rad, float current_f_pll, uint32_t strobe_tick) {
   if (!initialized || !buffer) return;
   
   uint16_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
   if (size != buf_size) return; // Size mismatch
   
-  // Copy frame to history buffer
+  // Copy/Resample frame to history buffer
   uint16_t* dest = get_history_buffer(history_write_idx);
-  memcpy(dest, buffer, buf_size * sizeof(uint16_t));
-  
+
+  if (current_f_pll > 0.1f && fabs(current_f_pll - nominal_frequency) > 0.001f) {
+    // Resample from current_f_pll to nominal_frequency to maintain consistent timebase
+    float ratio = current_f_pll / nominal_frequency;
+    for (uint16_t i = 0; i < buf_size; i++) {
+      float src_idx = (float)i * ratio;
+      uint16_t i0 = (uint16_t)src_idx;
+      uint16_t i1 = i0 + 1;
+      float f = src_idx - (float)i0;
+      if (i1 < buf_size) {
+        dest[i] = (uint16_t)((float)buffer[i0] * (1.0f - f) + (float)buffer[i1] * f);
+      } else {
+        dest[i] = buffer[i0];
+      }
+    }
+  } else {
+    memcpy(dest, buffer, buf_size * sizeof(uint16_t));
+  }
+
   // Store the state for this frame
-  history_pll_error[history_write_idx] = current_pll_error;
+  history_f_pll[history_write_idx] = current_f_pll;
+  history_ticks[history_write_idx] = strobe_tick;
   history_jitter_rad[history_write_idx] = jitter_rad;
+  history_pll_error[history_write_idx] = current_pll_error;
 
   // Update circular buffer index
   history_write_idx = (history_write_idx + 1) % config.history_depth;
@@ -206,9 +227,10 @@ float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint1
   // so offset is POSITIVE. We want this to be NEGATIVE raw_phase? No.
   // Let's stick to: raw_phase = phi_target - phi_reference (rel to sampling)
   // phi = 2pi * (1 - idx/128).
-  // phi_target - phi_ref = 2pi/128 * (target_idx - ref_idx) = 2pi/128 * offset
-  // Positive phase means target signal leads the reference
-  float phase_rad = (2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
+  // phi_target - phi_ref = 2pi/128 * (ref_idx - target_idx) = -2pi/128 * offset
+  // Positive phase means target signal leads the reference.
+  // If offset > 0, target[i+offset] matches ref[i], so target peak is LATER -> LAGGING -> negative.
+  float phase_rad = -(2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
   
   // Normalize to [-π, π]
   while (phase_rad > M_PI) phase_rad -= 2.0f * M_PI;
@@ -368,15 +390,11 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
     float corr_target = history_pll_error[hist_idx];
 
     // Accumulated phase relative to sampling clock:
-    // phi_true = measured_phase - (jitter_target - jitter_ref) + (corr_target - corr_ref)
-    // Signs verified:
-    // - Positive jitter (late) -> measured phase increases (phi_meas = phi_true + jitter)
-    //   So phi_true = phi_meas - jitter.
-    // - Positive corr (advance) -> measured phase decreases (phi_meas = phi_true - corr)
-    //   So phi_true = phi_meas + corr.
-    // Difference: (phi_h_true - phi_r_true) = (phi_h_m - phi_r_m) - (j_h - j_r) + (c_h - c_r)
-    //                                      = raw_phase - (jitter_target - jitter_ref) + (corr_target - corr_ref)
-    float accumulated_phase = raw_phase - (jitter_target - jitter_ref) + (corr_target - corr_ref);
+    // phi_true = measured_phase - jitter - correction
+    // (Positive jitter/correction means delayed strobe -> signal appears leading/positive)
+    // Trend[h] = T_h - T_r = (M_h - J_h - C_h) - (M_r - J_r - C_r)
+    //                     = raw_phase - (J_h - J_r) - (C_h - C_r)
+    float accumulated_phase = raw_phase - (jitter_target - jitter_ref) - (corr_target - corr_ref);
     
     // Unwrap phase discontinuities
     if (i > 0) {
@@ -431,32 +449,44 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
   result.frequency_hz = nominal_frequency;
   result.valid = false;
 
-  if (!initialized || cache_count < 4 || buffer_time_interval <= 0.0f) {
+  if (!initialized || history_count < 2 || system_cpu_hz == 0) {
     return false;
   }
   
-  // Use recent phase trend to estimate frequency
-  // We'll use a window of 6 samples for a good balance between responsiveness and stability
-  uint8_t trend_length = (cache_count < 6) ? cache_count : 6;
+  // Use the most recent strobe interval to estimate frequency.
+  // This is highly responsive. We'll use the average of the last 2 intervals for stability.
+  uint8_t n = (history_count > 4) ? 4 : history_count;
+  float sum_f_est = 0.0f;
+  uint8_t count = 0;
   
-  // Fit linear model to recent phase trend subset
-  // This gives us phase drift rate in rad/buffer
-  float slope, intercept;
-  uint8_t start_idx = cache_count - trend_length;
-  
-  fit_linear_drift(&phase_trend_cache[start_idx], trend_length, slope, intercept);
-  
-  float phase_drift_per_buffer = slope;
-  
-  // Convert to frequency error RELATIVE TO PLL
-  float pll_error_hz = phase_drift_per_buffer / (2.0f * M_PI * buffer_time_interval);
-  
-  // Estimated actual PLL frequency
-  float current_f_pll = strobe_cycles / buffer_time_interval;
-  
-  // Estimated actual frequency of the grid
-  float estimated_freq = current_f_pll + pll_error_hz;
+  for (uint8_t i = 0; i < n - 1; i++) {
+    uint16_t r_idx = (history_write_idx + config.history_depth - 1 - i) % config.history_depth;
+    uint16_t h_idx = (history_write_idx + config.history_depth - 2 - i) % config.history_depth;
 
+    // delta_phi (Older - Newer)
+    float delta_phi = compute_phase_shift(get_history_buffer(r_idx), get_history_buffer(h_idx));
+
+    // delta_t in seconds
+    uint32_t dt_ticks = history_ticks[r_idx] - history_ticks[h_idx];
+    float dt = (float)dt_ticks / system_cpu_hz;
+
+    if (dt > 0.001f) {
+      // f_grid = (strobe_cycles - delta_phi / 2pi) / dt
+      float f_est = (strobe_cycles - delta_phi / (2.0f * M_PI)) / dt;
+      sum_f_est += f_est;
+      count++;
+    }
+  }
+  
+  if (count == 0) return false;
+  
+  float estimated_freq = sum_f_est / count;
+  
+  // PLL error for correction is f_pll - f_grid
+  uint16_t newest_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
+  float current_f_pll = history_f_pll[newest_idx];
+  float pll_error_hz = current_f_pll - estimated_freq;
+  
   // Confidence based on current state
   float confidence = 0.0f;
   switch(current_state) {

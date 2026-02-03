@@ -54,7 +54,7 @@ void tune_pll(float f){
 
   // Update phase estimator with new interval for accurate tracking
   float interval_s = (float)sys.cycles_per_strobe / sys.cpu_hz;
-  phase_est.set_frequency_params(NOMINAL_FREQ, interval_s, SAMPLES_PER_CYCLE, STROBE_DIV);
+  phase_est.set_frequency_params(NOMINAL_FREQ, interval_s, SAMPLES_PER_CYCLE, STROBE_DIV, sys.cpu_hz);
 }
 
 const char* state_to_string(PhaseEstState state) {
@@ -141,8 +141,10 @@ void loop(){
     // Calculate capture jitter in radians
     float jitter_rad = (2.0f * M_PI * sys.grid_f * sys.strobe_offset_cycles) / sys.cpu_hz;
 
-    // Add frame to phase estimator history
-    phase_est.add_frame(raw_buffer, BUF_SZ, jitter_rad);
+    // Add frame to phase estimator history with resampling to nominal frequency
+    // Use the scheduled strobe tick for absolute time tracking
+    uint32_t scheduled_tick = cpu_hal_get_cycle_count() - sys.strobe_offset_cycles;
+    phase_est.add_frame(raw_buffer, BUF_SZ, jitter_rad, sys.grid_f, scheduled_tick);
     
     // === PHASE & FREQUENCY ESTIMATION ===
     PhaseEstResult pe_result;

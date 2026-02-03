@@ -43,7 +43,8 @@ int main() {
     double current_pll_time = 0.0;
 
     // Set initial params
-    pe.set_frequency_params(NOMINAL_FREQ, STROBE_DIV / NOMINAL_FREQ, SAMPLES_PER_CYCLE, STROBE_DIV);
+    uint32_t cpu_hz = 240000000;
+    pe.set_frequency_params(NOMINAL_FREQ, STROBE_DIV / NOMINAL_FREQ, SAMPLES_PER_CYCLE, STROBE_DIV, cpu_hz);
 
     struct TestStep {
         double freq;
@@ -82,9 +83,10 @@ int main() {
 
             // Update estimator with current conditions
             double interval = STROBE_DIV / current_pll_freq;
-            pe.set_frequency_params(NOMINAL_FREQ, interval, SAMPLES_PER_CYCLE, STROBE_DIV);
+            pe.set_frequency_params(NOMINAL_FREQ, interval, SAMPLES_PER_CYCLE, STROBE_DIV, cpu_hz);
 
-            pe.add_frame(buf, BUF_SZ, jitter_rad);
+            uint32_t current_tick = (uint32_t)(current_pll_time * cpu_hz);
+            pe.add_frame(buf, BUF_SZ, jitter_rad, current_pll_freq, current_tick);
 
             PhaseEstResult pe_result;
             if (pe.estimate_phase(pe_result)) {
@@ -103,7 +105,8 @@ int main() {
                 // Apply frequency correction
                 if (freq_valid && freq_gain > 0.0f) {
                     // Standard convention: f_grid > f_pll -> slope negative -> pll_correction negative.
-                    // Subtract to increase PLL frequency.
+                    // Subtraction from PLL frequency:
+                    // If grid > PLL, pll_correction is negative. Subtracting negative increases PLL freq.
                     current_pll_freq -= freq_result.pll_correction_hz * freq_gain;
                 }
 

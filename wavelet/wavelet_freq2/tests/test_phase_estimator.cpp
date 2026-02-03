@@ -45,7 +45,8 @@ int main() {
     double nominal_freq = 50.0;
     double current_pll_freq = 50.0;
     double buffer_interval_s = 4.0 / nominal_freq; // 0.08s
-    pe.set_frequency_params(nominal_freq, buffer_interval_s, 128);
+    uint32_t cpu_hz = 240000000;
+    pe.set_frequency_params(nominal_freq, buffer_interval_s, 128, 4.0, cpu_hz);
 
     struct TestStep {
         double freq;
@@ -74,7 +75,8 @@ int main() {
             uint16_t buf[128 * 3];
             generate_buffer(buf, step.freq, pll_time_accumulator, 128, 3, step.type);
 
-            pe.add_frame(buf, 128 * 3);
+            uint32_t current_tick = (uint32_t)(total_elapsed_time * cpu_hz);
+            pe.add_frame(buf, 128 * 3, 0.0f, current_pll_freq, current_tick);
 
             PhaseEstResult pe_result;
             if (pe.estimate_phase(pe_result)) {
@@ -92,19 +94,19 @@ int main() {
                 }
 
                 if (freq_valid && freq_gain > 0.0f) {
-                    current_pll_freq += freq_result.pll_correction_hz * freq_gain;
+                    current_pll_freq -= freq_result.pll_correction_hz * freq_gain;
                     // Clamp like in original code
                     if (current_pll_freq < 40.0) current_pll_freq = 40.0;
                     if (current_pll_freq > 60.0) current_pll_freq = 60.0;
                     // Update estimator parameters
-                    pe.set_frequency_params(nominal_freq, 4.0 / current_pll_freq, 128);
+                    pe.set_frequency_params(nominal_freq, 4.0 / current_pll_freq, 128, 4.0, cpu_hz);
                 }
 
                 if (phase_gain > 0.0f && std::abs(pe_result.linear_drift_rate) > 1e-6f) {
-                    float phase_corr = -pe_result.linear_drift_rate * phase_gain;
+                    float phase_corr = pe_result.linear_drift_rate * phase_gain;
                     // Apply phase correction to our time accumulator
                     double time_shift = (phase_corr / (2.0 * M_PI)) * (1.0 / current_pll_freq);
-                    pll_time_accumulator += time_shift;
+                    pll_time_accumulator -= time_shift;
                     pe.notify_correction_applied(phase_corr);
                 }
 

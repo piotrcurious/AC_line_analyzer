@@ -4,12 +4,11 @@
  * by updating dt (ticks_per_sample) when frequency shifts.
  */
 
-#include <Arduino.h>
+#include "mock_arduino.h"
 #include <math.h>
 
-#include "SOGIvisualizer.h"
-
-SOGIVisualizer vis;
+// #include "SOGIvisualizer.h"
+// SOGIVisualizer vis;
 
 // Return type for interpolation
 struct InterpResult {
@@ -24,15 +23,14 @@ struct InterpResult {
 
 #define PLL_KP 1.2f
 #define PLL_KI 0.00f
-#define SAMPLES_PER_CYCLE 512 // must be power of two 
+#define SAMPLES_PER_CYCLE 512 // must be power of two
 #define ADC_RESOLUTION 12
 #define V_REF 3.3f
 #define DC_ALPHA 0.0002f
 
+extern uint32_t simulated_cycles;
 static inline uint32_t get_cycle_count() {
-    uint32_t ccount;
-    asm volatile("rsr %0, ccount" : "=a" (ccount));
-    return ccount;
+    return simulated_cycles;
 }
 
 struct SOGI_PLL {
@@ -41,7 +39,7 @@ struct SOGI_PLL {
     float freq;
     float omega;
     float integral;
-    uint32_t ticks_per_sample; 
+    uint32_t ticks_per_sample;
     float u_prev;
     float filtered_err;
     float mag_smooth;
@@ -253,7 +251,7 @@ void process_sogi_window(int start_idx, int count) {
 void do_strobe_computation() {
     float mag_inst = sqrtf(sogi.v_alpha * sogi.v_alpha + sogi.v_beta * sogi.v_beta);
     sogi.mag_smooth = (0.2f * mag_inst) + (0.8f * sogi.mag_smooth);
-    
+
     if (sogi.mag_smooth > 0.10f) {
         float raw_p_err = sogi.v_beta / sogi.mag_smooth;
         sogi.filtered_err = (1.0f * raw_p_err) + (0.0f * sogi.filtered_err);
@@ -273,17 +271,17 @@ void setup() {
     Serial.begin(115200);
     analogReadResolution(ADC_RESOLUTION);
     initSOGI(NOMINAL_FREQ);
-    
+
     uint32_t start_c = get_cycle_count();
     last_sample_cycles = start_c;
     last_cycle_boundary = start_c;
-    
+
     for (int i=0; i<4; i++) cycle_start_idx[i] = 0;
     current_cycle = 0;
     buf_idx = 0;
-    vis.begin();
+    // vis.begin();
 }
-float dc_current = 2048; 
+float dc_current = 2048;
 void loop() {
     uint32_t now = get_cycle_count();
 
@@ -309,7 +307,7 @@ void loop() {
             ts_buf[buf_idx] = now;
             buf_idx = (buf_idx + 1) % BUF_N;
         }
-        
+
         // Safety: prevent infinite loop if ticks_per_sample is somehow 0
         if (sogi.ticks_per_sample == 0) break;
     }
@@ -328,21 +326,21 @@ void loop() {
             int s_idx = cycle_start_idx[1];
             int e_idx = cycle_start_idx[2];
             int actual_count = (e_idx - s_idx + BUF_N) % BUF_N;
-            
+
             if (actual_count > 0) {
                 // Update sampling DC offset for next cycle
                 dc_offset_sampling = dc_current;
-                
+
                 process_sogi_window(s_idx, actual_count);
                 do_strobe_computation();
-                
+
                 // --- Phase Alignment for Visualizer ---
                 // atan2f returns [-PI, PI]. We want to align to the negative peak.
                 float end_phase = atan2f(sogi.v_beta, sogi.v_alpha);
                 const float target_phase = -1.570796f; // -PI / 2
 
                 float phase_diff = end_phase - target_phase;
-                
+
                 // Normalized wrap-around [0, 2PI]
                 if (phase_diff < 0) phase_diff += 6.283185f;
                 if (phase_diff >= 6.283185f) phase_diff -= 6.283185f;
@@ -356,9 +354,9 @@ void loop() {
                 int aligned_start_idx = (processed_end_idx - samples_back + BUF_N) % BUF_N;
 
                 // Update Visualizer
-                vis.update(samp_buf, BUF_N, aligned_start_idx, actual_count,
-                           sogi.freq, sogi.mag_smooth, sogi.filtered_err);
-                
+                // vis.update(samp_buf, BUF_N, aligned_start_idx, actual_count,
+                //            sogi.freq, sogi.mag_smooth, sogi.filtered_err);
+
                 Serial.printf("F:%.4fHz | Mag:%.3f | Offset:%.1f | ActSamples:%d\n",
                               sogi.freq, sogi.mag_smooth, dc_offset_sampling, actual_count);
             }

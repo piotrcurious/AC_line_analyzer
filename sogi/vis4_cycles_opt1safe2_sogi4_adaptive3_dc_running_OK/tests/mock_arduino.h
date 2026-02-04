@@ -9,17 +9,9 @@
 
 #define PI 3.14159265358979323846f
 
-inline float constrain(float x, float a, float b) {
-    if(x < a) return a;
-    if(x > b) return b;
-    return x;
-}
-
-inline int constrain(int x, int a, int b) {
-    if(x < a) return a;
-    if(x > b) return b;
-    return x;
-}
+#ifndef constrain
+#define constrain(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
+#endif
 
 // Mock ESP class
 class MockESP {
@@ -38,5 +30,11 @@ public:
     void begin(int baud) {}
 };
 extern MockSerial Serial;
+
+// Arduino functions to mock
+extern int analogRead(int pin);
+extern void analogReadResolution(int res);
+
+#define ADC_PIN 36
 
 #endif

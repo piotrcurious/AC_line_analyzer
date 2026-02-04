@@ -1,8 +1,0 @@
---- Test: Interpolation ---
-Exact hit: val=0.064097, conf=1.000000 (expected 0.064097, 1.0)
-Midpoint: val=0.067231, conf=1.000000 (expected 0.067231, 1.0)
-Gap/Jitter: val=0.123390, conf=0.720000 (expected confidence < 1.0 due to gap ratio 10000/4800 > 1.5)
-
---- Test: SOGI Resampled Processing ---
-After Cycle 1: v_alpha=0.035393, v_beta=-0.916814, mag=0.917497
-After Cycle 2: v_alpha=-0.002384, v_beta=-0.995104, mag=0.995107

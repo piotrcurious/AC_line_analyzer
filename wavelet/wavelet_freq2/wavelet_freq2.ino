@@ -40,6 +40,7 @@ void apply_phase_rad(float rad){
   double cyc = (rad / (2.0 * M_PI)) * cycles_per_grid; // desired shift in cycles
   // clamp to +/- one grid period to avoid runaway
   int32_t maxc = (int32_t)(cycles_per_grid);
+  // No negation: negative rad/slope means f_grid > f_pll, so we want negative pending (advance)
   sys.phase_pending = clamp_i32((int32_t)lrint(cyc), -maxc, maxc);
 }
 
@@ -50,6 +51,10 @@ void tune_pll(float f){
   sys.grid_f = f;
   sys.cycles_per_sample = (uint32_t)((double)sys.cpu_hz / (f * SAMPLES_PER_CYCLE));
   sys.cycles_per_strobe = (uint32_t)((double)sys.cpu_hz * STROBE_DIV / f);
+
+  // Update phase estimator with new interval for accurate tracking
+  float interval_s = (float)sys.cycles_per_strobe / sys.cpu_hz;
+  phase_est.set_frequency_params(NOMINAL_FREQ, interval_s, SAMPLES_PER_CYCLE, STROBE_DIV, sys.cpu_hz);
 }
 
 const char* state_to_string(PhaseEstState state) {
@@ -84,9 +89,9 @@ void setup(){
     Serial.println("Phase estimator initialized successfully");
     
     // Set frequency estimation parameters
-    // Buffer interval = STROBE_DIV / frequency (time for 3 cycles)
+    // Buffer interval = STROBE_DIV / frequency
     float buffer_interval_s = STROBE_DIV / NOMINAL_FREQ;
-    phase_est.set_frequency_params(NOMINAL_FREQ, buffer_interval_s, SAMPLES_PER_CYCLE);
+    phase_est.set_frequency_params(NOMINAL_FREQ, buffer_interval_s, SAMPLES_PER_CYCLE, STROBE_DIV);
     
     Serial.printf("Frequency estimation configured: %.3f Hz nominal, %.4f s/buffer\n",
                  NOMINAL_FREQ, buffer_interval_s);
@@ -133,8 +138,13 @@ void loop(){
       raw_buffer[i] = sys.buf[i].v;
     }
     
-    // Add frame to phase estimator history
-    phase_est.add_frame(raw_buffer, BUF_SZ);
+    // Calculate capture jitter in radians
+    float jitter_rad = (2.0f * M_PI * sys.grid_f * sys.strobe_offset_cycles) / sys.cpu_hz;
+
+    // Add frame to phase estimator history with resampling to nominal frequency
+    // Use the scheduled strobe tick for absolute time tracking
+    uint32_t scheduled_tick = cpu_hal_get_cycle_count() - sys.strobe_offset_cycles;
+    phase_est.add_frame(raw_buffer, BUF_SZ, jitter_rad, sys.grid_f, scheduled_tick);
     
     // === PHASE & FREQUENCY ESTIMATION ===
     PhaseEstResult pe_result;
@@ -149,28 +159,25 @@ void loop(){
     }
     
     // === CONTROL STRATEGY ===
-    // More aggressive gains for faster convergence with changing frequencies
+    // Balanced gains for stability and convergence
     float phase_gain = 0.0f;
     float freq_gain = 0.0f;
     
     switch(pe_result.state) {
       case PE_STABLE:
-        // Stable - strong corrections
-        phase_gain = 0.9f;
-        freq_gain = 0.25f;  // More aggressive for faster convergence
+        phase_gain = 0.5f;
+        freq_gain = 0.15f;
         break;
         
       case PE_NONLINEAR_DRIFT:
-        // Frequency is changing - prioritize frequency correction
-        phase_gain = 0.4f;
-        freq_gain = 0.30f;  // Even more aggressive for rapid freq changes
+        phase_gain = 0.3f;
+        freq_gain = 0.25f;
         break;
         
       case PE_INITIALIZING:
       case PE_READY:
-        // Gentle startup
-        phase_gain = 0.5f;
-        freq_gain = 0.15f;
+        phase_gain = 0.4f;
+        freq_gain = 0.10f;
         break;
         
       default:
@@ -180,9 +187,13 @@ void loop(){
     }
     
     // === APPLY FREQUENCY CORRECTION ===
-    if (freq_valid && freq_gain > 0.0f && fabs(freq_result.frequency_error_hz) > 0.001f) {
-      float freq_corr = freq_result.frequency_error_hz * freq_gain;
-      float new_freq = sys.grid_f + freq_corr;
+    // Use pll_correction_hz for error relative to current PLL frequency
+    if (freq_valid && freq_gain > 0.0f && fabs(freq_result.pll_correction_hz) > 0.001f) {
+      float freq_corr = freq_result.pll_correction_hz * freq_gain;
+      // Subtract because positive drift rate means f_pll > f_grid (in new convention)
+      // Actually let's re-verify: f_grid > f_pll -> slope negative -> pll_correction negative.
+      // To increase f_pll, we must SUBTRACT the negative pll_correction.
+      float new_freq = sys.grid_f - freq_corr;
       
       // Clamp to reasonable range (±10 Hz from nominal for rapid changes)
       new_freq = fmaxf(NOMINAL_FREQ - 10.0f, fminf(NOMINAL_FREQ + 10.0f, new_freq));
@@ -199,7 +210,8 @@ void loop(){
     
     // === APPLY PHASE CORRECTION ===
     if (phase_gain > 0.0f && fabs(pe_result.linear_drift_rate) > 1e-6f) {
-      float phase_corr = -pe_result.linear_drift_rate * phase_gain;
+      // Correct in direction of detected drift to align phase
+      float phase_corr = pe_result.linear_drift_rate * phase_gain;
       
       if (fabs(phase_corr) > 1e-6f) {
         apply_phase_rad(phase_corr);

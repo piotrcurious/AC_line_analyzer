@@ -64,7 +64,15 @@ private:
   // State tracking
   PhaseEstState current_state;
   float last_phase_shift;
+  float phase_trend_cache[PE_HISTORY_DEPTH];
+  uint8_t cache_count;
   float expected_next_shift; // Based on linear model
+  float history_f_pll[PE_HISTORY_DEPTH];
+  uint32_t history_ticks[PE_HISTORY_DEPTH];
+  float history_jitter_rad[PE_HISTORY_DEPTH];
+  float history_pll_error[PE_HISTORY_DEPTH];
+  float current_pll_error;
+  float strobe_cycles;
   uint32_t correction_cooldown; // Frames to wait after correction
   bool correction_was_applied;  // Tracks if we applied a correction
   uint32_t frames_since_correction; // Frames elapsed since correction
@@ -74,6 +82,7 @@ private:
   float buffer_time_interval;   // Time between buffers (seconds)
   float last_freq_estimate;     // Last frequency estimate
   uint32_t samples_per_cycle;   // Samples per nominal cycle
+  uint32_t system_cpu_hz;
   
   // Internal calculation buffers
   float* correlation_buffer;
@@ -107,10 +116,14 @@ public:
   bool begin(const PhaseEstConfig* cfg = nullptr);
   
   // Set nominal frequency and timing parameters for frequency estimation
-  void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle);
+  // strobe_div_cycles is the number of nominal cycles captured between buffers (e.g. 4.0)
+  void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles = 0.0f, uint32_t cpu_hz = 240000000);
   
   // Add a new frame to history
-  void add_frame(const uint16_t* buffer, uint16_t size);
+  // jitter_rad is the phase shift due to capture timing jitter (leading > 0)
+  // current_f_pll is the frequency at which this frame was sampled
+  // strobe_tick is the CPU cycle count when the strobe was scheduled
+  void add_frame(const uint16_t* buffer, uint16_t size, float jitter_rad = 0.0f, float current_f_pll = 0.0f, uint32_t strobe_tick = 0);
   
   // Notify that a phase correction was applied (for tracking)
   void notify_correction_applied(float correction_rad);

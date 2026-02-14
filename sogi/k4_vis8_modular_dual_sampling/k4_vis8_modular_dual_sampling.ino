@@ -7,6 +7,7 @@
 #include <math.h>
 #include "SOGI.h"
 #include "SOGIvisualizer.h"
+#include "analog.h"
 
 #define ADC_PIN_V 36
 #define ADC_PIN_I 39
@@ -30,8 +31,8 @@ struct {
     bool initialized = false;
 } phase_track;
 
-float v_dc_offset = 2048.0f;
-float i_dc_offset = 2048.0f;
+float v_dc_offset = 1650.0f;
+float i_dc_offset = 1650.0f;
 uint32_t last_sample_cycles = 0;
 uint32_t last_cycle_boundary = 0;
 uint32_t single_cycle_cycles = 0;
@@ -98,11 +99,8 @@ void loop() {
     if (elapsed_sample >= ticks_per_sample && current_cycle < 3) {
         last_sample_cycles += ticks_per_sample;
 
-        int raw_v = analogRead(ADC_PIN_V);
-        int raw_i = analogRead(ADC_PIN_I);
-
-        v_samp_buf[buf_idx] = ((float)raw_v) * (V_REF / 4095.0f);
-        i_samp_buf[buf_idx] = ((float)raw_i) * (V_REF / 4095.0f);
+        v_samp_buf[buf_idx] = (float)analogReadMillivolts(ADC_PIN_V, ADC_ATTEN_DB_11, 1);
+        i_samp_buf[buf_idx] = (float)analogReadMillivolts(ADC_PIN_I, ADC_ATTEN_DB_11, 1);
 
         buf_idx = (buf_idx + 1) % BUF_N;
     }

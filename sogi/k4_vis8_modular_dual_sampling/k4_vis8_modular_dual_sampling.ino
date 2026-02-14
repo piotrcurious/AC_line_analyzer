@@ -72,7 +72,7 @@ void updateTimingParameters(float frequency) {
 
 void setup() {
     Serial.begin(115200);
-    analogReadResolution(ADC_RESOLUTION);
+    // analogReadResolution(ADC_RESOLUTION); // Commented to avoid conflict with legacy ADC driver
 
     updateTimingParameters(NOMINAL_FREQ);
 

@@ -121,16 +121,18 @@ void TileManager::flush(lgfx::LGFX_Device &dev) {
 // ------------------ Visualizer Implementation ------------------
 
 static TileManager g_tiled_canvas;
-static float last_v_min = 1.0f; 
+static float last_v_min = 1.0f;
 static float last_v_max = 2.0f;
-static uint32_t g_frame_count = 0; 
+static float last_i_min = 1.0f;
+static float last_i_max = 2.0f;
+static uint32_t g_frame_count = 0;
 
 static constexpr int WAVE_AREA_HEIGHT = SOGIVisualizer::SCREEN_HEIGHT - 1;
 static constexpr float MIN_RANGE = 0.05f;
-static constexpr float PEAK_HISTORY_WEIGHT = 0.95f; 
+static constexpr float PEAK_HISTORY_WEIGHT = 0.95f;
 static constexpr float PEAK_NEW_WEIGHT = 0.05f;
 
-SOGIVisualizer::SOGIVisualizer() : _canvas(nullptr) {}
+SOGIVisualizer::SOGIVisualizer() {}
 
 void SOGIVisualizer::begin() {
     auto& dev = get_hw();
@@ -139,62 +141,90 @@ void SOGIVisualizer::begin() {
     dev.clear();
 
     gpio_set_drive_capability((gpio_num_t)18, GPIO_DRIVE_CAP_3);
-    gpio_set_drive_capability((gpio_num_t)23, GPIO_DRIVE_CAP_3); 
+    gpio_set_drive_capability((gpio_num_t)23, GPIO_DRIVE_CAP_3);
     g_tiled_canvas.init(SCREEN_WIDTH, SCREEN_HEIGHT, TILE_SIZE);
 }
 
-void SOGIVisualizer::update(const float* buffer, int bufLen, int startIdx, int count, 
-                            float freq, float magnitude, float error, float dc_offset) {
-    if (count <= 0 || buffer == nullptr) return;
-    
+void SOGIVisualizer::update(const float* vBuffer, const float* iBuffer, int bufLen, int startIdx, int count,
+                            float freq, float magnitude, float v_dc, float i_dc) {
+    if (count <= 0 || vBuffer == nullptr) return;
+
     auto& dev = get_hw();
     g_tiled_canvas.startFrame();
-    g_frame_count++; 
-    
-    float range = last_v_max - last_v_min;
-    if (range < MIN_RANGE) range = MIN_RANGE;
-    
+    g_frame_count++;
+
     const int wave_h = WAVE_AREA_HEIGHT;
     const int screen_w = SCREEN_WIDTH;
-    const float scale_y = (WAVE_AREA_HEIGHT - 4) / range;
-    const float mid_point = (last_v_max + last_v_min) * 0.5f;
     const int center_y = WAVE_AREA_HEIGHT / 2;
 
-    // Fixed Zero Line Logic (relative to the tracked DC offset)
-    int zero_line_y = center_y - (int)lrintf((dc_offset - mid_point) * scale_y);
-    
-    if (zero_line_y >= 0 && zero_line_y < wave_h) {
-        int offset = g_frame_count & 1; 
-        for (int x = offset * 2; x < screen_w; x += 4) {
-            g_tiled_canvas.writePixelGlobal(x, zero_line_y, 255); 
+    // --- Plot Voltage Waveform (Solid) ---
+    float v_range = last_v_max - last_v_min;
+    if (v_range < MIN_RANGE) v_range = MIN_RANGE;
+    float v_scale_y = (WAVE_AREA_HEIGHT - 4) / v_range;
+    float v_mid_point = (last_v_max + last_v_min) * 0.5f;
+
+    // Zero Line for Voltage
+    int v_zero_line_y = center_y - (int)lrintf((v_dc - v_mid_point) * v_scale_y);
+    if (v_zero_line_y >= 0 && v_zero_line_y < wave_h) {
+        for (int x = (g_frame_count & 1) * 2; x < screen_w; x += 4) {
+            g_tiled_canvas.writePixelGlobal(x, v_zero_line_y, 180);
         }
     }
 
-    // Plot Waveform
-    float current_min = 100.0f;
-    float current_max = -100.0f;
-    int prev_x = -1, prev_y = -1;
-    
+    float current_v_min = 100.0f, current_v_max = -100.0f;
+    int prev_x = -1, prev_v_y = -1;
+
     for (int x = 0; x < SCREEN_WIDTH; x++) {
         int sample_idx = (startIdx + (x * count / SCREEN_WIDTH)) % bufLen;
-        float val = buffer[sample_idx];
-        
-        if (val < current_min) current_min = val;
-        if (val > current_max) current_max = val;
-        
-        int y = center_y - (int)((val - mid_point) * scale_y);
-        if (y < 0) y = 0;
-        if (y >= WAVE_AREA_HEIGHT) y = WAVE_AREA_HEIGHT - 1;
-        
+        float v_val = vBuffer[sample_idx];
+        if (v_val < current_v_min) current_v_min = v_val;
+        if (v_val > current_v_max) current_v_max = v_val;
+
+        int v_y = center_y - (int)((v_val - v_mid_point) * v_scale_y);
+        v_y = constrain(v_y, 0, WAVE_AREA_HEIGHT - 1);
+
         if (prev_x != -1) {
-            g_tiled_canvas.drawLine(prev_x, prev_y, x, y, 255); 
+            g_tiled_canvas.drawLine(prev_x, prev_v_y, x, v_y, 255);
         }
+        prev_v_y = v_y;
         prev_x = x;
-        prev_y = y;
     }
-    
-    last_v_min = (current_min * PEAK_NEW_WEIGHT) + (last_v_min * PEAK_HISTORY_WEIGHT);
-    last_v_max = (current_max * PEAK_NEW_WEIGHT) + (last_v_max * PEAK_HISTORY_WEIGHT);
-    
+
+    // --- Plot Current Waveform (Dotted/Dimmer) ---
+    if (iBuffer != nullptr) {
+        float i_range = last_i_max - last_i_min;
+        if (i_range < MIN_RANGE) i_range = MIN_RANGE;
+        float i_scale_y = (WAVE_AREA_HEIGHT - 4) / i_range;
+        float i_mid_point = (last_i_max + last_i_min) * 0.5f;
+
+        float current_i_min = 100.0f, current_i_max = -100.0f;
+        int prev_i_y = -1;
+        prev_x = -1;
+
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            int sample_idx = (startIdx + (x * count / SCREEN_WIDTH)) % bufLen;
+            float i_val = iBuffer[sample_idx];
+            if (i_val < current_i_min) current_i_min = i_val;
+            if (i_val > current_i_max) current_i_max = i_val;
+
+            int i_y = center_y - (int)((i_val - i_mid_point) * i_scale_y);
+            i_y = constrain(i_y, 0, WAVE_AREA_HEIGHT - 1);
+
+            if (prev_x != -1) {
+                // Simple dotted effect by only drawing even x
+                if (x % 2 == 0) {
+                    g_tiled_canvas.drawLine(prev_x, prev_i_y, x, i_y, 150);
+                }
+            }
+            prev_i_y = i_y;
+            prev_x = x;
+        }
+        last_i_min = (current_i_min * PEAK_NEW_WEIGHT) + (last_i_min * PEAK_HISTORY_WEIGHT);
+        last_i_max = (current_i_max * PEAK_NEW_WEIGHT) + (last_i_max * PEAK_HISTORY_WEIGHT);
+    }
+
+    last_v_min = (current_v_min * PEAK_NEW_WEIGHT) + (last_v_min * PEAK_HISTORY_WEIGHT);
+    last_v_max = (current_v_max * PEAK_NEW_WEIGHT) + (last_v_max * PEAK_HISTORY_WEIGHT);
+
     g_tiled_canvas.flush(dev);
 }

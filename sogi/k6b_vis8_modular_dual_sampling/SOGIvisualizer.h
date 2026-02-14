@@ -43,7 +43,7 @@ struct TileManager {
 
     TileManager();
     void init(uint16_t sw, uint16_t sh, uint16_t tsize);
-    
+
     inline Tile* tileAtIdx(uint16_t tx, uint16_t ty) {
         if ((uint32_t)tx >= cols || (uint32_t)ty >= rows) return nullptr;
         return &tiles[ty * cols + tx];
@@ -65,10 +65,10 @@ public:
 
     SOGIVisualizer();
     void begin();
-     void update(const float* buffer, int bufLen, int startIdx, int count, float freq, float magnitude, float error, float dc_offset);
+    void update(const float* vBuffer, const float* iBuffer, int bufLen, int startIdx, int count,
+                float freq, float magnitude, float v_dc, float i_dc);
 
 private:
-    LGFX_Sprite _canvas; // Use a sprite for flicker-free double buffering
     // Any private members if needed
 };
 

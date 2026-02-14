@@ -7,7 +7,7 @@
  *
  * f = sign · 2^e · m, where m ∈ [1,2)
  *
- * The mantissa m is approximated by a piecewise ring chart table 
+ * The mantissa m is approximated by a piecewise ring chart table
  * generated offline. Each segment stores:
  * - a Q16.16 multiplier for the mantissa center
  * - an optional linear correction slope (Q16.16)
@@ -84,7 +84,7 @@ static inline uint32_t mul_u32_by_float_ring(uint32_t a, float f) {
     if (!isfinite(f) || f == 0.0f) return 0u;
 
     // ---- Step 1: extract sign (unsigned saturating logic) ----
-    if (f < 0.0f) return 0u; 
+    if (f < 0.0f) return 0u;
 
     // ---- Step 2: bit-level float decomposition ----
     union {

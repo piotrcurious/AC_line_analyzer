@@ -73,6 +73,9 @@ void setup() {
     Serial.begin(115200);
     // analogReadResolution(ADC_RESOLUTION); // Commented to avoid conflict with legacy ADC driver
 
+    analogInit(ADC_PIN_V, ADC_ATTEN_DB_11);
+    analogInit(ADC_PIN_I, ADC_ATTEN_DB_11);
+
     updateTimingParameters(NOMINAL_FREQ);
 
     uint32_t start_c = get_cycle_count();
@@ -97,8 +100,8 @@ void loop() {
     if (elapsed_sample >= ticks_per_sample && current_cycle < 3) {
         last_sample_cycles += ticks_per_sample;
 
-        v_samp_buf[buf_idx] = (float)analogReadMillivolts(ADC_PIN_V, ADC_ATTEN_DB_11, 1);
-        i_samp_buf[buf_idx] = (float)analogReadMillivolts(ADC_PIN_I, ADC_ATTEN_DB_11, 1);
+        v_samp_buf[buf_idx] = (float)analogReadMillivolts(ADC_PIN_V, 1);
+        i_samp_buf[buf_idx] = (float)analogReadMillivolts(ADC_PIN_I, 1);
 
         buf_idx = (buf_idx + 1) % BUF_N;
     }

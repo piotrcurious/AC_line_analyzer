@@ -1,72 +1,68 @@
 # SOGI-PLL Grid Synchronization Project
 
 ## Overview
-This project implements a high-performance **Second-Order Generalized Integrator Phase-Locked Loop (SOGI-PLL)** for single-phase grid synchronization on the ESP32. It has evolved through several developmental stages, from basic inverter applications to advanced predictive control models with high-fidelity visualization.
+This repository contains a diverse collection of Single-Phase Phase-Locked Loop (PLL) implementations based on the Second-Order Generalized Integrator (SOGI). Rather than a simple linear progression, these versions represent different architectural approaches and combinations of sampling, timing, and control strategies.
 
-## 🚀 Project Evolution (Chronology)
+## 📊 Technical Taxonomy & Feature Matrix
 
-The repository is organized into five distinct "Eras," representing the technical progression of the algorithm and its implementation.
+The following table categorizes the different implementations across five key technical axes:
 
-### Era 1: Application Origins
-The foundation of the project, focusing on practical grid-tie inverter applications.
-- **[grid_tie_inverter](./grid_tie_inverter)**: Initial application-specific implementation for H-Bridge and Push-Pull topologies.
-- **classic.ino**: The original baseline SOGI-PLL logic.
-
-### Era 2: Modular Transformation
-Transition to a class-based architecture, enabling multiple SOGI instances and better hardware abstraction.
-- **[modular_dual](./modular_dual)**: Introduction of `SOGI` and `FrequencyAdaptivePLL` classes; dual-channel sampling.
-- **[modular_dual_k6b_analogread_oneshot_fix4_debug2_ok](./modular_dual_k6b_analogread_oneshot_fix4_debug2_ok)**: Optimized analog driver wrapper for high-speed acquisition.
-- **[modular_dual_k6b_analogread_oneshot_fix4_debug2_ok_dz_dma2_ok](./modular_dual_k6b_analogread_oneshot_fix4_debug2_ok_dz_dma2_ok)**: Integration of DMA for jitter-free ADC sampling.
-
-### Era 3: Advanced Math & Precision
-A focus on estimation theory and timing precision.
-- **[sogi_ekf10_tuned_refined_new_ekf](./sogi_ekf10_tuned_refined_new_ekf)**: State estimation using an Extended Kalman Filter (EKF).
-- **[sogi_pll_paradigm_shift_timer_02_nojitter](./sogi_pll_paradigm_shift_timer_02_nojitter)**: Hardware timer-driven ISR to eliminate RTOS jitter.
-
-### Era 4: Production Hardening
-Hardened versions optimized for reliability and industry standards.
-- **[sogi_pll_production](./sogi_pll_production)**: RTOS-based, high-reliability version with multi-core support and watchdog integration.
-- **[sogi_pll_tests](./sogi_pll_tests)**: Automated validation suite.
-
-### Era 5: High-Performance Visualization (Current Apex)
-The most advanced branch, featuring Tustin-transformed filters and predictive control.
-- **[vis_sogi4_adaptive3_dc_running](./vis_sogi4_adaptive3_dc_running)**: Real-time DC compensation and OLED visualization.
-- **[k6b_vis7t4dma3_z_cycles_opt1safe2_sogi4_adaptive3_dc_nodc_OK](./k6b_vis7t4dma3_z_cycles_opt1safe2_sogi4_adaptive3_dc_nodc_OK)**: **Project Apex**. Features adaptive single-gain predictive modeling, Kahan summation, and advanced phase unwrapping.
+| Version / Folder | Sampling | Timebase | Filter | PLL / Feedback | DC Removal |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **[Apex (k6b)](./k6b_vis7t4dma3_z_cycles_opt1safe2_sogi4_adaptive3_dc_nodc_OK)** | Polling (ccount) | Cycle-Accurate | Tustin DFII | Predictive + Kahan | Windowed |
+| **[Production](./sogi_pll_production)** | Timer ISR | Hardware Timer | Forward Euler | Standard PI | EMA |
+| **[DMA-Backed](./modular_dual_k6b_analogread_oneshot_fix4_debug2_ok_dz_dma2_ok)** | DMA (Continuous) | Bresenham/Interp | Forward Euler | Adaptive (LMS) | EMA + Window |
+| **[Resampled](./vis_sogi4_adaptive3_dc_running)** | Polling/Buffering | Virtual/Confidence | Tustin | Standard PI | Coasting EMA |
+| **[No-Jitter](./sogi_pll_paradigm_shift_timer_02_nojitter)** | Polling (ccount) | Dynamic dt | Tustin | Standard PI | EMA |
+| **[EKF](./sogi_ekf10_tuned_refined_new_ekf)** | Polling/ISR | Standard | EKF Observer | EKF Estimated | Internal |
+| **[Dual-Channel](./modular_dual)** | Polling (ccount) | CPU Cycles | Forward Euler | Standard PI | Windowed |
+| **[Inverter](./grid_tie_inverter)** | Timer ISR | esp_timer | Forward Euler | Standard PI | EMA |
 
 ---
 
-## 📊 Feature Comparison
+## 📂 Variant Clusters
 
-| Feature | Era 1 (Classic) | Era 2 (Modular) | Era 3 (Precision) | Era 4 (Production) | Era 5 (Apex) |
-|---------|-----------------|-----------------|-------------------|--------------------|--------------|
-| **Architecture** | Monolithic | Class-based | Estimator-based | RTOS / Mutex | Advanced DSP |
-| **Filter Type** | Forward Euler | Forward Euler | EKF / Hybrid | Forward Euler | Tustin (Biquad) |
-| **Sampling** | Loop-based | Loop / DMA | Timer-driven | Timer ISR | Cycle-Accurate |
-| **DC Removal** | Simple EMA | Window-based | Kalman Gain | Stable EMA | Adaptive Window |
-| **Precision** | Standard float | Standard float | High-precision | Standard float | Kahan Summation |
-| **Diagnostics** | Serial only | Serial + OLED | Metrics | RTOS Metrics | CPU Headroom |
-| **Phase Tracking**| Standard | Unwrapped | EKF Estimated | Robust | Predictive |
+The repository contains several experimental branches and tuning variants:
+
+- **Modular Variants (`modular_dual_*`)**: Focus on class-based encapsulation and multi-channel handling. Includes fixes for different ESP32 Arduino Core versions (e.g., `oneshot_fix`).
+- **Visualization Variants (`vis_*`, `k4_`, `k6_`)**: Focused on high-fidelity OLED rendering. These explore different "dirty-rect" algorithms (TileManager) and phase-aligned plotting.
+- **Paradigm Shift Variants**: Explore moving away from fixed-rate sampling toward cycle-accurate dynamic `dt` integration.
 
 ---
 
-## 🛠 Key Technical Concepts
+## 🛠 Architectural Approaches
 
-### SOGI-QSG (Quadrature Signal Generator)
-The core of the system is the Second-Order Generalized Integrator. It generates an orthogonal version of the input signal (90° phase shift), which is essential for phase detection in single-phase systems. Modern versions (Era 5) use the **Tustin Transformation** for improved stability and frequency response at high sampling rates.
+### 1. Sampling & Acquisition
+- **Polling (ccount)**: Low-latency access to the ESP32 CPU cycle counter allows for sub-microsecond timing accuracy without ISR overhead.
+- **Hardware Timer ISR**: Provides a rock-solid, fixed-frequency sampling clock (e.g., 10kHz), ideal for production stability.
+- **DMA (Continuous Mode)**: Offloads ADC acquisition to hardware. Critical for high-bandwidth applications, but requires re-sampling/interpolation to align with the PLL's phase clock.
 
-### Predictive Cancellation Model
-Introduced in the "Apex" version, this model decouples the commanded control action from the state estimation. By predicting the effect of a frequency correction on the phase error, the system avoids "integrating its own corrections," leading to much faster and more stable locking.
+### 2. Timebase Management
+- **Dynamic dt**: Instead of assuming a fixed sample rate, the system measures the exact cycles elapsed between samples and feeds this delta into the discrete integrator, making it immune to OS-induced jitter.
+- **Bresenham Scheduling**: Distributes samples with integer cycle counts while maintaining a perfect long-term average frequency.
+- **Interpolation / Resampling**: Reconstructs an ideal uniform timebase from jittery or asynchronous hardware samples.
 
-### Kahan Summation
-To maintain precision over long integration periods, Kahan summation is used in the Loop Filter's integrator. This prevents small error increments from being "swallowed" by the large magnitude of the accumulated frequency state.
+### 3. Filter Discretization
+- **Forward Euler**: Simple and computationally cheap. Effective at high oversampling ratios.
+- **Tustin (Bilinear) Transformation**: Provides superior phase and amplitude mapping near the Nyquist frequency. Often implemented in Direct Form II (DFII) to minimize state memory.
+
+### 4. PLL Loop Dynamics
+- **Standard PI**: The industry-standard approach. Robust and well-understood.
+- **Adaptive PLL (LMS)**: Uses Least Mean Squares to estimate the "plant gain" in real-time, allowing the PLL to stay tuned even as signal amplitude or noise floor changes.
+- **Predictive Cancellation**: Models the expected phase shift from a frequency correction. By subtracting this "predicted effect" from the error, the system avoids self-excitation and achieves faster locking.
+- **EKF (Extended Kalman Filter)**: The most advanced observer. It models the entire system as a non-linear state space, providing optimal estimation of frequency, phase, and amplitude simultaneously.
+
+### 5. Precision & Stability
+- **Kahan Summation**: Used in the Loop Filter's integrator to preserve precision of tiny error updates that would otherwise be lost to floating-point truncation.
+- **Confidence Weighting**: In resampled versions, it allows the PLL to "coast" through data gaps by trusting its internal resonance more than a missing or noisy sample.
 
 ---
 
-## 🔮 Future Directions
-The next phase of the SOGI-PLL project will focus on **External Integration and Visualization**:
-- **UDP Multicast Broadcasting**: Real-time visualization frames and grid metrics will be broadcasted over UDP multicast.
-- **Grid Management System**: Integration with external monitoring systems for microgrid control and stabilization.
-- **Web-based Dashboard**: A remote dashboard to visualize synchronized waveforms from multiple nodes.
+## 🔮 Future Integration
+Future versions of this system will focus on networked grid management:
+- **UDP Multicast Visualization**: Broadcasting high-fidelity waveform frames over the network for remote monitoring.
+- **Grid Management API**: Exposing synchronized frequency and phase data to higher-level microgrid control systems.
+- **Time-Synchronized Meshes**: Coordinating multiple ESP32 nodes to perform distributed grid analysis.
 
 ---
 *Documentation generated for SOGI-PLL project development.*

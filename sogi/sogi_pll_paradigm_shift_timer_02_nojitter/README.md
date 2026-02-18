@@ -1,10 +1,18 @@
-# Jitter-Free Timer-Driven SOGI-PLL
+# Jitter-Compensated Tustin SOGI
+
+## Technical Specification
+
+| Axis | Implementation |
+| :--- | :--- |
+| **Sampling** | Loop Polling (ccount) |
+| **Timebase** | Dynamic dt (Elapsed CPU cycles per step) |
+| **SOGI Filter** | Tustin (Bilinear) Transformation |
+| **PLL / Control** | Standard PI |
+| **DC Removal** | EMA |
+| **Architecture** | Monolithic optimized loop |
 
 ## Overview
-Uses ESP32 hardware timers (ISR-driven) to perform sampling at exactly 10kHz, eliminating the timing jitter caused by FreeRTOS task switching.
+Eliminates OS-induced jitter errors by measuring exact time between samples and feeding it into the discrete integrator.
 
-## Key Features
-- Hardware timer interrupt-driven sampling.
-- Elimination of task-switching jitter.
-- Predictive control model integration.
-- Hardened timing logic for high-precision applications.
+## Description
+Detailed documentation for this specific implementation axis. This version represents a specialized approach to grid synchronization, focusing on the specific combination of the technical parameters listed above.

@@ -1,10 +1,18 @@
-# Modular Dual with DMA Integration
+# DMA-Backed Adaptive SOGI-PLL
+
+## Technical Specification
+
+| Axis | Implementation |
+| :--- | :--- |
+| **Sampling** | DMA (Continuous Mode) + ISR Timestamps |
+| **Timebase** | Bresenham scheduling + Linear Interpolation |
+| **SOGI Filter** | Class-based SOGI (Euler) |
+| **PLL / Control** | AdaptivePLL (LMS Gain Estimation) |
+| **DC Removal** | EMA-Smoothed Windowed Average |
+| **Architecture** | DMA-driven Modular architecture |
 
 ## Overview
-An experimental branch that integrates Direct Memory Access (DMA) for jitter-free ADC sampling. This is critical for high-frequency harmonic analysis.
+Decouples ADC acquisition from processing. Linear interpolation reconstructs a perfect timebase from jittery DMA frames.
 
-## Key Features
-- DMA-based ADC acquisition.
-- High-precision timestamps per sample.
-- Jitter reduction in the main control loop.
-- Modular class-based DSP logic.
+## Description
+Detailed documentation for this specific implementation axis. This version represents a specialized approach to grid synchronization, focusing on the specific combination of the technical parameters listed above.

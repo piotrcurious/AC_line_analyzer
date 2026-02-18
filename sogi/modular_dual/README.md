@@ -1,10 +1,18 @@
-# Modular Dual-Channel SOGI-PLL
+# Modular Dual-Channel SOGI
+
+## Technical Specification
+
+| Axis | Implementation |
+| :--- | :--- |
+| **Sampling** | Loop Polling (ccount) |
+| **Timebase** | CPU Cycles (ccount) |
+| **SOGI Filter** | Class-based SOGI (Euler) |
+| **PLL / Control** | Class-based FrequencyAdaptivePLL (PI) |
+| **DC Removal** | Windowed Average (Recalculated per cycle) |
+| **Architecture** | Modular classes (SOGI.h/PLL.h) |
 
 ## Overview
-This version introduces a class-based modular architecture, supporting concurrent SOGI instances for fundamental and harmonic tracking. It implements dual-channel sampling for both Voltage and Current.
+Simultaneous tracking of Voltage and Current channels. Optimized for modularity and harmonic monitoring.
 
-## Key Features
-- Modular `SOGI` and `FrequencyAdaptivePLL` classes.
-- Dual-channel sampling (GPIO 36 and GPIO 39).
-- Phase unwrapping and alignment for visualization.
-- Real-time OLED visualization using `SOGIVisualizer`.
+## Description
+Detailed documentation for this specific implementation axis. This version represents a specialized approach to grid synchronization, focusing on the specific combination of the technical parameters listed above.

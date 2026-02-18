@@ -1,13 +1,15 @@
 # SOGI-PLL Version: sogi_pll_paradigm_shift3
 
+## Evolution Stage
+**Stage 4: Advanced**
+
 ## Description
-Early version of the transition to timer-driven sampling architecture.
+Early transition to timer-driven software architecture.
 
-## Status
-- **Type**: Experimental
-- **Parent Branch**: Main
+## Key Features
+- Precise timing research
 
-## Evolution Notes
-This version belongs to the **Advanced / Experimental** stage of the project evolution.
-It focused on:
-- Bugfixes and performance tweaks.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Advanced / Experimental
+- **Focus**: State estimation and timing precision

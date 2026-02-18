@@ -1,13 +1,16 @@
 # SOGI-PLL Version: sogi_pll_tests
 
+## Evolution Stage
+**Baseline**
+
 ## Description
-Unit tests and validation suite for the SOGI-PLL project.
+Test suite for core SOGI-PLL algorithm validation.
 
-## Status
-- **Type**: Experimental
-- **Parent Branch**: Main
+## Key Features
+- Unit testing
+- Consistency checks
 
-## Evolution Notes
-This version belongs to the **Testing** stage of the project evolution.
-It focused on:
-- Bugfixes and performance tweaks.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Testing Framework
+- **Focus**: Validation and correctness of the core algorithms.

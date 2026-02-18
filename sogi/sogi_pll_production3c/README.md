@@ -1,13 +1,16 @@
 # SOGI-PLL Version: sogi_pll_production3c
 
+## Evolution Stage
+**Stage 3: Production**
+
 ## Description
-Advanced production candidate with multi-channel support or additional refinements.
+Production variant for ESP32 Arduino Core 3.x.
 
-## Status
-- **Type**: Stable / Production
-- **Parent Branch**: Main
+## Key Features
+- esp_timer integration
+- IDF v5 compatibility
 
-## Evolution Notes
-This version belongs to the **Production** stage of the project evolution.
-It focused on:
-- Bugfixes and performance tweaks.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Hardened / RTOS
+- **Focus**: Safety and reliability

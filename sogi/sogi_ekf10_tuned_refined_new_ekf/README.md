@@ -1,12 +1,16 @@
-# SOGI-EKF Tuned & Refined
+# SOGI-PLL Version: sogi_ekf10_tuned_refined_new_ekf
 
-An advanced implementation using an Extended Kalman Filter (EKF) for grid synchronization.
+## Evolution Stage
+**Stage 4: Advanced**
 
-## Features
-- **Kalman Filtering**: Improved noise rejection and state estimation compared to standard SOGI.
-- **Tuned Performance**: Refined for fast convergence and high accuracy.
-- **Advanced State Tracking**: Directly estimates frequency and phase within the EKF framework.
+## Description
+Advanced state estimation using Extended Kalman Filters.
 
-## Status
-- **Maturity**: Advanced / Experimental
-- **Recommended Use**: High-noise environments where standard PLLs might struggle.
+## Key Features
+- Heterodyne EKF architecture
+- Phase-drift measurements
+
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Advanced / Experimental
+- **Focus**: State estimation and timing precision

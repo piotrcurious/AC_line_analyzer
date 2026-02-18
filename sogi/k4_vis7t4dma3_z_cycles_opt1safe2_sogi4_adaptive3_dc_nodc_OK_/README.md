@@ -1,13 +1,15 @@
 # SOGI-PLL Version: k4_vis7t4dma3_z_cycles_opt1safe2_sogi4_adaptive3_dc_nodc_OK_
 
+## Evolution Stage
+**Stage 1: Monolithic**
+
 ## Description
-Experimental version exploring low SOGI gain (K=0.4) and optimized cycle detection.
+Experiment testing low SOGI gain (K=0.4).
 
-## Status
-- **Type**: Optimization / Bugfix
-- **Parent Branch**: Legacy
+## Key Features
+- Low-gain stability test
 
-## Evolution Notes
-This version belongs to the **Monolithic / Legacy** stage of the project evolution.
-It focused on:
-- Improving computational efficiency and timing.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Monolithic
+- **Focus**: DSP algorithm research

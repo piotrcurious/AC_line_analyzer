@@ -1,13 +1,17 @@
 # SOGI-PLL Version: vis4_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK
 
+## Evolution Stage
+**Stage 1: Monolithic**
+
 ## Description
-Optimized legacy version with reliable cycle detection and DC tracking.
+Optimized monolithic version focusing on buffer alignment.
 
-## Status
-- **Type**: Optimization / Bugfix
-- **Parent Branch**: Legacy
+## Key Features
+- Power-of-two optimizations
+- SOGIResampler introduction
+- Reliable cycle detection
 
-## Evolution Notes
-This version belongs to the **Monolithic / Legacy** stage of the project evolution.
-It focused on:
-- Dynamic DC offset estimation and removal.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Monolithic
+- **Focus**: DSP algorithm research

@@ -1,13 +1,17 @@
 # SOGI-PLL Version: vis7t4dma3_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK_acc2
 
+## Evolution Stage
+**Stage 1: Monolithic**
+
 ## Description
-Highly optimized legacy version with fast sampling and visualization.
+High-performance monolithic research version.
 
-## Status
-- **Type**: Optimization / Bugfix
-- **Parent Branch**: Legacy
+## Key Features
+- Timing accounting (us monitoring)
+- DMA-style buffering
+- Optimized visuals
 
-## Evolution Notes
-This version belongs to the **Monolithic / Legacy** stage of the project evolution.
-It focused on:
-- Dynamic DC offset estimation and removal.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Monolithic
+- **Focus**: DSP algorithm research

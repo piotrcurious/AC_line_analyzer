@@ -1,12 +1,16 @@
-# SOGI-PLL Paradigm Shift: Timer-Driven (No Jitter)
+# SOGI-PLL Version: sogi_pll_paradigm_shift_timer_02_nojitter
 
-This version represents a shift from software-loop sampling to precise hardware-timer-driven sampling.
+## Evolution Stage
+**Stage 4: Advanced**
 
-## Features
-- **Hardware Timers**: Uses ESP32 hardware timers for ADC sampling at exactly 10kHz.
-- **Zero Jitter**: Eliminates sampling jitter caused by FreeRTOS task scheduling or other background tasks.
-- **High Precision**: Significantly improves frequency estimation accuracy.
+## Description
+Research into zero-jitter software loops.
 
-## Status
-- **Maturity**: Optimized / Advanced
-- **Architectural Shift**: Core timing logic moved to ISR (Interrupt Service Routine).
+## Key Features
+- Cycle-count bookkeeping
+- Jitter compensation logic
+
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Advanced / Experimental
+- **Focus**: State estimation and timing precision

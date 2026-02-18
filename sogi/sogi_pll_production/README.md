@@ -1,16 +1,17 @@
-# SOGI-PLL Production Version
+# SOGI-PLL Version: sogi_pll_production
 
-This is the stable, production-ready version of the SOGI-PLL implementation.
+## Evolution Stage
+**Stage 3: Production**
 
-## Features
-- **Single-Channel Focus**: Optimized for high-reliability grid synchronization.
-- **Robustness**: Comprehensive error handling and watchdog integration.
-- **Compatibility**: Supports both ESP32 Arduino Core 2.x and 3.x.
-- **Documentation**: Fully documented code and setup instructions.
+## Description
+The current stable, production-ready version (v2.0.1).
 
-## Status
-- **Maturity**: Production
-- **Recommended Use**: General purpose grid synchronization, production environments.
+## Key Features
+- FreeRTOS Tasking
+- Watchdog & Mutex
+- High-reliability single channel
 
-## Architecture
-Standard monolithic SOGI-PLL with clean separation of concerns within the main file.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Hardened / RTOS
+- **Focus**: Safety and reliability

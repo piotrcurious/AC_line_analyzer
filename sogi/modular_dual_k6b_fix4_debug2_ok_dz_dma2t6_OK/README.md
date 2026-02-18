@@ -1,13 +1,15 @@
 # SOGI-PLL Version: modular_dual_k6b_fix4_debug2_ok_dz_dma2t6_OK
 
+## Evolution Stage
+**Stage 2: Modular**
+
 ## Description
-Refined modular dual-channel version with timing optimizations.
+Modular version with improved timing and dual sampling.
 
-## Status
-- **Type**: Optimization / Bugfix
-- **Parent Branch**: Modular
+## Key Features
+- V/I synchronized sampling
 
-## Evolution Notes
-This version belongs to the **Modular / Dual-Channel** stage of the project evolution.
-It focused on:
-- Addressing compatibility issues and bugs.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Modular / Class-based
+- **Focus**: Modularity and Multi-channel support

@@ -1,13 +1,15 @@
 # SOGI-PLL Version: grid_tie_inverter
 
+## Evolution Stage
+**Stage 4: Advanced**
+
 ## Description
-Application of SOGI-PLL for grid-tie inverter synchronization and control.
+SOGI-PLL application for grid-tie inverter control.
 
-## Status
-- **Type**: Experimental
-- **Parent Branch**: Main
+## Key Features
+- Inverter sync focus
 
-## Evolution Notes
-This version belongs to the **Application** stage of the project evolution.
-It focused on:
-- Bugfixes and performance tweaks.
+## Development Context
+This version represents a specific step in the project's evolution:
+- **Architecture**: Advanced / Experimental
+- **Focus**: State estimation and timing precision

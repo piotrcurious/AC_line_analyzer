@@ -64,11 +64,6 @@ The `SOGIVisualizer` drives the SSD1306 OLED via a 40MHz SPI bus using **Tile-ba
 - **Double-Dirty Logic**: Tiles are cleared and redrawn only if they were modified in the current *or* previous frame. This maximizes SPI throughput by only updating active waveform regions.
 - **DMA Alignment**: All graphics buffers are allocated with `MALLOC_CAP_DMA`, allowing the SPI hardware to handle transmission in the background.
 
-### 4.3 Auxiliary: FastMath Ring-Tables
-Included in the directory is `FastMathToolkit.h`, which provides **Ring-Table multipliers**.
-- **Math**: Uses a 16-segment piecewise linear approximation of the IEEE 754 mantissa to bypass the FPU for certain scalar multiplications.
-- **Future Use**: This infrastructure is designed to offload the FPU during multi-channel harmonic analysis where hundreds of SOGI instances may be running concurrently.
-
 ---
 
 ## 5. Signal Conditioning & Quantization
@@ -84,6 +79,21 @@ The system tracks the 1.65V mid-scale bias using a dual-stage approach:
 2.  **EMA Smoothing**: This mean is fed into an EMA filter with $\alpha=0.2$.
     $$V_{dc} = 0.2 \cdot V_{mean\_win} + 0.8 \cdot V_{dc\_prev}$$
 - **Rationale**: This prevents DC-tracking from phase-shifting the fundamental frequency (high rejection at 50Hz) while remaining agile enough to track thermal bias drift in the ADC front-end.
+
+---
+
+## 6. Critical Review & Implementation Assessment
+
+### 6.1 Architectural Strengths
+- **Decoupled Timing**: The use of a "Virtual Timebase" with linear interpolation is an elite-level solution for handling non-uniform hardware sampling in a phase-sensitive DSP environment.
+- **Numerical Rigor**: Implementation of Kahan summation and Tustin discretization demonstrates a deep understanding of the precision limits of IEEE 754 single-precision floats in long-running integrators.
+- **Hardware Exploitation**: The tile-based rendering engine effectively bypasses the bottleneck of SPI-based display updates, preserving CPU cycles for high-priority mathematical tasks.
+
+### 6.2 Areas for Improvement (Technical Debt)
+- **God-Function Pattern**: The `loop()` function is monolithic, mixing acquisition scheduling, DSP logic, and visualization orchestration. This should be refactored into a clear state-machine or distinct task-oriented functions.
+- **Coefficient Redundancy**: SOGI coefficient calculation is duplicated in `SOGI::step` and `SOGI::processWindow`. This "DRY" (Don't Repeat Yourself) violation increases the risk of algorithmic divergence if only one is updated.
+- **Global State Proliferation**: Extensive use of static globals and file-scope variables (e.g., `g_tiled_canvas`, `last_v_min`) complicates unit testing and prevents re-entrancy.
+- **Hardcoded Configuration**: Hardware pin definitions and SPI host selections are embedded deep within the class implementations (e.g., in `LGFX_SOGI`), rather than being passed via dependency injection or a centralized configuration header.
 
 ---
 

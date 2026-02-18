@@ -1,84 +1,82 @@
-# Deep Technical Analysis: Optimized Modular Dual SOGI-PLL
+# Technical Analysis: Optimized Dual SOGI-PLL (DMA + Tile Rendering)
 
-This directory contains a specialized ESP32 implementation of a Second-Order Generalized Integrator (SOGI) PLL. Unlike standard implementations that rely on synchronous polling or low-rate timers, this version implements an asynchronous bridge between high-rate DMA acquisition and a phase-synchronous DSP pipeline.
-
----
-
-## 1. Signal Acquisition & The Asynchronous Bridge
-
-### 1.1 DMA Pipeline & ISR Jitter
-Acquisition is handled by the ESP32 `adc_continuous` hardware, configured for a 200kHz aggregate rate.
-- **Hardware Layer**: The DMA controller fills 32-byte frames (16 samples of Type 1 ADC data).
-- **Temporal Uncertainty**: The `ccount` (CPU cycle counter) is captured at the start of the `adc_conv_done_callback`. While `ccount` has 4.16ns resolution (@240MHz), the entry latency into the ISR introduces a jitter $\Delta t_{isr} \approx 1\text{--}5\mu\text{s}$.
-- **Impact**: At the 100kHz per-channel rate, the interval between samples is $10\mu\text{s}$. A $2\mu\text{s}$ jitter represents a 20% uncertainty in the frame's temporal anchor, which is the primary source of noise in the resampled stream.
-
-### 1.2 Linear Interpolation Math
-To reconstruct a uniform timebase for the PLL, the system solves for $V(t_{target})$ using bounded frames:
-$$V(t) = V_n + (t - t_n) \cdot \frac{V_{n+1} - V_n}{t_{n+1} - t_n}$$
-This interpolation acts as a first-order low-pass filter on the quantization noise, providing a theoretical $\approx 3\text{dB}$ SNR improvement at the midpoint of samples ($\alpha=0.5$), but it cannot recover information lost to ISR jitter.
+This directory implements an advanced, high-performance Grid Synchronization system using a Second-Order Generalized Integrator Phase-Locked Loop (SOGI-PLL) on the ESP32. It features a sophisticated asynchronous acquisition pipeline and a low-overhead tile-based visualization system.
 
 ---
 
-## 2. Numerical Signal Processing
+## 🏗️ System Architecture
 
-### 2.1 Tustin (Bilinear) Discretization
-The SOGI filter is discretized using the Tustin transform, which maps the $s$-domain to the $z$-domain via $s = \frac{2}{T} \frac{z-1}{z+1}$.
-- **Pole Sensitivity**: At a 6.4kHz internal sampling rate (128 samples/cycle @ 50Hz), the system poles are located at $z \approx 0.98 \pm 0.045j$.
-- **Numerical Limits**: At higher oversampling (e.g., >100kHz), the poles move to $z \approx 0.999 \pm 0.003j$. In FP32 (24-bit mantissa), the rounding errors in the $a_1$ and $a_2$ coefficients ($a_1 \to -2, a_2 \to 1$) can lead to limit-cycle oscillations or catastrophic cancellation. This implementation avoids this by fixing the internal DSP rate via Bresenham scheduling.
+The system is designed around a **Hardware-Software Co-Design** philosophy, decoupling high-rate hardware acquisition from phase-synchronous DSP processing.
 
-### 2.2 Kahan Summation Integrator
-To maintain phase lock over long durations, the frequency integrator uses Kahan Summation to combat floating-point truncation.
-- **Quantization**: When adding a small error $\epsilon \approx 10^{-6}$ to an angular frequency $\omega \approx 314.159$, the low bits are lost.
-- **Correction**: By maintaining a separate `integral_err_c` variable to store the "lost" residue, the effective precision is extended, preventing long-term frequency drift that would otherwise occur in naive FP32 accumulation.
+### 1. The Data Acquisition Pipeline (Asynchronous Bridge)
+Unlike standard implementations that poll the ADC or use low-rate timers, this system utilizes the ESP32's **Continuous ADC DMA** unit.
 
----
+*   **Acquisition (Producer)**: The ADC1 unit samples at an aggregate rate of **200 kHz** (100 kHz per channel for Voltage and Current). Data is moved via DMA into 32-byte frames.
+*   **Temporal Anchoring**: An ISR (`adc_conv_done_callback`) captures the high-resolution CPU `ccount` (4.16ns resolution) at the exact moment a DMA frame is ready. This timestamp provides a "temporal anchor" for the entire frame.
+*   **Buffer Depth**: A `FRAME_BUFFER_SIZE` of 400 frames maintains a rolling history of ~32ms of raw signal, allowing the DSP consumer to "look back" in time.
 
-## 3. Advanced Control Theory
+### 2. The Virtual Timebase & Resampling
+The DSP pipeline does not process data at the 200kHz rate. Instead, it maintains a **Virtual Timebase** synchronous to the estimated grid frequency.
 
-### 3.1 Predictive Cancellation Model
-Standard PLLs suffer from a "command-to-feedback" lag caused by the SOGI filter's group delay.
-- **Concept**: The system implements an internal model to predict the phase shift caused by its own frequency corrections.
-- **Decoupling**: $e_{residual} = e_{raw} - (\gamma \cdot u_{last})$. By subtracting the predicted effect of the last control action ($u_{last}$) from the observed error ($e_{raw}$), the integrator only sees the *external* disturbance. This allows for significantly higher loop gains ($K_p$) without inducing self-excited oscillations.
-
-### 3.2 LMS Gain Adaptation
-The plant gain $\gamma$ (the transfer function from frequency command to phase error) is not constant; it depends on grid impedance and signal magnitude.
-- **Normalized LMS**: The system uses an NLMS update law:
-  $$\hat{\gamma}_{n+1} = \hat{\gamma}_n + \mu \frac{x_n (d_n - \hat{\gamma}_n x_n)}{\|x_n\|^2 + \epsilon}$$
-- **Stability**: With $\mu = 0.1001$, the gain estimator is highly damped, ensuring stability even in the presence of 12-bit quantization noise and ADC non-linearities.
+*   **Bresenham Timing Engine**: To ensure exactly 128 samples per AC cycle, the system uses a Bresenham-style accumulator to calculate the ideal `target_time` in CPU cycles. This eliminates cumulative drift even when the `CPU_FREQ / (FREQ * 128)` ratio is fractional.
+*   **Linear Interpolation**: For every virtual sample point, the `interpolateSampleAtTime` engine searches the DMA frame buffer. It locates the two hardware samples that bracket the target time and performs linear interpolation:
+    $$V(t) = V_n + (t - t_n) \frac{V_{n+1} - V_n}{t_{n+1} - t_n}$$
+*   **Oversampling Gain**: By reconstructing the signal from a 200kHz stream for a ~6.4kHz DSP loop (128 samples/cycle @ 50Hz), the system achieves a theoretical SNR gain of:
+    $$10 \log_{10}\left(\frac{200\text{kHz}}{6.4\text{kHz}}\right) \approx 14.9 \text{ dB}$$
 
 ---
 
-## 4. Hardware & Memory Orchestration
+## 📐 Numerical Signal Processing
 
-### 4.1 Bresenham-style Sample Scheduling
-To ensure the PLL maintains exactly $N$ samples per cycle without drifting against the CPU clock, a first-order Delta-Sigma approach is used for timing.
-- **Accumulator**: `bresenham_acc` tracks the fractional CPU cycles per sample.
-- **Zero-Drift**: This ensures that over $M$ samples, the total elapsed cycles exactly matches $M \times (\text{CPU\_FREQ} / \text{TARGET\_FREQ})$, maintaining long-term phase-synchronicity with the grid even if the division is not an integer.
+### 1. SOGI Discretization (Tustin Transform)
+The Second-Order Generalized Integrator is discretized using the **Tustin (Bilinear) Transform**. This transform is superior to Forward Euler for power electronics because it maps the entire $s$-plane into the unit circle of the $z$-plane, ensuring stability and better matching the frequency response near the Nyquist frequency.
 
-### 4.2 Frame Buffer Depth & Latency
-- **Buffer Capacity**: The `FRAME_BUFFER_SIZE` is 400 frames. At 80µs/frame, this represents 32ms of raw history.
-- **Cleanup Threshold**: The `CLEANUP_FRAMES_DIVIDER` (200) limits the active search window to $\approx 5\text{ms}$. If the main loop is blocked by Serial I/O or other high-priority tasks for more than 5ms, the interpolation engine will lose its temporal anchor, reverting to nearest-sample fallback and inducing phase jitter.
+*   **Filter Path**: The implementation uses **Direct Form II (DFII)** to realize both the Alpha (Band-Pass) and Beta (Quadrature Low-Pass) paths. This minimizes state memory and provides better numerical properties than Direct Form I.
+*   **State Management**: Orthogonal signals are processed in windows to maintain phase coherence during frequency transients.
 
-### 4.3 Memory & Cache Efficiency
-- **IRAM-Resident Code**: Critical DSP paths and the ADC ISR are marked `IRAM_ATTR` to prevent cache-miss latency spikes during Flash MMU activity.
-- **DMA RAM**: The `TileManager` utilizes 8KB of `MALLOC_CAP_DMA` internal RAM. This allows the SPI controller to transmit OLED updates in the background without CPU intervention, preserving cycles for the SOGI window processing.
+### 2. Adaptive PLL with Predictive Cancellation
+The PLL is a sophisticated self-tuning observer that decouples control actions from state estimation.
 
-### 4.3 Double-Dirty Tiling Logic
-To maximize the effective refresh rate of the SSD1306 (limited by the 40MHz SPI bus), the system divides the screen into 512 tiles ($4 \times 4$ pixels).
-- **The "Tail" Problem**: A moving waveform leaves a residue on the screen.
-- **Double-Buffering**: Each tile maintains `dirty_curr` and `dirty_prev`. A tile is cleared and redrawn if it was dirty in either the current frame (new data) or the previous frame (needs erasure of old data). This minimizes the "SPI airtime" to only the active pixels and their recent paths.
+*   **Predictive Cancellation**: To prevent the loop filter from oscillating due to the SOGI group delay, the system calculates the **Residual Error**:
+    $$e_{residual} = e_{raw} - (\gamma \cdot u_{last})$$
+    It subtracts the "predicted effect" of the last frequency shift command from the observed phase error.
+*   **LMS Gain Estimation**: The "plant gain" ($\gamma$) is not assumed; it is estimated in real-time using a Least Mean Squares (LMS) update law. This allows the PLL to stay locked even if the grid signal amplitude or impedance changes drastically.
+*   **Kahan Summation**: To achieve sub-milliHz frequency resolution, the frequency integrator uses Kahan Summation. This technique stores the floating-point truncation error in a separate compensation variable, effectively extending the precision of the accumulation beyond the standard 24-bit mantissa of FP32.
 
 ---
 
-## 5. Technical Specifications & Quantization
+## 📺 Visualization: Tile-based "Dirty-Rect" Rendering
 
-| Dimension | Specification | Notes |
+Driving an SPI OLED (SSD1306) at high frame rates typically consumes significant CPU and SPI bandwidth. This implementation uses a **TileManager** to optimize throughput.
+
+*   **Tiling**: The 128x64 screen is divided into 4x4 pixel tiles.
+*   **Double-Dirty Logic**: Each tile maintains `dirty_curr` and `dirty_prev` flags. A tile is only refreshed if it was dirty in the *current* frame (new drawing) or the *previous* frame (needs erasure). This ensures the "tail" of a moving waveform is cleared without requiring a full-screen `memset`.
+*   **DMA Transfers**: Tile buffers are allocated in DMA-accessible internal RAM (`MALLOC_CAP_DMA`). Updates are pushed over a **40 MHz SPI bus**, allowing the CPU to return to DSP tasks while the hardware handles the display update.
+
+---
+
+## ⚖️ Design Trade-offs & Hardware Limits
+
+| Dimension | DMA/Interpolation (This Version) | Standard Polling / ISR |
 | :--- | :--- | :--- |
-| **ADC Quantization** | 12-bit (4096 levels) | Effective ENOB $\approx 10.5$ due to ESP32 INL/DNL. |
-| **Oversampling Gain** | $\approx 15\text{dB}$ | 200kHz acquisition vs 6.4kHz DSP loop. |
-| **Arithmetic** | FP32 (IEEE 754) | Optimized via Kahan Summation and Tustin pre-computation. |
-| **Loop Latency** | $160\mu\text{s}$ | Combined DMA frame buffering and ISR entry. |
-| **Jitter Margin** | $< 10\mu\text{s}$ | Limited by FreeRTOS interrupt latency. |
+| **CPU Load** | Very Low (Hardware handles sampling) | High (CPU handles every sample) |
+| **Jitter Resistance**| High (Asynchronous bridge) | Low (Directly tied to OS latency) |
+| **Numerical Stability**| High (Tustin + Kahan) | Medium (Euler / Naive Integrator) |
+| **Complexity** | Very High (Requires Buffer Search/Interp) | Low |
+| **Latency** | 1 Frame (~160µs) | Near Zero |
+
+### Quantization and ENOB
+While the ESP32 ADC has a 12-bit resolution, its Effective Number of Bits (ENOB) is closer to 10.5 due to non-linearity. The **Oversampling + Interpolation** strategy effectively acts as a low-pass filter, recovering some of this lost precision and providing cleaner signals to the SOGI integrator.
 
 ---
-*Technical analysis for the SOGI-PLL Grid Synchronization Project.*
+
+## 📂 File Analysis
+
+- `modular_dual_..._opt.ino`: Orchestrates the DMA-ISR-Loop bridge and the Bresenham timing engine.
+- `SOGI.cpp/h`: Contains the core mathematical implementation of the Tustin SOGI and Adaptive PLL.
+- `SOGIvisualizer.cpp/h`: Implements the high-speed tile rendering engine.
+- `FastMathToolkit.h`: Auxiliary ring-table based multipliers for future off-loading of floating-point divisions.
+- `analog.cpp/h`: Legacy wrappers for one-shot ADC calibration (maintained for reference).
+
+---
+*Developed as part of the SOGI-PLL Grid Synchronization Project.*

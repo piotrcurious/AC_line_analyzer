@@ -74,7 +74,8 @@ static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw_value) {
 }
 
 // ISR callback - unchanged logic but keep minimal work
-static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
+// this version does not drop old data if buffer full so is slightly faster
+static bool IRAM_ATTR adc_conv_done_callback_lean(adc_continuous_handle_t handle, 
                                              const adc_continuous_evt_data_t *edata,
                                              void *user_data) {
     uint32_t end_timestamp = get_cycle_count();
@@ -103,6 +104,44 @@ static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
 
     return false;
 }
+
+static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
+                                             const adc_continuous_evt_data_t *edata,
+                                             void *user_data) {
+    uint32_t end_timestamp = get_cycle_count();
+
+    uint32_t next_write = (frame_write_idx + 1) % FRAME_BUFFER_SIZE;
+
+    // If buffer appears full, drop one oldest frame to make space.
+    // This makes the producer non-blocking at the cost of oldest-data loss.
+    if (next_write == frame_read_idx) {
+        // Advance read pointer (drop oldest)
+        uint32_t new_read = (frame_read_idx + 1) % FRAME_BUFFER_SIZE;
+        frame_read_idx = new_read;
+        frames_dropped++; // still count it as dropped
+        // continue to write into next_write
+    }
+
+    uint32_t size = edata->size;
+    if (size > CONV_FRAME_SIZE) size = CONV_FRAME_SIZE;
+
+    memcpy((void*)frame_buffer[frame_write_idx].raw_data,
+           edata->conv_frame_buffer,
+           size);
+
+    // mark fully written in a safe order: end_timestamp then data_size
+    frame_buffer[frame_write_idx].end_timestamp = end_timestamp;
+    frame_buffer[frame_write_idx].data_size = (uint16_t)size;
+    frame_buffer[frame_write_idx].sample_count = 0;
+
+    // publish the new write index
+    frame_write_idx = next_write;
+    isr_callback_count++;
+
+    return false;
+}
+
+
 
 // Count samples in a frame. Cache the result for future calls.
 // optimized to iterate by element rather than byte scattering

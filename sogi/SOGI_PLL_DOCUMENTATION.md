@@ -1,6 +1,8 @@
 # SOGI-PLL Grid Synchronization System
 ## Production Documentation v2.0
 
+> **Note on Project Scope:** This document primarily covers the **Era 4: Production Hardened** version of the SOGI-PLL system (`sogi_pll_production`). For advanced experimental versions featuring predictive modeling and Tustin-transformed filters, please refer to the **Era 5: Apex** series in the main [README.md](./README.md).
+
 ---
 
 ## Table of Contents

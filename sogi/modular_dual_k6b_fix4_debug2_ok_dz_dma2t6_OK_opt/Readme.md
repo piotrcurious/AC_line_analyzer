@@ -52,13 +52,33 @@ The "plant gain" $\gamma$ (the phase sensitivity to frequency shifts) is estimat
 
 ---
 
-## 4. Hardware Orchestration & Resource Management
+## 4. Feedback Logic & Quantization Vulnerabilities
 
-### 4.1 Resource Profiling
+### 4.1 Unused History Provisions
+The `AdaptivePLL` class maintains 8-sample circular buffers for phase error (`phase_hist`) and control action (`control_hist`).
+- **The Problem**: While these buffers are correctly populated in every cycle, the LMS update law currently only utilizes the **single previous sample** (`idx_prev`).
+- **Analysis**: This is a significant "provision without application." The 8-sample window is a valuable resource for statistical noise reduction or least-squares gain estimation that remains unexploited in the current codebase.
+
+### 4.2 LMS "Gain Collapse" Phenomenon
+A critical numerical issue exists when the PLL settles near zero error.
+- **Quantization Floor**: Near lock, the change in phase error ($\Delta \phi$, or `dy` in code) often falls below the quantization granularity of the 12-bit ADC or the interpolated FP32 stream.
+- **The Failure**: When `dy` becomes 0 due to quantization while the control action is non-zero, the LMS update law interprets this as the gain being too high. It incorrectly drives $\hat{\gamma}$ towards zero.
+- **Impact**: This "Gain Collapse" breaks the predictive model, causing the PLL to revert to a standard, non-predictive loop filter, losing its snappiness and stability margins.
+
+### 4.3 Asymmetric Deadbands
+The system implements a `PHASE_DEADBAND = 0.01f`.
+- **Application Error**: This deadband is applied to the PI controller (stopping frequency updates when error is small), but it is **not applied** to the LMS estimator.
+- **Result**: The estimator continues to try "learning" from sub-quantization noise, leading to the instability mentioned above. Proper application would involve a deadband on the LMS update law based on the measured noise floor in the unused history buffers.
+
+---
+
+## 5. Hardware Orchestration & Visualization
+
+### 5.1 Resource Profiling
 - **RAM Usage**: ~35.6 KB total static RAM (15.6 KB for DMA frames, 16 KB for Display Tiles, 4 KB for Signal Buffers).
 - **CPU Load**: The interpolation engine consumes ~1.3% of the 240MHz CPU. SOGI window processing takes ~30-50µs per cycle.
 
-### 4.2 Visualization: Tile-based "Dirty-Rect" Engine
+### 5.2 Visualization: Tile-based "Dirty-Rect" Engine
 The `SOGIVisualizer` drives the SSD1306 OLED via a 40MHz SPI bus using **Tile-based rendering**.
 - **Tiling**: The screen is divided into 512 tiles ($4 \times 4$ pixels).
 - **Double-Dirty Logic**: Tiles are cleared and redrawn only if they were modified in the current *or* previous frame. This maximizes SPI throughput by only updating active waveform regions.
@@ -66,43 +86,41 @@ The `SOGIVisualizer` drives the SSD1306 OLED via a 40MHz SPI bus using **Tile-ba
 
 ---
 
-## 5. Signal Conditioning & Quantization
+## 6. Signal Conditioning & Quantization
 
-### 5.1 Oversampling SNR Gains
+### 6.1 Oversampling SNR Gains
 The aggregate 200kHz acquisition rate provides a Significant Oversampling Ratio (OSR) relative to the 6.4kHz DSP loop (OSR $\approx 31.25$).
 - **Process Gain**: The linear interpolation process acts as a decimation filter, providing $\approx 15\text{dB}$ of SNR gain.
 - **Effective Resolution**: While the hardware ADC is 12-bit, the oversampled and interpolated signal fed to the SOGI integrator has an effective resolution (ENOB) approaching **14.5 bits**.
 
-### 5.2 Hybrid DC Estimation
+### 6.2 Hybrid DC Estimation
 The system tracks the 1.65V mid-scale bias using a dual-stage approach:
 1.  **Windowed Mean**: Each AC cycle calculates the arithmetic mean of all samples in the window.
 2.  **EMA Smoothing**: This mean is fed into an EMA filter with $\alpha=0.2$.
     $$V_{dc} = 0.2 \cdot V_{mean\_win} + 0.8 \cdot V_{dc\_prev}$$
-- **Rationale**: This prevents DC-tracking from phase-shifting the fundamental frequency (high rejection at 50Hz) while remaining agile enough to track thermal bias drift in the ADC front-end.
 
 ---
 
-## 6. Critical Review & Implementation Assessment
+## 7. Numerical Optimization: FastMath Ring-Tables
 
-### 6.1 Architectural Strengths
-- **Decoupled Timing**: The use of a "Virtual Timebase" with linear interpolation is an elite-level solution for handling non-uniform hardware sampling in a phase-sensitive DSP environment.
-- **Numerical Rigor**: Implementation of Kahan summation and Tustin discretization demonstrates a deep understanding of the precision limits of IEEE 754 single-precision floats in long-running integrators.
-- **Hardware Exploitation**: The tile-based rendering engine effectively bypasses the bottleneck of SPI-based display updates, preserving CPU cycles for high-priority mathematical tasks.
-
-### 6.2 Areas for Improvement (Technical Debt)
-- **God-Function Pattern**: The `loop()` function is monolithic, mixing acquisition scheduling, DSP logic, and visualization orchestration. This should be refactored into a clear state-machine or distinct task-oriented functions.
-- **Coefficient Redundancy**: SOGI coefficient calculation is duplicated in `SOGI::step` and `SOGI::processWindow`. This "DRY" (Don't Repeat Yourself) violation increases the risk of algorithmic divergence if only one is updated.
-- **Global State Proliferation**: Extensive use of static globals and file-scope variables (e.g., `g_tiled_canvas`, `last_v_min`) complicates unit testing and prevents re-entrancy.
-- **Hardcoded Configuration**: Hardware pin definitions and SPI host selections are embedded deep within the class implementations (e.g., in `LGFX_SOGI`), rather than being passed via dependency injection or a centralized configuration header.
+Included in the directory is `FastMathToolkit.h`, which provides **Ring-Table multipliers** for offloading the FPU.
+- **Approximation**: It uses a 16-segment piecewise linear approximation of the IEEE 754 mantissa.
+- **Precision**: Each segment is a first-order formal-series chart, providing a high-speed alternative to floating-point multiplication for scalars.
+- **Future Use**: This infrastructure is designed to scale to multi-channel systems where hundreds of SOGI instances might otherwise saturate the FPU.
 
 ---
 
-## 📂 Design Rationale: Why this Version?
+## 8. Critical Review & Implementation Assessment
 
-This "opt" (Optimized) version represents the convergence of three separate technical axes:
-1.  **Asynchronous Sampling**: DMA-based acquisition eliminates the "hard-real-time" requirement for the main loop.
-2.  **Theoretical Rigor**: Tustin discretization and Kahan summation ensure high-fidelity estimation.
-3.  **UI Performance**: Tile-based rendering allows a high-fidelity 50fps visualization without interrupting the DSP pipeline.
+### 8.1 Architectural Strengths
+- **Decoupled Timing**: The "Virtual Timebase" is an elite-level solution for non-uniform sampling.
+- **Numerical Rigor**: Kahan summation and Tustin discretization handle the core math with high fidelity.
+
+### 8.2 Areas for Improvement (Technical Debt)
+- **Monolithic `loop()`**: Combines acquisition, DSP, and UI. Should be decomposed into a state machine or tasks.
+- **Hidden Division-by-Zero**: The anti-windup logic in `AdaptivePLL::update` contains a potential division by zero (`integral_state = i_term / ki`) if `ki` is ever set to 0. It is currently "safe" only because the outer `if` block is coincidentally unreachable when `ki=0`.
+- **LMS Robustness**: Needs to incorporate sign-integrity checks (gain should not flip) and quantization-aware update gating.
+- **Buffer Utilization**: Refactor the LMS estimator to utilize the full 8-sample history window (provisions already exist) for statistical regression rather than relying on a single, noisy delta.
 
 ---
 *Technical analysis for the SOGI-PLL Grid Synchronization Project.*

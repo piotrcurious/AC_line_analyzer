@@ -2,7 +2,7 @@
 
 **Version:** 2.0.0  
 **Platform:** ESP32  
-**License:** MIT  
+**License:** UBI-AI
 
 ---
 

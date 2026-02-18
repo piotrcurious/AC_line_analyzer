@@ -1,17 +1,17 @@
 # SOGI-PLL Version: modular_dual
 
-## Evolution Stage
-**Stage 2: Modular**
+## Project Era
+**Era 2: Modular Transformation**
 
 ## Description
-Initial refactor into a modular, class-based architecture.
+Initial refactor into C++ classes for SOGI and PLL components.
 
 ## Key Features
 - SOGI class
 - FrequencyAdaptivePLL class
 - Dual-channel support
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Modular / Class-based
-- **Focus**: Modularity and Multi-channel support
+- **Advancement**: Transition to object-oriented DSP components.

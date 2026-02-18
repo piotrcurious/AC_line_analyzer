@@ -1,16 +1,15 @@
 # SOGI-PLL Version: sogi_pll_paradigm_shift_ekf_2_timer
 
-## Evolution Stage
-**Stage 4: Advanced**
+## Project Era
+**Era 3: Math & Precision**
 
 ## Description
-Hybrid EKF implementation with timer-driven sampling.
+Hybrid version combining EKF and timer-driven sampling.
 
 ## Key Features
-- EKF frequency tracking
-- Experimental
+- Experimental hybrid
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Advanced / Experimental
-- **Focus**: State estimation and timing precision
+- **Advancement**: Precision math, EKF, and jitter compensation.

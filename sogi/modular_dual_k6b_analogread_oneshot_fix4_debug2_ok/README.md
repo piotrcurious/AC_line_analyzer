@@ -1,16 +1,17 @@
 # SOGI-PLL Version: modular_dual_k6b_analogread_oneshot_fix4_debug2_ok
 
-## Evolution Stage
-**Stage 2: Modular**
+## Project Era
+**Era 2: Modular Transformation**
 
 ## Description
-Modular version with ADC one-shot driver compatibility fixes.
+Modular version with optimized ADC legacy wrappers.
 
 ## Key Features
 - Analog.h legacy wrapper
 - Bresenham scheduling
+- ESP32 Core 3.x fix
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Modular / Class-based
-- **Focus**: Modularity and Multi-channel support
+- **Advancement**: Transition to object-oriented DSP components.

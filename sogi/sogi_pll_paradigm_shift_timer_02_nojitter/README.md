@@ -1,16 +1,16 @@
 # SOGI-PLL Version: sogi_pll_paradigm_shift_timer_02_nojitter
 
-## Evolution Stage
-**Stage 4: Advanced**
+## Project Era
+**Era 3: Math & Precision**
 
 ## Description
-Research into zero-jitter software loops.
+Research into zero-jitter software loops through cycle-counting.
 
 ## Key Features
 - Cycle-count bookkeeping
-- Jitter compensation logic
+- Jitter-compensated integration
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Advanced / Experimental
-- **Focus**: State estimation and timing precision
+- **Advancement**: Precision math, EKF, and jitter compensation.

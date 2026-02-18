@@ -1,17 +1,16 @@
 # SOGI-PLL Version: vis_sogi4_adaptive3_dc_running
 
-## Evolution Stage
-**Stage 1: Monolithic**
+## Project Era
+**Era 5: Advanced Visualization**
 
 ## Description
-Monolithic version with added dynamic DC offset tracking.
+The latest project evolution with advanced dual-stage DC tracking.
 
 ## Key Features
-- Dynamic DC removal
-- EMA filters
-- Visualization
+- Separated sampling/processing DC offsets
+- Most advanced stable version
 
-## Development Context
-This version represents a specific step in the project's evolution:
-- **Architecture**: Monolithic
-- **Focus**: DSP algorithm research
+## Technical Significance
+In the project's lineage, this version is significant for:
+- **Architecture**: High-Performance Visualization
+- **Advancement**: Optimal waveform fidelity and remote frame readiness.

@@ -1,62 +1,58 @@
-# SOGI-PLL Project Evolution
+# SOGI-PLL Project Lineage
 
-This directory tracks the development of Second-Order Generalized Integrator (SOGI) Phase-Locked Loop (PLL) systems on the ESP32. The project has evolved from simple monolithic scripts to advanced, modular, and production-ready architectures.
+This directory documents the technical evolution of SOGI-PLL grid synchronization on the ESP32. Unlike standard versioning, the project's history is best understood through its transition from application-specific code to advanced modular and visualization-focused architectures.
 
-## 🏗️ Architectural Stages
+## 📈 Technical Chronology
 
-The following stages represent the major milestones in the project's development.
+The project has evolved through five distinct eras, as verified by file metadata and code complexity.
 
-### Stage 0: Baseline Monolithic
-The simplest implementations focusing on core mathematical correctness.
-*   **[classic.ino](./classic.ino)**: The minimal ISR-based implementation. It uses a hardware timer to drive a 10kHz sampling loop, performing all DSP in the interrupt context.
-*   **[sogi_pll_tests](./sogi_pll_tests)**: A validation suite for verifying core algorithm behavior.
+### Era 1: Application Origins (`...808ns`)
+Focused on direct power electronics control using legacy ADC drivers.
+*   **[grid_tie_inverter](./grid_tie_inverter)**: The oldest ancestor. Uses Forward Euler discretization and simple PI frequency tracking.
 
-### Stage 1: Monolithic Research & Visualization (`vis_...`)
-Early research into frequency adaptation and real-time visualization on SSD1306 displays. These versions typically use software-timed loops for sampling.
-*   **[vis_sogi4_adaptive3](./vis_sogi4_adaptive3)**: Initial frequency-adaptive sampling.
-*   **[vis_sogi4_adaptive3_dc_running](./vis_sogi4_adaptive3_dc_running)**: Added dynamic DC offset tracking via EMA filters.
-*   **[vis4_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK](./vis4_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK)**: Optimization for power-of-two buffer sizes and the introduction of `SOGIResampler`.
-*   **[vis7t4dma3_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK_acc2](./vis7t4dma3_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK_acc2)**: The pinnacle of the monolithic research branch, featuring high-performance visualization and detailed CPU timing accounting.
+### Era 2: Modular Transformation (`...820ns - 844ns`)
+The primary architectural shift from monolithic scripts to reusable C++ classes.
+*   **[modular_dual](./modular_dual)**: Introduced the `SOGI` and `FrequencyAdaptivePLL` classes.
+*   **[modular_dual_k6b_analogread_oneshot_fix4_debug2_ok](./modular_dual_k6b_analogread_oneshot_fix4_debug2_ok)**: Solved ESP32 Core 3.x ADC "oneshot" driver overhead by implementing a custom `analog.h` legacy wrapper.
+*   **[modular_dual_k6b_fix4_debug2_ok_dz_dma2t6_OK_opt_tune](./modular_dual_k6b_fix4_debug2_ok_dz_dma2t6_OK_opt_tune)**: The math peak of the modular branch, featuring **AdaptivePLL** with predictive gain estimation and Kahan summation for high precision.
 
-### Stage 2: Modular Transformation (`modular_dual_...`)
-A major architectural shift moving DSP logic into reusable C++ classes (`SOGI`, `FrequencyAdaptivePLL`). This stage introduced simultaneous Voltage and Current (V/I) monitoring.
-*   **[modular_dual](./modular_dual)**: The first refactor into a class-based structure.
-*   **[modular_dual_k6b_analogread_oneshot_fix4_debug2_ok_dz_dma2_ok](./modular_dual_k6b_analogread_oneshot_fix4_debug2_ok_dz_dma2_ok)**: Implementation of legacy ADC wrappers to bypass modern Arduino overhead and introduction of Bresenham-style sample scheduling.
-*   **[modular_dual_k6b_fix4_debug2_ok_dz_dma2t6_OK_opt_tune](./modular_dual_k6b_fix4_debug2_ok_dz_dma2t6_OK_opt_tune)**: The most advanced modular version, featuring `AdaptivePLL` with predictive cancellation and Kahan summation for high precision.
+### Era 3: Advanced Math & Precision (`...844ns - 848ns`)
+Experimental branches exploring radical improvements in state estimation and timing.
+*   **[sogi_ekf10_tuned_refined_new_ekf](./sogi_ekf10_tuned_refined_new_ekf)**: Replaced standard PLLs with a **Heterodyne Extended Kalman Filter (EKF)** for robust lock in high-noise environments.
+*   **[sogi_pll_paradigm_shift_timer_02_nojitter](./sogi_pll_paradigm_shift_timer_02_nojitter)**: Solved software-loop sampling jitter through precise CPU cycle-count bookkeeping and jitter-compensated integration.
 
-### Stage 3: Hardened Production (`sogi_pll_production`)
-Focusing on reliability, safety, and multi-core execution for industrial use.
-*   **[sogi_pll_production](./sogi_pll_production)**: **Version 2.0.1**. This is the recommended version for most control applications. It uses a high-priority FreeRTOS task, hardware-timer-driven interrupts, and comprehensive error handling (Watchdog, Mutexes).
-*   **[sogi_pll_production3c](./sogi_pll_production3c)**: A variant using `esp_timer` for compatibility with different ESP32 Arduino Core toolchains.
+### Era 4: The Production Snapshot (`...852ns - 856ns`)
+A stabilized mid-project milestone focused on system hardening rather than DSP advancement.
+*   **[sogi_pll_production](./sogi_pll_production)**: Standardizes the Era 2/3 logic into a hardened FreeRTOS environment with Watchdog protection, Mutex-guarded data sharing, and comprehensive error handling. *Note: Uses simpler Forward Euler math for maximum reliability/determinism.*
 
-### Stage 4: Specialized Research & Paradigm Shifts
-Exploring radical new approaches and advanced state estimation.
-*   **[sogi_pll_paradigm_shift_timer_02_nojitter](./sogi_pll_paradigm_shift_timer_02_nojitter)**: A focus on zero-jitter sampling in software loops through precise cycle-count bookkeeping.
-*   **[sogi_ekf10_tuned_refined_new_ekf](./sogi_ekf10_tuned_refined_new_ekf)**: Research into Extended Kalman Filters (EKF) for grid synchronization in extremely noisy environments.
+### Era 5: High-Performance Visualization (`...864ns - 880ns`)
+The current project peak, optimizing for real-time waveform monitoring and grid diagnostics.
+*   **[vis7t4dma3_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK_acc2](./vis7t4dma3_cycles_opt1safe2_sogi4_adaptive3_dc_running_OK_acc2)**: Introduced microsecond-level CPU timing accounting and high-speed waveform accumulation.
+*   **[vis_sogi4_adaptive3_dc_running](./vis_sogi4_adaptive3_dc_running)**: **The Latest Evolution.** Features the "Adaptive3" PLL and a sophisticated dual-stage DC tracking system (separating sampling and processing offsets) to eliminate jitter in zero-crossing detection.
 
 ---
 
-## 📂 Version Map Summary
+## 📂 Architectural Comparison
 
-| Version Category | Key Feature | Representative Directory |
-| :--- | :--- | :--- |
-| **Monolithic** | Easy to read, single file | `vis_sogi4_adaptive3_dc_running` |
-| **Modular** | Dual-channel (V/I), OO-Design | `modular_dual_k6b_..._tune` |
-| **Production** | Reliable, RTOS, Mutex, WDT | `sogi_pll_production` |
-| **Advanced** | EKF, Paradigm Timing | `sogi_ekf10_...` |
-
----
-
-## 🗺️ Future Roadmap
-
-The next phase of architectural evolution moves beyond local visualization:
-
-1.  **UDP Multicast Frame Broadcasting**: The visualization data frames (waveform buffers and PLL metrics) will be broadcast over the network using UDP Multicast.
-2.  **Remote Visualization**: Decoupling UI from the DSP core, allowing multiple remote monitors (PC/Web/Mobile) to visualize the grid state without adding latency to the control loop.
-3.  **Grid Management Integration**: Facilitating the use of the SOGI-PLL system as a high-speed sensor node for larger-scale distributed grid monitoring and management systems.
+| Feature | Production (Era 4) | Advanced Vis (Era 5) | Modular Tune (Era 2) |
+| :--- | :--- | :--- | :--- |
+| **Math** | Forward Euler | Tustin (Trapezoidal) | Tustin + Adaptive Gain |
+| **Timing** | Hardware Timer ISR | Software Jitter-Compensated | Bresenham Distributed |
+| **ADC** | Legacy Direct | Arduino Standard | Optimized Legacy Wrapper |
+| **Focus** | Stability/Uptime | Visualization Fidelity | Modular Flexibility |
 
 ---
 
-## 📖 Related Documentation
-*   [SOGI_PLL_DOCUMENTATION.md](SOGI_PLL_DOCUMENTATION.md): Detailed algorithm theory and tuning guidelines.
-*   [COMPATIBILITY_NOTES.md](COMPATIBILITY_NOTES.md): Guidance on ESP32 Arduino Core versions (2.x vs 3.x).
+## 🗺️ Roadmap: Distributed Monitoring
+
+The Era 5 (`vis_sogi4`) architecture provides the foundation for the next major milestone:
+
+1.  **UDP Multicast Frame Broadcasting**: Waveform "frames" currently used for local SSD1306 rendering will be broadcast over the network.
+2.  **Remote Visualization**: Decoupling the UI from the DSP core, allowing external systems to monitor grid quality without impacting synchronization stability.
+3.  **Grid Management Node**: Transitioning the system from a local controller to a networked sensor node for distributed grid management.
+
+---
+
+## 📖 Essential Documentation
+*   [SOGI_PLL_DOCUMENTATION.md](SOGI_PLL_DOCUMENTATION.md): Deep dive into the SOGI-PLL math and tuning.
+*   [COMPATIBILITY_NOTES.md](COMPATIBILITY_NOTES.md): Guidance on ESP32 Core 2.x/3.x compatibility layers.

@@ -1,15 +1,15 @@
 # SOGI-PLL Version: k6b_vis7t4dma3_z_cycles_opt1safe2_sogi4_adaptive3_dc_nodc_OK
 
-## Evolution Stage
-**Stage 1: Monolithic**
+## Project Era
+**Era 2: Early Research**
 
 ## Description
-Experiment testing balanced SOGI gain (K=0.6).
+Experimental version testing balanced SOGI gain (K=0.6).
 
 ## Key Features
 - Standard-gain validation
 
-## Development Context
-This version represents a specific step in the project's evolution:
-- **Architecture**: Monolithic
-- **Focus**: DSP algorithm research
+## Technical Significance
+In the project's lineage, this version is significant for:
+- **Architecture**: Modular / Class-based
+- **Advancement**: Transition to object-oriented DSP components.

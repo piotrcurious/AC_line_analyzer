@@ -1,15 +1,16 @@
 # SOGI-PLL Version: modular_dual_k6b_fix4_debug2_ok_dz_dma2t6_OK
 
-## Evolution Stage
-**Stage 2: Modular**
+## Project Era
+**Era 2: Modular Transformation**
 
 ## Description
-Modular version with improved timing and dual sampling.
+Modular version with V/I synchronized sampling.
 
 ## Key Features
-- V/I synchronized sampling
+- Synchronized sampling
+- Improved timing
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Modular / Class-based
-- **Focus**: Modularity and Multi-channel support
+- **Advancement**: Transition to object-oriented DSP components.

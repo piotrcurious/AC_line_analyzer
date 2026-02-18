@@ -1,15 +1,15 @@
 # SOGI-PLL Version: sogi_pll_paradigm_shift3
 
-## Evolution Stage
-**Stage 4: Advanced**
+## Project Era
+**Era 3: Math & Precision**
 
 ## Description
-Early transition to timer-driven software architecture.
+Early transition to jitter-compensated software architecture.
 
 ## Key Features
-- Precise timing research
+- Timing precision research
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Advanced / Experimental
-- **Focus**: State estimation and timing precision
+- **Advancement**: Precision math, EKF, and jitter compensation.

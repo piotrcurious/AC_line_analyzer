@@ -1,16 +1,17 @@
 # SOGI-PLL Version: sogi_ekf10_tuned_refined_new_ekf
 
-## Evolution Stage
-**Stage 4: Advanced**
+## Project Era
+**Era 3: Math & Precision**
 
 ## Description
-Advanced state estimation using Extended Kalman Filters.
+Advanced state estimation using a Heterodyne Extended Kalman Filter.
 
 ## Key Features
 - Heterodyne EKF architecture
 - Phase-drift measurements
+- Noise robustness
 
-## Development Context
-This version represents a specific step in the project's evolution:
+## Technical Significance
+In the project's lineage, this version is significant for:
 - **Architecture**: Advanced / Experimental
-- **Focus**: State estimation and timing precision
+- **Advancement**: Precision math, EKF, and jitter compensation.

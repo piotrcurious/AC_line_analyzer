@@ -1,15 +1,17 @@
 # SOGI-PLL Version: grid_tie_inverter
 
-## Evolution Stage
-**Stage 4: Advanced**
+## Project Era
+**Era 1: Application Origins**
 
 ## Description
-SOGI-PLL application for grid-tie inverter control.
+The oldest version, focused on direct grid-tie inverter control.
 
 ## Key Features
-- Inverter sync focus
+- Forward Euler math
+- Legacy ADC driver
+- Simple PI control
 
-## Development Context
-This version represents a specific step in the project's evolution:
-- **Architecture**: Advanced / Experimental
-- **Focus**: State estimation and timing precision
+## Technical Significance
+In the project's lineage, this version is significant for:
+- **Architecture**: Monolithic / Legacy
+- **Advancement**: Foundational grid-tie logic.

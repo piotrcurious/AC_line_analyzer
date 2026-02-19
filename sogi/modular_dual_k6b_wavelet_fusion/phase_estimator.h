@@ -56,8 +56,8 @@ private:
   // Configuration
   PhaseEstConfig config;
 
-  // History buffer storage
-  uint16_t* history_buffers;  // Flat array: [depth][CYCLES][SAMPLES]
+  // History buffer storage (Now storing normalized floats)
+  float* history_buffers;     // Flat array: [depth][CYCLES][SAMPLES]
   uint16_t history_count;     // Number of buffers currently stored
   uint16_t history_write_idx; // Circular buffer write position
 
@@ -88,19 +88,26 @@ private:
   float* correlation_buffer;
   float* residual_buffer;
 
+  // Optimized buffers
+  float* norm_ref_3c;     // [3 * 128]
+  float* extended_tar;    // [256]
+
   bool initialized;
 
   // Helper: get buffer pointer for a specific history index
-  inline uint16_t* get_history_buffer(uint16_t idx) {
+  inline float* get_history_buffer(uint16_t idx) {
     uint16_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
     return &history_buffers[idx * buf_size];
   }
 
-  // Compute phase shift between reference wavelet and target buffer using sliding correlation
-  float compute_phase_shift(const uint16_t* reference, const uint16_t* target);
+  // Pre-normalize a frame (3 cycles) and store as floats
+  void pre_normalize_frame(const float* frame, float* dest_norm_3c);
 
-  // Compute phase shift for a single cycle
-  float compute_phase_shift_cycle(const uint16_t* ref_cycle, const uint16_t* search_cycle);
+  // Compute phase shift between two pre-normalized buffers
+  float compute_phase_shift_norm(const float* reference, const float* target);
+
+  // Optimized single-cycle phase shift using pre-normalized cycles
+  float compute_phase_shift_cycle_norm(const float* norm_ref_cycle, const float* norm_tar_cycle);
 
   // Analyze trend to determine state
   void analyze_trend(PhaseEstResult& result);
@@ -122,11 +129,11 @@ public:
   // strobe_div_cycles is the number of nominal cycles captured between buffers (e.g. 4.0)
   void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles = 0.0f, uint32_t cpu_hz = 240000000);
 
-  // Add a new frame to history
+  // Add a new frame to history (Now takes float buffer)
   // jitter_rad is the phase shift due to capture timing jitter (leading > 0)
   // current_f_pll is the frequency at which this frame was sampled
   // strobe_tick is the CPU cycle count when the strobe was scheduled
-  void add_frame(const uint16_t* buffer, uint16_t size, float jitter_rad = 0.0f, float current_f_pll = 0.0f, uint32_t strobe_tick = 0);
+  void add_frame(const float* buffer, uint16_t size, float jitter_rad = 0.0f, float current_f_pll = 0.0f, uint32_t strobe_tick = 0);
 
   // Notify that a phase correction was applied (for tracking)
   void notify_correction_applied(float correction_rad);

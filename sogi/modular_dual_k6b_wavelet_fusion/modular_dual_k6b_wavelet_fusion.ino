@@ -471,11 +471,11 @@ void loop() {
             cycle_start_idx[current_cycle] = buf_idx;
 
             // Feed the wavelet phase estimator every cycle
-            static uint16_t pe_buf[384];
+            static float pe_buf[384];
             int start_3c = cycle_start_idx[(current_cycle + 1) % 4];
             for (int i = 0; i < 384; i++) {
                 int id = (start_3c + i) % BUF_N;
-                pe_buf[i] = (uint16_t)(v_samp_buf[id] / RAW_TO_MV);
+                pe_buf[i] = v_samp_buf[id] - v_dc_offset; // Use DC-removed millivolts
             }
             float jitter_rad = (2.0f * PI * pll.freq * (float)jitter_cycles) * inv_cpu_freq;
             phase_est.add_frame(pe_buf, 384, jitter_rad, pll.freq, last_cycle_boundary);

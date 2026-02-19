@@ -162,22 +162,20 @@ void PhaseEstimator::add_frame(const uint16_t* buffer, uint16_t size, float jitt
     }
   }
 
-  // Track frames since correction
-  if (correction_was_applied) {
-    frames_since_correction++;
-  }
-
   // Decrement cooldown
   if (correction_cooldown > 0) correction_cooldown--;
 }
 
 float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint16_t* target) {
-  // Extract center cycle from reference (cycle 2 of 3 cycles)
-  const uint16_t* ref_cycle = reference + PE_SAMPLES_PER_CYCLE; // Middle cycle
+  float sum_phase = 0.0f;
+  for (uint8_t c = 0; c < PE_CYCLES_PER_BUFFER; c++) {
+    sum_phase += compute_phase_shift_cycle(reference + c * PE_SAMPLES_PER_CYCLE,
+                                           target + c * PE_SAMPLES_PER_CYCLE);
+  }
+  return sum_phase / (float)PE_CYCLES_PER_BUFFER;
+}
 
-  // We'll search in the center cycle of target buffer for best match
-  const uint16_t* search_cycle = target + PE_SAMPLES_PER_CYCLE;
-
+float PhaseEstimator::compute_phase_shift_cycle(const uint16_t* ref_cycle, const uint16_t* search_cycle) {
   // Normalize reference wavelet
   float ref_mean = 0.0f;
   for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
@@ -187,7 +185,7 @@ float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint1
 
   float ref_std = 0.0f;
   for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
-    correlation_buffer[i] = ref_cycle[i] - ref_mean;
+    correlation_buffer[i] = (float)ref_cycle[i] - ref_mean;
     ref_std += correlation_buffer[i] * correlation_buffer[i];
   }
   ref_std = sqrtf(ref_std / PE_SAMPLES_PER_CYCLE);
@@ -201,15 +199,19 @@ float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint1
   float min_residual = 1e9f;
   int16_t best_offset = 0;
 
+  float residuals[PE_SAMPLES_PER_CYCLE];
+
   for (int16_t offset = 0; offset < PE_SAMPLES_PER_CYCLE; offset++) {
     float residual_sum = 0.0f;
 
     for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
       uint16_t target_idx = (i + offset) % PE_SAMPLES_PER_CYCLE;
-      float target_val = search_cycle[target_idx];
+      float target_val = (float)search_cycle[target_idx];
       float diff = correlation_buffer[i] - (target_val - ref_mean) / ref_std;
       residual_sum += diff * diff;
     }
+
+    residuals[offset] = residual_sum;
 
     if (residual_sum < min_residual) {
       min_residual = residual_sum;
@@ -217,24 +219,24 @@ float PhaseEstimator::compute_phase_shift(const uint16_t* reference, const uint1
     }
   }
 
+  // Sub-sample interpolation (parabolic fit)
+  float fine_offset = (float)best_offset;
+  if (best_offset > 0 && best_offset < PE_SAMPLES_PER_CYCLE - 1) {
+    float y1 = residuals[best_offset - 1];
+    float y2 = residuals[best_offset];
+    float y3 = residuals[best_offset + 1];
+    float denom = (y1 - 2.0f * y2 + y3);
+    if (fabs(denom) > 1e-6f) {
+        fine_offset = (float)best_offset + (y1 - y3) / (2.0f * denom);
+    }
+  }
+
   // Convert offset to phase (radians)
-  // Positive phase means target signal leads the reference
-  // A positive best_offset means reference[i] matches target[i+offset]
-  // So target peak index is LARGER than reference peak index
-  // Larger index = happened LATER = LAGGING
-  // We want raw_phase to be POSITIVE when f_grid > f_pll
-  // f_grid > f_pll means reference peak index is SMALLER than target peak index
-  // so offset is POSITIVE. We want this to be NEGATIVE raw_phase? No.
-  // Let's stick to: raw_phase = phi_target - phi_reference (rel to sampling)
-  // phi = 2pi * (1 - idx/128).
-  // phi_target - phi_ref = 2pi/128 * (ref_idx - target_idx) = -2pi/128 * offset
-  // Positive phase means target signal leads the reference.
-  // If offset > 0, target[i+offset] matches ref[i], so target peak is LATER -> LAGGING -> negative.
-  float phase_rad = -(2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
+  float phase_rad = -(2.0f * (float)M_PI * fine_offset) / PE_SAMPLES_PER_CYCLE;
 
   // Normalize to [-π, π]
-  while (phase_rad > M_PI) phase_rad -= 2.0f * M_PI;
-  while (phase_rad < -M_PI) phase_rad += 2.0f * M_PI;
+  while (phase_rad > (float)M_PI) phase_rad -= 2.0f * (float)M_PI;
+  while (phase_rad < -(float)M_PI) phase_rad += 2.0f * (float)M_PI;
 
   return phase_rad;
 }
@@ -247,11 +249,11 @@ void PhaseEstimator::fit_linear_drift(const float* trend, uint8_t count,
     return;
   }
 
-  // Simple linear regression
+  // Simple linear regression using cycles as X-axis
   float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_xx = 0.0f;
 
   for (uint8_t i = 0; i < count; i++) {
-    float x = (float)i;
+    float x = (float)i * strobe_cycles;
     float y = trend[i];
     sum_x += x;
     sum_y += y;
@@ -277,7 +279,7 @@ float PhaseEstimator::calculate_drift_variance(const float* trend, uint8_t count
 
   float variance = 0.0f;
   for (uint8_t i = 0; i < count; i++) {
-    float expected = intercept + slope * i;
+    float expected = intercept + slope * ((float)i * strobe_cycles);
     float diff = trend[i] - expected;
     variance += diff * diff;
   }
@@ -377,9 +379,12 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
 
     const uint16_t* target = get_history_buffer(hist_idx);
 
-    // Compute raw phase shift: how much target leads/lags reference
-    // Positive = target signal leads reference signal in the capture
-    float raw_phase = compute_phase_shift(reference, target);
+    // Compute raw phase shift: phi_reference - phi_target
+    // We want a negative slope when f_grid > f_pll.
+    // If f_grid > f_pll, phi_reference > phi_target, so raw_phase is POSITIVE.
+    // Chronologically, as target approaches reference, this difference goes to zero.
+    // Thus the slope is NEGATIVE.
+    float raw_phase = compute_phase_shift(target, reference);
 
     // Compensate for:
     // 1. Jitter in capture timing (positive jitter rad means captured LATE -> leading signal)
@@ -391,20 +396,20 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
 
     // Accumulated phase relative to sampling clock:
     // phi_true = measured_phase - jitter - correction
-    // (Positive jitter/correction means delayed strobe -> signal appears leading/positive)
-    // Trend[h] = T_h - T_r = (M_h - J_h - C_h) - (M_r - J_r - C_r)
-    //                     = raw_phase - (J_h - J_r) - (C_h - C_r)
-    float accumulated_phase = raw_phase - (jitter_target - jitter_ref) - (corr_target - corr_ref);
+    // Trend[h] = phi_true_ref - phi_true_target
+    //          = (phi_r - jitter_r - corr_r) - (phi_t - jitter_t - corr_t)
+    //          = raw_phase - (jitter_ref - jitter_target) - (corr_ref - corr_target)
+    float accumulated_phase = raw_phase - (jitter_ref - jitter_target) - (corr_ref - corr_target);
 
     // Unwrap phase discontinuities
     if (i > 0) {
       float diff = accumulated_phase - last_phase;
-      while (diff > M_PI) {
-        accumulated_phase -= 2.0f * M_PI;
+      while (diff > (float)M_PI) {
+        accumulated_phase -= 2.0f * (float)M_PI;
         diff = accumulated_phase - last_phase;
       }
-      while (diff < -M_PI) {
-        accumulated_phase += 2.0f * M_PI;
+      while (diff < -(float)M_PI) {
+        accumulated_phase += 2.0f * (float)M_PI;
         diff = accumulated_phase - last_phase;
       }
     }
@@ -472,7 +477,7 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
 
     if (dt > 0.001f) {
       // f_grid = (strobe_cycles - delta_phi / 2pi) / dt
-      float f_est = (strobe_cycles - delta_phi / (2.0f * M_PI)) / dt;
+      float f_est = (strobe_cycles - delta_phi / (2.0f * (float)M_PI)) / dt;
       sum_f_est += f_est;
       count++;
     }

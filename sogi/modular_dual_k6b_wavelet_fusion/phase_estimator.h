@@ -99,6 +99,9 @@ private:
   // Compute phase shift between reference wavelet and target buffer using sliding correlation
   float compute_phase_shift(const uint16_t* reference, const uint16_t* target);
 
+  // Compute phase shift for a single cycle
+  float compute_phase_shift_cycle(const uint16_t* ref_cycle, const uint16_t* search_cycle);
+
   // Analyze trend to determine state
   void analyze_trend(PhaseEstResult& result);
 

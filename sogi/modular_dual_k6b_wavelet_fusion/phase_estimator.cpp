@@ -29,6 +29,8 @@ PhaseEstimator::PhaseEstimator()
     ref_pll_error(0.0f),
     prev_cycle_buf(nullptr),
     prev_cycle_valid(false),
+    current_residue(0.0f),
+    avg_residue(0.0f),
     initialized(false) {
   memset(&config, 0, sizeof(config));
   memset(history_pll_error, 0, sizeof(history_pll_error));
@@ -221,6 +223,12 @@ float PhaseEstimator::compute_phase_shift_norm(const float* reference, const flo
     sum_snr += snr_c;
   }
   current_snr = sum_snr / (float)PE_CYCLES_PER_BUFFER;
+
+  // Residue: 1.0 - correlation_coefficient.
+  // max_dot for perfect match is PE_SAMPLES_PER_CYCLE.
+  // so snr_c is already the correlation coefficient.
+  current_residue = 1.0f - current_snr;
+
   return sum_phase / (float)PE_CYCLES_PER_BUFFER;
 }
 
@@ -234,11 +242,6 @@ float PhaseEstimator::compute_phase_shift_cycle_hierarchical(const float* norm_r
     extended_tar[i] = norm_tar_cycle[i];
     extended_tar[i + PE_SAMPLES_PER_CYCLE] = norm_tar_cycle[i];
   }
-
-  // Debug: compute dot product at offset 0
-  float dot0 = 0;
-  for(int i=0; i<PE_SAMPLES_PER_CYCLE; i++) dot0 += norm_ref_cycle[i] * norm_tar_cycle[i];
-  // printf("Dot0: %.2f\n", dot0);
 
   // Pass 1: Coarse search
   const int coarse_stride = 4;
@@ -438,6 +441,30 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
   // 1. Long-term correlation (Absolute Phase)
   float raw_phase = compute_phase_shift_norm(newest_frame, reference_frame);
 
+  // SHAPE TRANSITION DETECTION
+  // If current residue is significantly higher than average, signal shape changed.
+  if (avg_residue == 0) avg_residue = current_residue;
+
+  bool shape_transition = (current_residue > 2.0f * avg_residue && current_residue > 0.1f);
+
+  if (shape_transition) {
+      // Calculate absolute phase BEFORE re-anchoring
+      float jitter_newest = history_jitter_rad[newest_idx];
+      float corr_newest = history_pll_error[newest_idx];
+      float old_absolute_phase = (ref_jitter_rad + ref_pll_error) + raw_phase - jitter_newest - corr_newest;
+
+      // Re-anchor to new shape
+      memcpy(reference_frame, newest_frame, 3 * PE_SAMPLES_PER_CYCLE * sizeof(float));
+      ref_jitter_rad = 0;
+      ref_pll_error = old_absolute_phase + jitter_newest + corr_newest;
+
+      // Re-calculate raw_phase (now 0)
+      raw_phase = 0;
+      avg_residue = current_residue;
+  } else {
+      avg_residue = 0.95f * avg_residue + 0.05f * current_residue;
+  }
+
   // 2. Short-term correlation (Frequency)
   float diff_phase = 0;
   if (prev_cycle_valid) {
@@ -455,9 +482,9 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
 
   // Accumulated phase relative to sampling clock:
   // phi_true = measured_phase - jitter - correction
-  // phi_true_newest = raw_phase_absolute = (phi_ref_true) - raw_phase - jitter_newest - corr_newest
+  // phi_true_newest = raw_phase_absolute = (phi_ref_true) + raw_phase - jitter_newest - corr_newest
   // We use the persistent reference as our temporal anchor (phi_ref_true = jitter_ref + corr_ref)
-  float absolute_phase = (ref_jitter_rad + ref_pll_error) - raw_phase - jitter_newest - corr_newest;
+  float absolute_phase = (ref_jitter_rad + ref_pll_error) + raw_phase - jitter_newest - corr_newest;
 
   // Override linear_drift_rate if diff_phase is reliable
   // rad/cycle
@@ -500,6 +527,19 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
 
   // Analyze trend and update state machine
   analyze_trend(result);
+
+  // Overwrite state machine result with a more continuous confidence metric
+  // If snr is high, we are more confident.
+  // current_snr is dot_product / PE_SAMPLES_PER_CYCLE.
+  // For identical normalized signals, it is 1.0.
+  float snr_conf = constrain((current_snr - 0.7f) / 0.3f, 0.0f, 1.0f);
+
+  // Also account for stability (variance)
+  float var_conf = 1.0f / (1.0f + 100.0f * result.drift_variance);
+
+  if (current_state == PE_STABLE) result.snr = snr_conf * var_conf;
+  else if (current_state == PE_READY) result.snr = 0.5f * snr_conf;
+  else result.snr = 0.1f * snr_conf;
 
   // Add frequency estimation if parameters are set
   if (buffer_time_interval > 0.0f) {

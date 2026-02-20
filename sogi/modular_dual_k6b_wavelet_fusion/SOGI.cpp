@@ -132,14 +132,22 @@ void AdaptivePLL::init() {
         phase_hist[i] = 0.0f;
     }
 
-    // EKF Init
-    x_phase = 0;
-    x_omega = 0;
-    P[0][0] = 1.0f; P[0][1] = 0.0f;
-    P[1][0] = 0.0f; P[1][1] = 10.0f;
+    // Augmented EKF Init
+    x_theta = 0; // theta_signal (absolute relative to 50Hz)
+    x_omega = 0; // omega_signal (absolute relative to 50Hz)
+    x_beta = 0;
 
-    Q[0][0] = 0.1f;    Q[0][1] = 0.0f;
-    Q[1][0] = 0.0f;    Q[1][1] = 100.0f;
+    pll_theta_offset = 0;
+
+    memset(P, 0, sizeof(P));
+    P[0][0] = 1.0f;
+    P[1][1] = 10.0f;
+    P[2][2] = 1.0f;
+
+    memset(Q, 0, sizeof(Q));
+    Q[0][0] = 0.001f;  // theta_sig random walk
+    Q[1][1] = 0.01f;   // omega_sig random walk
+    Q[2][2] = 0.0001f; // beta random walk
 }
 
 void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
@@ -212,90 +220,122 @@ void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_err, fl
     if (mag_smooth > 0.10f) {
         float sogi_p_err = v_beta / mag_smooth;
 
-        // 1. EKF Prediction Step
-        // x = [phase_error (rad), omega_offset (rad/s)]
-        // ts is the time elapsed since last call (~1 cycle duration)
-        float x_phase_pred = x_phase + x_omega * ts;
-        float x_omega_pred = x_omega;
+        // 1. Prediction Step
+        // x = [theta_sig, omega_sig, beta]
+        float theta_p = x_theta + x_omega * ts;
+        float omega_p = x_omega;
+        float beta_p  = x_beta;
 
-        // Covariance Prediction: P = F*P*F^T + Q
-        // F = [[1, ts], [0, 1]]
-        float P00_p = P[0][0] + ts * (P[1][0] + P[0][1] + ts * P[1][1]) + Q[0][0];
-        float P01_p = P[0][1] + ts * P[1][1] + Q[0][1];
-        float P10_p = P[1][0] + ts * P[1][1] + Q[1][0];
-        float P11_p = P[1][1] + Q[1][1];
+        // P = F*P*F^T + Q
+        float nP[3][3];
+        nP[0][0] = P[0][0] + ts*(P[1][0] + P[0][1] + ts*P[1][1]) + Q[0][0];
+        nP[0][1] = P[0][1] + ts*P[1][1] + Q[0][1];
+        nP[0][2] = P[0][2] + ts*P[1][2] + Q[0][2];
+        nP[1][0] = P[1][0] + ts*P[1][1] + Q[1][0];
+        nP[1][1] = P[1][1] + Q[1][1];
+        nP[1][2] = P[1][2] + Q[1][2];
+        nP[2][0] = P[2][0] + ts*P[2][1] + Q[2][0];
+        nP[2][1] = P[2][1] + Q[2][1];
+        nP[2][2] = P[2][2] + Q[2][2];
 
-        // 2. EKF Measurement Step
-        // z1: Phase Error measurement
-        // We fuse SOGI and Wavelet Absolute Phase for z1
-        float z1;
-        float R_z1;
+        // 2. Update Step
+        // Measurements: z1 = SOGI Error, z2 = Wavelet Abs, z3 = Wavelet Drift
+        // h[0] = (theta_sig - theta_pll) + beta
+        // h[1] = theta_sig
+        // h[2] = omega_sig
+        float z[3] = { sogi_p_err, abs_phase, wavelet_err / (ts + 1e-9f) };
+        float h[3] = { (theta_p - pll_theta_offset) + beta_p, theta_p, omega_p };
 
-        if (confidence > 0.5f) {
-            z1 = abs_phase;
-            R_z1 = 0.001f; // Trust absolute anchor
-        } else {
-            z1 = sogi_p_err;
-            R_z1 = 0.1f;
+        // Measurement Covariance R
+        float R[3] = { 0.1f, 0.05f, 0.1f };
+
+        // Discrepancy-based R inflation for SOGI
+        float disc = fabs(z[0] - h[0]);
+        if (disc > 0.05f) R[0] *= 100.0f;
+
+        // Confidence-based R inflation for Wavelet
+        if (confidence < 0.5f) { R[1] = 100.0f; R[2] = 10.0f; }
+
+        for (int i = 0; i < 3; i++) {
+            float H[3];
+            if (i == 0)      { H[0]=1; H[1]=0; H[2]=1; } // z1
+            else if (i == 1) { H[0]=1; H[1]=0; H[2]=0; } // z2
+            else             { H[0]=0; H[1]=1; H[2]=0; } // z3
+
+            float S = 0;
+            for(int r=0; r<3; r++) for(int c=0; c<3; c++) S += H[r] * nP[r][c] * H[c];
+            S += R[i];
+
+            if (fabs(S) > 1e-12f) {
+                float invS = 1.0f / S;
+                float K[3];
+                for(int r=0; r<3; r++) {
+                    K[r] = 0;
+                    for(int c=0; c<3; c++) K[r] += nP[r][c] * H[c];
+                    K[r] *= invS;
+                }
+
+                float innov = z[i] - h[i];
+                // Unwrap Innov for phase measurements
+                if (i == 0 || i == 1) {
+                    while (innov > PI) innov -= TWO_PI;
+                    while (innov < -PI) innov += TWO_PI;
+                }
+
+                theta_p += K[0] * innov;
+                omega_p += K[1] * innov;
+                beta_p  += K[2] * innov;
+
+                float tempP[3][3];
+                for(int r=0; r<3; r++) {
+                    for(int c=0; c<3; c++) {
+                        tempP[r][c] = nP[r][c];
+                        for(int k=0; k<3; k++) tempP[r][c] -= K[r] * H[k] * nP[k][c];
+                    }
+                }
+                memcpy(nP, tempP, sizeof(nP));
+
+                h[0] = (theta_p - pll_theta_offset) + beta_p;
+                h[1] = theta_p;
+                h[2] = omega_p;
+            }
         }
 
-        // z2: Frequency Offset measurement (rad/s)
-        float z2 = wavelet_err / (ts + 1e-9f);
-        float R_z2 = (confidence > 0.8f) ? 0.001f : 0.1f;
+        x_theta = theta_p;
+        x_omega = omega_p;
+        x_beta  = beta_p;
+        for(int r=0; r<3; r++) for(int c=0; c<3; c++) P[r][c] = nP[r][c];
 
-        // Innovation Gate for SOGI fallback
-        if (confidence < 0.5f) {
-            float disc = fabs(sogi_p_err - x_phase_pred);
-            if (disc > 0.05f) R_z1 *= 100.0f;
-        }
+        // 3. Control Application
+        float err_phase = x_theta - pll_theta_offset;
+        while (err_phase > PI) err_phase -= TWO_PI;
+        while (err_phase < -PI) err_phase += TWO_PI;
 
-        // Kalman Gain Calculation
-        // H = [[1, 0], [0, 1]]
-        float S00 = P00_p + R_z1;
-        float S01 = P01_p;
-        float S10 = P10_p;
-        float S11 = P11_p + R_z2;
-
-        float det = S00 * S11 - S01 * S10;
-        if (fabs(det) > 1e-12f) {
-            float inv_det = 1.0f / det;
-            float K00 = (P00_p * S11 - P01_p * S10) * inv_det;
-            float K01 = (P01_p * S00 - P00_p * S01) * inv_det;
-            float K10 = (P10_p * S11 - P11_p * S10) * inv_det;
-            float K11 = (P11_p * S00 - P10_p * S01) * inv_det;
-
-            // State Update
-            x_phase = x_phase_pred + K00 * (z1 - x_phase_pred) + K01 * (z2 - x_omega_pred);
-            x_omega = x_omega_pred + K10 * (z1 - x_phase_pred) + K11 * (z2 - x_omega_pred);
-
-            // Covariance Update: P = (I - K*H) * P_pred
-            P[0][0] = (1.0f - K00) * P00_p - K01 * P10_p;
-            P[0][1] = (1.0f - K00) * P01_p - K01 * P11_p;
-            P[1][0] = -K10 * P00_p + (1.0f - K11) * P10_p;
-            P[1][1] = -K10 * P01_p + (1.0f - K11) * P11_p;
-        }
-
-        // 3. PLL Control Application
-        // Frequency is directly derived from the observer's omega offset
-        float frequency_term = x_omega / (2.0f * PI);
-
-        // Small damping term to drive residual phase error to zero
-        float damping_term = 0.1f * x_phase;
-
-        float control_action = frequency_term + damping_term;
+        float control_action = (x_omega / (2.0f * PI)) + (kp * err_phase);
         last_control_action = control_action;
 
         freq = nominal_freq + control_action;
         omega = 2.0f * PI * freq;
 
-        // Log for LMS (optional, but keep for consistency)
-        phase_hist[hist_idx] = x_phase;
+        phase_hist[hist_idx] = err_phase;
         control_hist[hist_idx] = control_action;
         hist_idx = (hist_idx + 1) & (SOGI_HIST_LEN - 1);
     }
 }
 
+void AdaptivePLL::advanceTime(float ts) {
+    pll_theta_offset += 2.0f * PI * (freq - nominal_freq) * ts;
+    while (pll_theta_offset > PI) pll_theta_offset -= TWO_PI;
+    while (pll_theta_offset < -PI) pll_theta_offset += TWO_PI;
+}
+
+float AdaptivePLL::getPhaseError() const {
+    float err = x_theta - pll_theta_offset;
+    while (err > PI) err -= TWO_PI;
+    while (err < -PI) err += TWO_PI;
+    return err;
+}
+
 void AdaptivePLL::shiftPhase(float delta_rad) {
-    x_phase += delta_rad;
-    // We don't change P or x_omega, just the phase anchor
+    x_theta += delta_rad;
 }

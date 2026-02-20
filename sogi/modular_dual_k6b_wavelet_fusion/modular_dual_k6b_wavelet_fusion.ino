@@ -436,6 +436,7 @@ void loop() {
 
         if (current_cycle < 3) {
             float v_interp = 0.0f, i_interp = 0.0f;
+            pll.advanceTime((float)ticks_per_sample * inv_cpu_freq);
             if (interpolateSampleAtTime(last_sample_cycles, v_interp, i_interp)) {
                 v_samp_buf[buf_idx] = v_interp;
                 i_samp_buf[buf_idx] = i_interp;
@@ -523,9 +524,10 @@ void loop() {
                         pll.updateFused(sogi_v.v_alpha, sogi_v.v_beta, pe_result.linear_drift_rate, pe_result.absolute_phase, confidence, cycle_ts);
 
                         // Temporal Anchor Correction (Micro-alignment)
-                        // If x_phase > 0, grid leads anchor. We advance anchor.
-                        if (fabs(pll.x_phase) > 0.01f && confidence > 0.8f) {
-                            float shift_rad = pll.x_phase * 0.5f;
+                        // If err_phase > 0, grid leads anchor. We advance anchor.
+                        float err_phase = pll.getPhaseError();
+                        if (fabs(err_phase) > 0.01f && confidence > 0.8f) {
+                            float shift_rad = err_phase * 0.5f;
                             float cycles_per_grid = (float)cpu_freq_hz / pll.freq;
                             float cyc_shift = (shift_rad / (2.0f * PI)) * cycles_per_grid;
                             int32_t shift_ticks = (int32_t)lrintf(cyc_shift);
@@ -533,7 +535,7 @@ void loop() {
                             last_sample_cycles += shift_ticks;
                             last_cycle_boundary += shift_ticks;
 
-                            pll.shiftPhase(-shift_rad);
+                            pll.shiftPhase(-shift_rad); // Counter-shift the EKF state to match the timeline jump
                             phase_est.notify_correction_applied(shift_rad);
                         }
                     } else {

@@ -89,6 +89,8 @@ private:
   float history_jitter_rad[PE_HISTORY_DEPTH];
   float history_pll_error[PE_HISTORY_DEPTH];
   float current_snr;
+  float current_residue;
+  float avg_residue;
   float current_pll_error;
   float strobe_cycles;
   uint32_t correction_cooldown; // Frames to wait after correction

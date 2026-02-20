@@ -53,13 +53,17 @@ public:
     void init();
     void update(float v_alpha, float v_beta, float ts);
     void updateFused(float v_alpha, float v_beta, float wavelet_err, float abs_phase, float confidence, float ts);
+    void advanceTime(float ts);
+    float getPhaseError() const;
     void shiftPhase(float delta_rad);
 
-    // EKF-like State Observer
-    float x_phase;      // State 0: Phase error (rad)
-    float x_omega;      // State 1: Frequency offset (rad/s)
-    float P[2][2];      // State Covariance
-    float Q[2][2];      // Process Noise Covariance
+    // Augmented EKF State Observer
+    float x_theta;      // State 0: Estimated Phase (rad)
+    float x_omega;      // State 1: Frequency Offset (rad/s)
+    float x_beta;       // State 2: Harmonic Bias of SOGI (rad)
+    float P[3][3];      // State Covariance
+    float Q[3][3];      // Process Noise Covariance
+    float pll_theta_offset; // Accumulated PLL phase relative to 50Hz
 
     float integral_state;
     float i_term;

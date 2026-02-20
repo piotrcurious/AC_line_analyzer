@@ -61,10 +61,20 @@ private:
   uint16_t history_count;     // Number of buffers currently stored
   uint16_t history_write_idx; // Circular buffer write position
 
+  // Persistent reference
+  float* reference_frame;     // Pre-normalized [3 * 128]
+  bool reference_valid;
+  float ref_jitter_rad;
+  float ref_pll_error;
+
+  // Phase history for trend analysis
+  float phase_history[PE_HISTORY_DEPTH];
+  uint32_t history_ticks_buf[PE_HISTORY_DEPTH];
+  float history_f_pll_buf[PE_HISTORY_DEPTH];
+
   // State tracking
   PhaseEstState current_state;
   float last_phase_shift;
-  float phase_trend_cache[PE_HISTORY_DEPTH];
   uint8_t cache_count;
   float expected_next_shift; // Based on linear model
   float history_f_pll[PE_HISTORY_DEPTH];
@@ -108,6 +118,9 @@ private:
 
   // Optimized single-cycle phase shift using pre-normalized cycles
   float compute_phase_shift_cycle_norm(const float* norm_ref_cycle, const float* norm_tar_cycle);
+
+  // Hierarchical search version
+  float compute_phase_shift_cycle_hierarchical(const float* norm_ref_cycle, const float* norm_tar_cycle);
 
   // Analyze trend to determine state
   void analyze_trend(PhaseEstResult& result);

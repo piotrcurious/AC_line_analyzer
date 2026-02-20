@@ -131,6 +131,15 @@ void AdaptivePLL::init() {
         control_hist[i] = 0.0f;
         phase_hist[i] = 0.0f;
     }
+
+    // EKF Init
+    x_phase = 0;
+    x_omega = 0;
+    P[0][0] = 1.0f; P[0][1] = 0.0f;
+    P[1][0] = 0.0f; P[1][1] = 10.0f;
+
+    Q[0][0] = 0.1f;    Q[0][1] = 0.0f;
+    Q[1][0] = 0.0f;    Q[1][1] = 100.0f;
 }
 
 void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
@@ -196,77 +205,97 @@ void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
     }
 }
 
-void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_err, float confidence, float ts) {
+void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_err, float abs_phase, float confidence, float ts) {
     float mag_inst = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
     mag_smooth = (MAG_ALPHA * mag_inst) + ((1.0f - MAG_ALPHA) * mag_smooth);
 
     if (mag_smooth > 0.10f) {
         float sogi_p_err = v_beta / mag_smooth;
 
-        // Discrepancy Analysis
-        // SOGI is sensitive to harmonics/distortion, Wavelet is robust.
-        // If they disagree, SOGI's error might be a 'phantom' shift due to distortion.
-        float discrepancy = sogi_p_err - wavelet_err;
+        // 1. EKF Prediction Step
+        // x = [phase_error (rad), omega_offset (rad/s)]
+        // ts is the time elapsed since last call (~1 cycle duration)
+        float x_phase_pred = x_phase + x_omega * ts;
+        float x_omega_pred = x_omega;
 
-        // Weighting logic:
-        // Use Wavelet as the true error source when confident.
-        // Use SOGI for damping and high-frequency stability.
-        float combined_err;
-        float sogi_weight = 1.0f - (0.8f * confidence); // Reduce SOGI influence as Wavelet confidence increases
+        // Covariance Prediction: P = F*P*F^T + Q
+        // F = [[1, ts], [0, 1]]
+        float P00_p = P[0][0] + ts * (P[1][0] + P[0][1] + ts * P[1][1]) + Q[0][0];
+        float P01_p = P[0][1] + ts * P[1][1] + Q[0][1];
+        float P10_p = P[1][0] + ts * P[1][1] + Q[1][0];
+        float P11_p = P[1][1] + Q[1][1];
 
-        // If discrepancy is large and wavelet is confident, it's likely a SOGI distortion artifact.
-        // We suppress the SOGI error in the frequency integrator to prevent spikes.
-        if (fabs(discrepancy) > 0.05f && confidence > 0.5f) {
-            combined_err = wavelet_err; // Trust wavelet
+        // 2. EKF Measurement Step
+        // z1: Phase Error measurement
+        // We fuse SOGI and Wavelet Absolute Phase for z1
+        float z1;
+        float R_z1;
+
+        if (confidence > 0.5f) {
+            z1 = abs_phase;
+            R_z1 = 0.001f; // Trust absolute anchor
         } else {
-            combined_err = (sogi_weight * sogi_p_err) + ((1.0f - sogi_weight) * wavelet_err);
+            z1 = sogi_p_err;
+            R_z1 = 0.1f;
         }
 
-        float predicted_effect = gain_est * last_control_action;
-        float residual_err = combined_err - predicted_effect;
+        // z2: Frequency Offset measurement (rad/s)
+        float z2 = wavelet_err / (ts + 1e-9f);
+        float R_z2 = (confidence > 0.8f) ? 0.001f : 0.1f;
 
-        // Update Gain Estimation (LMS) - Use Wavelet-informed error for better stability
-        uint8_t idx_prev = (hist_idx + SOGI_HIST_LEN - 1) & (SOGI_HIST_LEN - 1);
-        float prev_phase = phase_hist[idx_prev];
-        float prev_control = control_hist[idx_prev];
-        float dy = combined_err - prev_phase;
-
-        float denom = (prev_control * prev_control) + 1e-6f;
-        float err_gain = (dy - gain_est * prev_control);
-        gain_est += learn_rate * (prev_control * err_gain) / denom;
-        gain_est = constrain(gain_est, -5.0f, 5.0f);
-
-        float p_term = 0;
-        if (fabs(combined_err) > PHASE_DEADBAND) {
-            p_term = kp * combined_err;
-
-            float y = residual_err - integral_err_c;
-            float t = integral_state + y;
-            integral_err_c = (t - integral_state) - y;
-            integral_state = t;
-
-            i_term = ki * integral_state;
+        // Innovation Gate for SOGI fallback
+        if (confidence < 0.5f) {
+            float disc = fabs(sogi_p_err - x_phase_pred);
+            if (disc > 0.05f) R_z1 *= 100.0f;
         }
 
-        const float I_MAX = 5.0f;
-        if (i_term > I_MAX) {
-            i_term = I_MAX;
-            integral_state = (ki > 1e-6f) ? i_term / ki : 0;
-            integral_err_c = 0.0f;
-        } else if (i_term < -I_MAX) {
-            i_term = -I_MAX;
-            integral_state = (ki > 1e-6f) ? i_term / ki : 0;
-            integral_err_c = 0.0f;
+        // Kalman Gain Calculation
+        // H = [[1, 0], [0, 1]]
+        float S00 = P00_p + R_z1;
+        float S01 = P01_p;
+        float S10 = P10_p;
+        float S11 = P11_p + R_z2;
+
+        float det = S00 * S11 - S01 * S10;
+        if (fabs(det) > 1e-12f) {
+            float inv_det = 1.0f / det;
+            float K00 = (P00_p * S11 - P01_p * S10) * inv_det;
+            float K01 = (P01_p * S00 - P00_p * S01) * inv_det;
+            float K10 = (P10_p * S11 - P11_p * S10) * inv_det;
+            float K11 = (P11_p * S00 - P10_p * S01) * inv_det;
+
+            // State Update
+            x_phase = x_phase_pred + K00 * (z1 - x_phase_pred) + K01 * (z2 - x_omega_pred);
+            x_omega = x_omega_pred + K10 * (z1 - x_phase_pred) + K11 * (z2 - x_omega_pred);
+
+            // Covariance Update: P = (I - K*H) * P_pred
+            P[0][0] = (1.0f - K00) * P00_p - K01 * P10_p;
+            P[0][1] = (1.0f - K00) * P01_p - K01 * P11_p;
+            P[1][0] = -K10 * P00_p + (1.0f - K11) * P10_p;
+            P[1][1] = -K10 * P01_p + (1.0f - K11) * P11_p;
         }
 
-        float control_action = p_term + i_term;
+        // 3. PLL Control Application
+        // Frequency is directly derived from the observer's omega offset
+        float frequency_term = x_omega / (2.0f * PI);
+
+        // Small damping term to drive residual phase error to zero
+        float damping_term = 0.1f * x_phase;
+
+        float control_action = frequency_term + damping_term;
         last_control_action = control_action;
 
         freq = nominal_freq + control_action;
         omega = 2.0f * PI * freq;
 
-        phase_hist[hist_idx] = combined_err;
+        // Log for LMS (optional, but keep for consistency)
+        phase_hist[hist_idx] = x_phase;
         control_hist[hist_idx] = control_action;
         hist_idx = (hist_idx + 1) & (SOGI_HIST_LEN - 1);
     }
+}
+
+void AdaptivePLL::shiftPhase(float delta_rad) {
+    x_phase += delta_rad;
+    // We don't change P or x_omega, just the phase anchor
 }

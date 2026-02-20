@@ -28,13 +28,15 @@ struct PhaseEstConfig {
 struct PhaseEstResult {
   PhaseEstState state;
   float phase_trend[PE_HISTORY_DEPTH]; // Phase shift for each historical buffer (radians)
-  float linear_drift_rate;              // Radians per buffer (if stable drift)
+  float linear_drift_rate;              // Radians per cycle
   float recent_phase_shift;             // Most recent phase shift (radians)
   uint8_t valid_samples;                // Number of valid trend entries
   bool correction_applied;              // True if WE applied a correction (input flag)
   bool correction_effective;            // True if applied correction shows up in trend
   float correction_magnitude;           // Size of detected correction (radians)
   float drift_variance;                 // Variance in phase drift (nonlinearity indicator)
+  float snr;                            // Correlation quality (Signal-to-Residual ratio)
+  float absolute_phase;                 // Cumulative phase relative to anchor (rad)
 
   // Frequency estimation
   float estimated_frequency_error;      // Estimated frequency error (Hz)
@@ -67,10 +69,15 @@ private:
   float ref_jitter_rad;
   float ref_pll_error;
 
+  // Previous cycle for differential estimation
+  float* prev_cycle_buf;      // Pre-normalized [128]
+  bool prev_cycle_valid;
+
   // Phase history for trend analysis
   float phase_history[PE_HISTORY_DEPTH];
   uint32_t history_ticks_buf[PE_HISTORY_DEPTH];
   float history_f_pll_buf[PE_HISTORY_DEPTH];
+  float history_snr[PE_HISTORY_DEPTH];
 
   // State tracking
   PhaseEstState current_state;
@@ -81,6 +88,7 @@ private:
   uint32_t history_ticks[PE_HISTORY_DEPTH];
   float history_jitter_rad[PE_HISTORY_DEPTH];
   float history_pll_error[PE_HISTORY_DEPTH];
+  float current_snr;
   float current_pll_error;
   float strobe_cycles;
   uint32_t correction_cooldown; // Frames to wait after correction
@@ -117,10 +125,10 @@ private:
   float compute_phase_shift_norm(const float* reference, const float* target);
 
   // Optimized single-cycle phase shift using pre-normalized cycles
-  float compute_phase_shift_cycle_norm(const float* norm_ref_cycle, const float* norm_tar_cycle);
+  float compute_phase_shift_cycle_norm(const float* norm_ref_cycle, const float* norm_tar_cycle, float& snr_out);
 
   // Hierarchical search version
-  float compute_phase_shift_cycle_hierarchical(const float* norm_ref_cycle, const float* norm_tar_cycle);
+  float compute_phase_shift_cycle_hierarchical(const float* norm_ref_cycle, const float* norm_tar_cycle, float& snr_out);
 
   // Analyze trend to determine state
   void analyze_trend(PhaseEstResult& result);

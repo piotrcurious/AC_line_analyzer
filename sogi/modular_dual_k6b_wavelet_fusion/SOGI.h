@@ -52,7 +52,14 @@ public:
     AdaptivePLL(float nominal_freq, float kp, float ki, float learn_rate = 0.1001f);
     void init();
     void update(float v_alpha, float v_beta, float ts);
-    void updateFused(float v_alpha, float v_beta, float wavelet_err, float confidence, float ts);
+    void updateFused(float v_alpha, float v_beta, float wavelet_err, float abs_phase, float confidence, float ts);
+    void shiftPhase(float delta_rad);
+
+    // EKF-like State Observer
+    float x_phase;      // State 0: Phase error (rad)
+    float x_omega;      // State 1: Frequency offset (rad/s)
+    float P[2][2];      // State Covariance
+    float Q[2][2];      // Process Noise Covariance
 
     float integral_state;
     float i_term;

@@ -518,20 +518,23 @@ void loop() {
                         float wavelet_err = pe_result.linear_drift_rate;
                         float confidence = (pe_result.state == PE_STABLE) ? 0.9f : 0.6f;
 
-                        // Fusion: incorporate Wavelet into AdaptivePLL's internal integrator
-                        pll.updateFused(sogi_v.v_alpha, sogi_v.v_beta, wavelet_err, confidence, ts);
+                        // Fusion: incorporate Wavelet into AdaptivePLL's State Observer (EKF)
+                        float cycle_ts = actual_count * ts;
+                        pll.updateFused(sogi_v.v_alpha, sogi_v.v_beta, pe_result.linear_drift_rate, pe_result.absolute_phase, confidence, cycle_ts);
 
                         // Temporal Anchor Correction (Micro-alignment)
-                        float drift_corr_rad = pe_result.linear_drift_rate * 0.2f;
-                        if (fabs(drift_corr_rad) > 1e-5f) {
+                        // If x_phase > 0, grid leads anchor. We advance anchor.
+                        if (fabs(pll.x_phase) > 0.01f && confidence > 0.8f) {
+                            float shift_rad = pll.x_phase * 0.5f;
                             float cycles_per_grid = (float)cpu_freq_hz / pll.freq;
-                            float cyc_shift = (drift_corr_rad / (2.0f * PI)) * cycles_per_grid;
+                            float cyc_shift = (shift_rad / (2.0f * PI)) * cycles_per_grid;
                             int32_t shift_ticks = (int32_t)lrintf(cyc_shift);
 
                             last_sample_cycles += shift_ticks;
                             last_cycle_boundary += shift_ticks;
 
-                            phase_est.notify_correction_applied(drift_corr_rad);
+                            pll.shiftPhase(-shift_rad);
+                            phase_est.notify_correction_applied(shift_rad);
                         }
                     } else {
                         // Fallback to pure SOGI

@@ -505,37 +505,37 @@ void loop() {
                     float ts = (float)ticks_per_sample * inv_cpu_freq;
 
                     sogi_v.processWindow(v_samp_buf, BUF_N, s_idx, actual_count, pll.omega, ts, v_dc_offset);
-                    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts);
 
-                    // Wavelet-based fine-tuning fusion
+                    // Wavelet Estimation and Fusion
                     PhaseEstResult pe_result;
                     FrequencyEstResult freq_result;
                     bool pe_valid = phase_est.estimate_phase(pe_result);
                     bool freq_valid = phase_est.estimate_frequency(freq_result);
 
                     if (pe_valid && (pe_result.state == PE_STABLE || pe_result.state == PE_READY)) {
-                        // 1. Fine-tune Frequency
-                        if (freq_valid && freq_result.valid) {
-                            // SOGI-PLL is robust but can have harmonic ripple.
-                            // Wavelet is immune to harmonics. We use it to gently bias the frequency.
-                            float freq_corr = freq_result.pll_correction_hz * 0.05f; // Very conservative gain
-                            pll.freq -= freq_corr;
-                            pll.omega = 2.0f * PI * pll.freq;
-                        }
+                        // Calculate wavelet-based phase error
+                        // PE reports drift rate in rad/cycle. We translate this into a phase error signal.
+                        float wavelet_err = pe_result.linear_drift_rate;
+                        float confidence = (pe_result.state == PE_STABLE) ? 0.9f : 0.6f;
 
-                        // 2. Fine-tune Phase (Drift Correction)
-                        // This corrects for residual phase misalignment detected by wavelet correlation
-                        float phase_corr_rad = pe_result.linear_drift_rate * 0.1f;
-                        if (fabs(phase_corr_rad) > 1e-5f) {
+                        // Fusion: incorporate Wavelet into AdaptivePLL's internal integrator
+                        pll.updateFused(sogi_v.v_alpha, sogi_v.v_beta, wavelet_err, confidence, ts);
+
+                        // Temporal Anchor Correction (Micro-alignment)
+                        float drift_corr_rad = pe_result.linear_drift_rate * 0.2f;
+                        if (fabs(drift_corr_rad) > 1e-5f) {
                             float cycles_per_grid = (float)cpu_freq_hz / pll.freq;
-                            float cyc_shift = (phase_corr_rad / (2.0f * PI)) * cycles_per_grid;
+                            float cyc_shift = (drift_corr_rad / (2.0f * PI)) * cycles_per_grid;
                             int32_t shift_ticks = (int32_t)lrintf(cyc_shift);
 
                             last_sample_cycles += shift_ticks;
                             last_cycle_boundary += shift_ticks;
 
-                            phase_est.notify_correction_applied(phase_corr_rad);
+                            phase_est.notify_correction_applied(drift_corr_rad);
                         }
+                    } else {
+                        // Fallback to pure SOGI
+                        pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts);
                     }
 
                     SOGI phase_sogi(SOGI_K);

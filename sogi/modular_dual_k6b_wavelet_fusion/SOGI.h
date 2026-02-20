@@ -52,6 +52,7 @@ public:
     AdaptivePLL(float nominal_freq, float kp, float ki, float learn_rate = 0.1001f);
     void init();
     void update(float v_alpha, float v_beta, float ts);
+    void updateFused(float v_alpha, float v_beta, float wavelet_err, float confidence, float ts);
 
     float integral_state;
     float i_term;

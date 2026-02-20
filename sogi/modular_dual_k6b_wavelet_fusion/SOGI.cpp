@@ -195,3 +195,78 @@ void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
         hist_idx = (hist_idx + 1) & (SOGI_HIST_LEN - 1);
     }
 }
+
+void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_err, float confidence, float ts) {
+    float mag_inst = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
+    mag_smooth = (MAG_ALPHA * mag_inst) + ((1.0f - MAG_ALPHA) * mag_smooth);
+
+    if (mag_smooth > 0.10f) {
+        float sogi_p_err = v_beta / mag_smooth;
+
+        // Discrepancy Analysis
+        // SOGI is sensitive to harmonics/distortion, Wavelet is robust.
+        // If they disagree, SOGI's error might be a 'phantom' shift due to distortion.
+        float discrepancy = sogi_p_err - wavelet_err;
+
+        // Weighting logic:
+        // Use Wavelet as the true error source when confident.
+        // Use SOGI for damping and high-frequency stability.
+        float combined_err;
+        float sogi_weight = 1.0f - (0.8f * confidence); // Reduce SOGI influence as Wavelet confidence increases
+
+        // If discrepancy is large and wavelet is confident, it's likely a SOGI distortion artifact.
+        // We suppress the SOGI error in the frequency integrator to prevent spikes.
+        if (fabs(discrepancy) > 0.05f && confidence > 0.5f) {
+            combined_err = wavelet_err; // Trust wavelet
+        } else {
+            combined_err = (sogi_weight * sogi_p_err) + ((1.0f - sogi_weight) * wavelet_err);
+        }
+
+        float predicted_effect = gain_est * last_control_action;
+        float residual_err = combined_err - predicted_effect;
+
+        // Update Gain Estimation (LMS) - Use Wavelet-informed error for better stability
+        uint8_t idx_prev = (hist_idx + SOGI_HIST_LEN - 1) & (SOGI_HIST_LEN - 1);
+        float prev_phase = phase_hist[idx_prev];
+        float prev_control = control_hist[idx_prev];
+        float dy = combined_err - prev_phase;
+
+        float denom = (prev_control * prev_control) + 1e-6f;
+        float err_gain = (dy - gain_est * prev_control);
+        gain_est += learn_rate * (prev_control * err_gain) / denom;
+        gain_est = constrain(gain_est, -5.0f, 5.0f);
+
+        float p_term = 0;
+        if (fabs(combined_err) > PHASE_DEADBAND) {
+            p_term = kp * combined_err;
+
+            float y = residual_err - integral_err_c;
+            float t = integral_state + y;
+            integral_err_c = (t - integral_state) - y;
+            integral_state = t;
+
+            i_term = ki * integral_state;
+        }
+
+        const float I_MAX = 5.0f;
+        if (i_term > I_MAX) {
+            i_term = I_MAX;
+            integral_state = (ki > 1e-6f) ? i_term / ki : 0;
+            integral_err_c = 0.0f;
+        } else if (i_term < -I_MAX) {
+            i_term = -I_MAX;
+            integral_state = (ki > 1e-6f) ? i_term / ki : 0;
+            integral_err_c = 0.0f;
+        }
+
+        float control_action = p_term + i_term;
+        last_control_action = control_action;
+
+        freq = nominal_freq + control_action;
+        omega = 2.0f * PI * freq;
+
+        phase_hist[hist_idx] = combined_err;
+        control_hist[hist_idx] = control_action;
+        hist_idx = (hist_idx + 1) & (SOGI_HIST_LEN - 1);
+    }
+}

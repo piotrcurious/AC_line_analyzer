@@ -51,29 +51,39 @@ class AdaptivePLL : public FrequencyAdaptivePLL {
 public:
     AdaptivePLL(float nominal_freq, float kp, float ki, float learn_rate = 0.1001f);
     void init();
-    void update(float v_alpha, float v_beta, float ts);
-    void updateFused(float v_alpha, float v_beta, float wavelet_err, float abs_phase, float confidence, float ts);
-    void advanceTime(float ts);
-    float getPhaseError() const;
+
+    // Per-sample operations
+    void predict(float ts);
+    void updateSOGI(float v_alpha, float v_beta, float ts);
+
+    // Per-cycle operations
+    void updateWavelet(float abs_phase, float drift_rate, float confidence, float ts);
+
+    // Utilities
+    float getPhaseError() const; // (theta_sig - theta_pll)
     void shiftPhase(float delta_rad);
+    void setNominalFreq(float freq);
 
-    // Augmented EKF State Observer
-    float x_theta;      // State 0: Estimated Phase (rad)
-    float x_omega;      // State 1: Frequency Offset (rad/s)
-    float x_beta;       // State 2: Harmonic Bias of SOGI (rad)
+    // EKF State Vector: [theta_sig, omega_sig, beta_bias]
+    float x_theta;      // State 0: Signal Phase Deviation (rad)
+    float x_omega;      // State 1: Signal Frequency Deviation (rad/s)
+    float x_beta;       // State 2: SOGI Harmonic Bias (rad)
+
     float P[3][3];      // State Covariance
-    float Q[3][3];      // Process Noise Covariance
-    float pll_theta_offset; // Accumulated PLL phase relative to 50Hz
+    float Q[3][3];      // Process Noise Covariance (per second)
 
-    float integral_state;
-    float i_term;
+    float sampling_phi; // Accumulated sampling clock phase deviation (rad)
+
+    // Legacy support for gain estimation (Adaptive LMS)
     float last_control_action;
     float gain_est;
     float learn_rate;
-
     float control_hist[SOGI_HIST_LEN];
     float phase_hist[SOGI_HIST_LEN];
     uint8_t hist_idx;
+
+    // Internal EKF helper
+    void sequentialUpdate(const float z[3], const float h[3], const float R[3], const float H[3][3], int num_measurements);
 };
 
 #endif // SOGI_H

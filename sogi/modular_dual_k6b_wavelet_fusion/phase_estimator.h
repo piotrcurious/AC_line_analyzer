@@ -57,7 +57,7 @@ private:
   // Configuration
   PhaseEstConfig config;
 
-  // History buffer storage (Using floats now)
+  // History buffer storage (Floats for millivolts)
   float* history_buffers;     // Flat array: [depth][CYCLES][SAMPLES]
   uint16_t history_count;     // Number of buffers currently stored
   uint16_t history_write_idx; // Circular buffer write position

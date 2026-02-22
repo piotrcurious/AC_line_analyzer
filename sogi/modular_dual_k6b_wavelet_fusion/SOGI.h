@@ -51,15 +51,19 @@ class AdaptivePLL : public FrequencyAdaptivePLL {
 public:
     AdaptivePLL(float nominal_freq, float kp, float ki, float learn_rate = 0.1001f);
     void init();
+
+    // Core EKF Fusion
+    void updateFused(float v_alpha, float v_beta, float wavelet_phase, float wavelet_drift, float confidence, float pll_phi_dev, float dt);
+    float getFusedPhase() const;
+
+    // Legacy support
     void update(float v_alpha, float v_beta, float ts);
-    void updateWavelet(float abs_phase, float drift_rate, float confidence, float ts);
 
-    float getFusedPhase() const; // Returns true signal phase relative to PLL oscillator
-
-    // Augmented EKF State Observer
-    float x_theta;      // State 0: Signal Phase Deviation (rad)
-    float x_omega_dev;  // State 1: Frequency Deviation (rad/s)
-    float x_beta;       // State 2: SOGI Harmonic Bias (rad)
+    // EKF State Vector: [theta_sig, omega_sig, beta_bias]
+    // Deviation from nominal 50Hz
+    float x_theta;      // rad
+    float x_omega;      // rad/s
+    float x_beta;       // rad (SOGI harmonic bias)
 
     float P[3][3];      // State Covariance
     float Q[3][3];      // Process Noise Covariance
@@ -73,7 +77,7 @@ public:
     uint8_t hist_idx;
 
 private:
-    void predict(float ts);
+    void predict(float dt);
     void sequentialUpdate(const float z[], const float h[], const float R[], const float H[][3], int num_measurements);
 };
 

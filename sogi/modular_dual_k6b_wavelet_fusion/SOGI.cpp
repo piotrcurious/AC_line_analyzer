@@ -132,40 +132,38 @@ void AdaptivePLL::init() {
     }
 
     x_theta = 0;
-    x_omega_dev = 0;
+    x_omega = 0;
     x_beta = 0;
 
     memset(P, 0, sizeof(P));
     P[0][0] = 0.1f;
-    P[1][1] = 1.0f;
+    P[1][1] = 10.0f;
     P[2][2] = 0.1f;
 
     memset(Q, 0, sizeof(Q));
-    Q[0][0] = 0.01f;   // theta noise
-    Q[1][1] = 1.0f;    // omega noise (rad/s^2)
-    Q[2][2] = 0.001f;  // beta noise
+    Q[0][0] = 0.01f;   // theta random walk
+    Q[1][1] = 1.0f;    // omega random walk
+    Q[2][2] = 0.001f;  // beta random walk
 }
 
-void AdaptivePLL::predict(float ts) {
+void AdaptivePLL::predict(float dt) {
     // x = F * x
-    x_theta += x_omega_dev * ts;
-    // x_omega_dev and x_beta are constant in prediction
-
-    // P = F * P * F^T + Q*ts
-    // F = [[1, ts, 0], [0, 1, 0], [0, 0, 1]]
+    x_theta += x_omega * dt;
+    // P = F * P * F^T + Q*dt
+    // F = [[1, dt, 0], [0, 1, 0], [0, 0, 1]]
     float P00 = P[0][0], P01 = P[0][1], P02 = P[0][2];
     float P10 = P[1][0], P11 = P[1][1], P12 = P[1][2];
     float P20 = P[2][0], P21 = P[2][1], P22 = P[2][2];
 
-    P[0][0] = P00 + ts * (P10 + P01 + ts * P11) + Q[0][0] * ts;
-    P[0][1] = P01 + ts * P11;
-    P[0][2] = P02 + ts * P12;
-    P[1][0] = P10 + ts * P11;
-    P[1][1] = P11 + Q[1][1] * ts;
+    P[0][0] = P00 + dt * (P10 + P01 + dt * P11) + Q[0][0] * dt;
+    P[0][1] = P01 + dt * P11;
+    P[0][2] = P02 + dt * P12;
+    P[1][0] = P10 + dt * P11;
+    P[1][1] = P11 + Q[1][1] * dt;
     P[1][2] = P12;
-    P[2][0] = P20 + ts * P21;
+    P[2][0] = P20 + dt * P21;
     P[2][1] = P21;
-    P[2][2] = P22 + Q[2][2] * ts;
+    P[2][2] = P22 + Q[2][2] * dt;
 }
 
 void AdaptivePLL::sequentialUpdate(const float z[], const float h[], const float R[], const float H[][3], int num_measurements) {
@@ -192,13 +190,14 @@ void AdaptivePLL::sequentialUpdate(const float z[], const float h[], const float
 
             float innov = z[i] - h[i];
             // Unwrap phase innovation if it's a phase measurement
-            if (i == 0 && num_measurements == 1) { // SOGI or single phase wavelet
-                while (innov > PI) innov -= 2.0f * PI;
-                while (innov < -PI) innov += 2.0f * PI;
+            // Measurement 0 is usually phase-related
+            if (i == 0) {
+                 while (innov > PI) innov -= 2.0f * PI;
+                 while (innov < -PI) innov += 2.0f * PI;
             }
 
             x_theta += K[0] * innov;
-            x_omega_dev += K[1] * innov;
+            x_omega += K[1] * innov;
             x_beta  += K[2] * innov;
 
             // P = (I - K*H) * P = P - K*H*P
@@ -221,6 +220,7 @@ void AdaptivePLL::sequentialUpdate(const float z[], const float h[], const float
 }
 
 void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
+    // Standard update called every processing window
     float mag_inst = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
     mag_smooth = (MAG_ALPHA * mag_inst) + ((1.0f - MAG_ALPHA) * mag_smooth);
 
@@ -229,38 +229,56 @@ void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
 
         predict(ts);
 
+        // Measurement update with SOGI only
         float z[1] = { sogi_p_err };
-        float h[1] = { x_theta + x_beta };
-        float R[1] = { 0.05f };
+        float h[1] = { x_theta + x_beta }; // No pll_phi_dev provided here, assume x_theta is already relative
+        float R[1] = { 0.1f };
         float H[1][3] = { {1.0f, 0.0f, 1.0f} };
 
         sequentialUpdate(z, h, R, H, 1);
 
-        float control_action = (x_omega_dev / (2.0f * PI)) + (kp * x_theta);
+        float control_action = (x_omega / (2.0f * PI)) + (kp * x_theta);
         freq = nominal_freq + control_action;
         omega = 2.0f * PI * freq;
     }
 }
 
-void AdaptivePLL::updateWavelet(float abs_phase, float drift_rate, float confidence, float ts) {
-    // drift_rate is rad/cycle. Convert to rad/s deviation from 50Hz.
-    // x_omega_dev = drift_rate * nominal_freq
+void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_phase, float wavelet_drift, float confidence, float pll_phi_dev, float dt) {
+    float mag_inst = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
+    mag_smooth = (MAG_ALPHA * mag_inst) + ((1.0f - MAG_ALPHA) * mag_smooth);
 
-    float z[2] = { abs_phase, drift_rate * nominal_freq };
-    float h[2] = { x_theta, x_omega_dev };
-    float R[2] = { 0.01f, 0.1f };
+    if (mag_smooth > 0.10f) {
+        float sogi_p_err = v_beta / mag_smooth;
 
-    if (confidence < 0.5f) { R[0] = 10.0f; R[1] = 10.0f; }
+        predict(dt);
 
-    float H[2][3] = { {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f} };
+        // Sequential Update: SOGI, then Wavelet Phase, then Wavelet Drift
+        // z1: SOGI phase error relative to PLL
+        // h1: (phi_true - phi_pll) + beta
+        // z2: Wavelet absolute phase deviation from 50Hz
+        // h2: phi_true
+        // z3: Wavelet frequency deviation from 50Hz (drift_rate is rad/cycle, so drift_rate * 50)
 
-    sequentialUpdate(z, h, R, H, 2);
+        float z[3] = { sogi_p_err, wavelet_phase, wavelet_drift * nominal_freq };
+        float h[3] = { (x_theta - pll_phi_dev) + x_beta, x_theta, x_omega };
 
-    float control_action = (x_omega_dev / (2.0f * PI)) + (kp * x_theta);
-    freq = nominal_freq + control_action;
-    omega = 2.0f * PI * freq;
+        float R[3] = { 0.1f, 0.01f, 0.1f };
+        if (confidence < 0.8f) { R[1] *= 10.0f; R[2] *= 10.0f; }
+
+        float H[3][3] = {
+            { 1.0f, 0.0f, 1.0f }, // SOGI
+            { 1.0f, 0.0f, 0.0f }, // Wavelet Phase
+            { 0.0f, 1.0f, 0.0f }  // Wavelet Drift
+        };
+
+        sequentialUpdate(z, h, R, H, 3);
+
+        float control_action = (x_omega / (2.0f * PI)) + (kp * (x_theta - pll_phi_dev));
+        freq = nominal_freq + control_action;
+        omega = 2.0f * PI * freq;
+    }
 }
 
 float AdaptivePLL::getFusedPhase() const {
-    return x_theta;
+    return x_theta; // This is the absolute phase deviation from 50Hz
 }

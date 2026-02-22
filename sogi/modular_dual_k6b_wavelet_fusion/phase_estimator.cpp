@@ -120,10 +120,24 @@ void PhaseEstimator::add_frame(const float* buffer, uint16_t size, float jitter_
   if (size != buf_size) return;
 
   float* dest = get_history_buffer(history_write_idx);
-  memcpy(dest, buffer, buf_size * sizeof(float));
+
+  // Resample to nominal frequency if needed to keep the wavelet shape consistent
+  if (fabs(current_f_pll - nominal_frequency) > 0.01f) {
+      float ratio = current_f_pll / nominal_frequency;
+      for (int i=0; i<buf_size; i++) {
+          float src = i * ratio;
+          int i0 = (int)src;
+          int i1 = i0 + 1;
+          float f = src - i0;
+          if (i1 < buf_size) dest[i] = buffer[i0] * (1.0f - f) + buffer[i1] * f;
+          else dest[i] = buffer[i0];
+      }
+  } else {
+      memcpy(dest, buffer, buf_size * sizeof(float));
+  }
 
   // Initialize reference with the first valid frame
-  if (!reference_valid && history_count == 0) {
+  if (!reference_valid) {
       memcpy(reference_frame, dest, buf_size * sizeof(float));
       reference_valid = true;
   }
@@ -275,12 +289,9 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
   // Calculate absolute phase relative to reference anchor
   float raw_phase = compute_phase_shift(reference_frame, newest_frame);
 
-  // Correct for jitter and previous corrections
-  float jitter_now = history_jitter_rad[newest_idx];
-  float corr_now = history_pll_error[newest_idx];
-
   // True signal phase deviation relative to the time reference anchor
-  float absolute_phase = raw_phase - jitter_now - corr_now;
+  // We subtract the accumulated PLL corrections to get absolute deviation from nominal
+  float absolute_phase = raw_phase - history_jitter_rad[newest_idx] - history_pll_error[newest_idx];
   result.absolute_phase = absolute_phase;
 
   // Build trend from history
@@ -321,11 +332,13 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
   uint16_t r_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
   uint16_t h_idx = (history_write_idx + config.history_depth - 2) % config.history_depth;
 
+  // Measurement of phase shift between last two frames
   float delta_phi = compute_phase_shift(get_history_buffer(h_idx), get_history_buffer(r_idx));
   uint32_t dt_ticks = history_ticks[r_idx] - history_ticks[h_idx];
   float dt = (float)dt_ticks / system_cpu_hz;
 
   if (dt > 0.001f) {
+    // f_grid = (strobe_cycles + delta_phi / 2pi) / dt
     float f_est = (strobe_cycles + delta_phi / (2.0f * M_PI)) / dt;
     result.frequency_hz = f_est;
     result.frequency_error_hz = f_est - nominal_frequency;

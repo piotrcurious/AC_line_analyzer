@@ -249,8 +249,7 @@ void setup() {
     pe_config.nonlinear_threshold_rad = 0.1f;
     pe_config.stable_tolerance_rad = 0.02f;
     phase_est.begin(&pe_config);
-    // strobe_div_cycles = 4.0 because we run analysis every 4 cycles
-    phase_est.set_frequency_params(NOMINAL_FREQ, 4.0f/NOMINAL_FREQ, SAMPLES_PER_CYCLE, 4.0f, cpu_freq_hz);
+    phase_est.set_frequency_params(NOMINAL_FREQ, 1.0f/NOMINAL_FREQ, SAMPLES_PER_CYCLE, 1.0f, cpu_freq_hz);
 
     initADCContinuous();
     gpio_set_drive_capability((gpio_num_t)18, GPIO_DRIVE_CAP_3);
@@ -265,7 +264,6 @@ void loop() {
     if ((int32_t)(now - last_sample_cycles) >= 0) {
         float ts = (float)ticks_per_sample * inv_cpu_freq;
 
-        // Track PLL oscillator phase deviation from nominal 50Hz
         pll_phi_dev += 2.0f * PI * (pll.freq - NOMINAL_FREQ) * ts;
         while (pll_phi_dev > PI) pll_phi_dev -= 2.0f * PI;
         while (pll_phi_dev < -PI) pll_phi_dev += 2.0f * PI;
@@ -295,7 +293,7 @@ void loop() {
             current_cycle = (current_cycle + 1) % 4;
             cycle_start_idx[current_cycle] = buf_idx;
 
-            if (prev_cycle == 2) { // process the window after capturing 3 cycles
+            if (prev_cycle == 2) {
                 uint32_t proc_start = get_cycle_count();
                 sample_slot_count = 0; bresenham_acc = 0;
                 int s_idx = cycle_start_idx[1], e_idx = cycle_start_idx[2];
@@ -313,7 +311,6 @@ void loop() {
                     float window_ts = (float)ticks_per_sample * inv_cpu_freq;
                     sogi_v.processWindow(v_samp_buf, BUF_N, s_idx, actual_count, pll.omega, window_ts, v_dc_offset);
 
-                    // Wavelet Analysis
                     static float pe_buf[PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER];
                     int pe_start = cycle_start_idx[0];
                     for (int i = 0; i < PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER; i++) {
@@ -327,49 +324,30 @@ void loop() {
                         float confidence = (pe_res.state == PE_STABLE) ? 1.0f : 0.5f;
                         pll.updateFused(sogi_v.v_alpha, sogi_v.v_beta, pe_res.absolute_phase, pe_res.linear_drift_rate, confidence, pll_phi_dev, window_ts * actual_count);
 
-                        // Principled Timeline correction (Fudge Factor)
-                        float rel_phi = pll.getFusedPhase() - pll_phi_dev;
-                        while (rel_phi > PI) rel_phi -= 2.0f * PI;
-                        while (rel_phi < -PI) rel_phi += 2.0f * PI;
+                        float err_phi = pll.getFusedPhase() - pll_phi_dev;
+                        while (err_phi > PI) err_phi -= 2.0f * PI;
+                        while (err_phi < -PI) err_phi += 2.0f * PI;
 
-                        if (fabs(rel_phi) > 0.05f && confidence > 0.8f) {
-                            float shift_rad = rel_phi * 0.5f;
+                        if (fabs(err_phi) > 0.05f && confidence > 0.8f) {
+                            float shift_rad = err_phi * 0.5f;
                             int32_t shift_ticks = (int32_t)lrintf((shift_rad / (2.0f * PI)) * ((float)cpu_freq_hz / pll.freq));
                             last_sample_cycles += shift_ticks;
                             last_cycle_boundary += shift_ticks;
-
-                            // Update PLL phase deviation to reflect jump
                             pll_phi_dev += shift_rad;
                             while (pll_phi_dev > PI) pll_phi_dev -= 2.0f * PI;
                             while (pll_phi_dev < -PI) pll_phi_dev += 2.0f * PI;
-
                             phase_est.notify_correction_applied(shift_rad);
                         }
                     } else {
                         pll.update(sogi_v.v_alpha, sogi_v.v_beta, window_ts * actual_count);
                     }
 
-                    // Visualizer Alignment using Fused EKF State
                     float err_phi = pll.getFusedPhase() - pll_phi_dev;
                     while (err_phi > PI) err_phi -= 2.0f * PI;
                     while (err_phi < -PI) err_phi += 2.0f * PI;
 
-                    float phase = atan2f(sogi_v.v_alpha, -sogi_v.v_beta); // Use SOGI for fine alignment within cycle
-                    // Combine EKF coarse and SOGI fine? No, EKF x_theta IS the true phase deviation.
-                    // But visualizer needs phase in [0, 2pi]
-                    // Fused Absolute Phase = 2pi*50*t + x_theta.
-                    // PLL Oscillator Phase = 2pi*50*t + pll_phi_dev.
-                    // Relative phase = x_theta - pll_phi_dev.
-
-                    // The visualizer trigger should be when oscillator phase is 0.
-                    // Signal is at rel_phi.
                     float samples_per_cycle_f = 1.0f / (pll.freq * window_ts);
-                    float samples_back = ( (PI - rel_phi) / (2.0f * PI) ) * samples_per_cycle_f;
-                    // Wait, original logic:
-                    // float samples_back = (phase_for_alignment / (2.0f * PI)) * samples_per_cycle_f;
-                    // if phase_for_alignment is signal phase relative to oscillator.
-
-                    float ph_align = rel_phi;
+                    float ph_align = err_phi;
                     while (ph_align < 0) ph_align += 2.0f * PI;
                     while (ph_align >= 2.0f * PI) ph_align -= 2.0f * PI;
 

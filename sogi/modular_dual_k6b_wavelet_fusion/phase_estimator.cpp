@@ -121,7 +121,6 @@ void PhaseEstimator::add_frame(const float* buffer, uint16_t size, float jitter_
 
   float* dest = get_history_buffer(history_write_idx);
 
-  // Resample to nominal frequency if needed to keep the wavelet shape consistent
   if (fabs(current_f_pll - nominal_frequency) > 0.01f) {
       float ratio = current_f_pll / nominal_frequency;
       for (int i=0; i<buf_size; i++) {
@@ -136,7 +135,6 @@ void PhaseEstimator::add_frame(const float* buffer, uint16_t size, float jitter_
       memcpy(dest, buffer, buf_size * sizeof(float));
   }
 
-  // Initialize reference with the first valid frame
   if (!reference_valid) {
       memcpy(reference_frame, dest, buf_size * sizeof(float));
       reference_valid = true;
@@ -177,7 +175,6 @@ float PhaseEstimator::compute_phase_shift(const float* reference, const float* t
 
   for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) correlation_buffer[i] /= ref_std;
 
-  // Prep extended target for modulo-free inner loop
   for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
       extended_target[i] = (tar_cycle[i] - ref_mean) / ref_std;
       extended_target[i + PE_SAMPLES_PER_CYCLE] = extended_target[i];
@@ -186,16 +183,32 @@ float PhaseEstimator::compute_phase_shift(const float* reference, const float* t
   float min_residual = 1e9f;
   int16_t best_offset = 0;
 
-  for (int16_t offset = 0; offset < PE_SAMPLES_PER_CYCLE; offset++) {
+  // Hierarchical Search: Stride 8 then Stride 1
+  for (int16_t offset = 0; offset < PE_SAMPLES_PER_CYCLE; offset += 8) {
     float residual_sum = 0.0f;
     const float* p_tar = extended_target + offset;
-    for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
+    for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i += 2) { // Sub-sample coarse search
       float diff = correlation_buffer[i] - p_tar[i];
       residual_sum += diff * diff;
     }
     if (residual_sum < min_residual) {
       min_residual = residual_sum;
       best_offset = offset;
+    }
+  }
+
+  int16_t coarse_best = best_offset;
+  for (int16_t offset = coarse_best - 7; offset <= coarse_best + 7; offset++) {
+    int16_t actual_offset = (offset + PE_SAMPLES_PER_CYCLE) % PE_SAMPLES_PER_CYCLE;
+    float residual_sum = 0.0f;
+    const float* p_tar = extended_target + actual_offset;
+    for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
+      float diff = correlation_buffer[i] - p_tar[i];
+      residual_sum += diff * diff;
+    }
+    if (residual_sum < min_residual) {
+      min_residual = residual_sum;
+      best_offset = actual_offset;
     }
   }
 
@@ -215,7 +228,7 @@ void PhaseEstimator::fit_linear_drift(const float* trend, uint8_t count,
   }
   float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_xx = 0.0f;
   for (uint8_t i = 0; i < count; i++) {
-    float x = (float)i * strobe_cycles;
+    float x = (float)i; // X is frame index (each frame is strobe_cycles)
     float y = trend[i];
     sum_x += x; sum_y += y; sum_xy += x * y; sum_xx += x * x;
   }
@@ -234,7 +247,7 @@ float PhaseEstimator::calculate_drift_variance(const float* trend, uint8_t count
   if (count < 2) return 0.0f;
   float variance = 0.0f;
   for (uint8_t i = 0; i < count; i++) {
-    float x = (float)i * strobe_cycles;
+    float x = (float)i;
     float expected = intercept + slope * x;
     float diff = trend[i] - expected;
     variance += diff * diff;
@@ -251,7 +264,7 @@ void PhaseEstimator::analyze_trend(PhaseEstResult& result) {
   }
   float slope, intercept;
   fit_linear_drift(result.phase_trend, count, slope, intercept);
-  result.linear_drift_rate = slope;
+  result.linear_drift_rate = slope; // rad / trigger
 
   float variance = calculate_drift_variance(result.phase_trend, count, slope, intercept);
   result.drift_variance = variance;
@@ -286,21 +299,15 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
   uint16_t newest_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
   const float* newest_frame = get_history_buffer(newest_idx);
 
-  // Calculate absolute phase relative to reference anchor
   float raw_phase = compute_phase_shift(reference_frame, newest_frame);
-
-  // True signal phase deviation relative to the time reference anchor
-  // We subtract the accumulated PLL corrections to get absolute deviation from nominal
   float absolute_phase = raw_phase - history_jitter_rad[newest_idx] - history_pll_error[newest_idx];
   result.absolute_phase = absolute_phase;
 
-  // Build trend from history
   uint8_t valid_count = 0;
   for (uint16_t i = 0; i < history_count; i++) {
       uint16_t idx = (history_write_idx + config.history_depth - history_count + i) % config.history_depth;
       float ph = compute_phase_shift(reference_frame, get_history_buffer(idx));
       result.phase_trend[i] = ph - history_jitter_rad[idx] - history_pll_error[idx];
-      // Unwrap trend
       if (i > 0) {
           float diff = result.phase_trend[i] - result.phase_trend[i-1];
           while (diff > M_PI) { result.phase_trend[i] -= 2.0f * M_PI; diff -= 2.0f * M_PI; }
@@ -332,13 +339,11 @@ bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
   uint16_t r_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
   uint16_t h_idx = (history_write_idx + config.history_depth - 2) % config.history_depth;
 
-  // Measurement of phase shift between last two frames
   float delta_phi = compute_phase_shift(get_history_buffer(h_idx), get_history_buffer(r_idx));
   uint32_t dt_ticks = history_ticks[r_idx] - history_ticks[h_idx];
   float dt = (float)dt_ticks / system_cpu_hz;
 
   if (dt > 0.001f) {
-    // f_grid = (strobe_cycles + delta_phi / 2pi) / dt
     float f_est = (strobe_cycles + delta_phi / (2.0f * M_PI)) / dt;
     result.frequency_hz = f_est;
     result.frequency_error_hz = f_est - nominal_frequency;

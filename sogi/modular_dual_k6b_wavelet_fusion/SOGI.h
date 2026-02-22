@@ -54,16 +54,17 @@ public:
 
     // Core EKF Fusion
     void updateFused(float v_alpha, float v_beta, float wavelet_phase, float wavelet_drift, float confidence, float pll_phi_dev, float dt);
-    float getFusedPhase() const;
 
     // Legacy support
     void update(float v_alpha, float v_beta, float ts);
 
-    // EKF State Vector: [theta_sig, omega_sig, beta_bias]
+    float getFusedPhase() const;
+
+    // EKF State Vector: [theta_sig, omega_sig_dev, beta_bias]
     // Deviation from nominal 50Hz
-    float x_theta;      // rad
-    float x_omega;      // rad/s
-    float x_beta;       // rad (SOGI harmonic bias)
+    float x_theta;      // Signal phase deviation from nominal (rad)
+    float x_omega;      // Signal frequency deviation from nominal (rad/s)
+    float x_beta;       // SOGI harmonic bias (rad)
 
     float P[3][3];      // State Covariance
     float Q[3][3];      // Process Noise Covariance

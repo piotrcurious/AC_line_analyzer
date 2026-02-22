@@ -153,7 +153,6 @@ void PhaseEstimator::add_frame(const float* buffer, uint16_t size, float jitter_
     }
   }
 
-  if (correction_was_applied) frames_since_correction++;
   if (correction_cooldown > 0) correction_cooldown--;
 }
 
@@ -283,7 +282,7 @@ void PhaseEstimator::analyze_trend(PhaseEstResult& result) {
 
   float variance_threshold = config.nonlinear_threshold_rad * config.nonlinear_threshold_rad;
   if (variance > variance_threshold) current_state = PE_NONLINEAR_DRIFT;
-  else if (fabs(slope) < config.stable_tolerance_rad) current_state = PE_STABLE;
+  else if (fabs(slope) > config.stable_tolerance_rad) current_state = PE_READY;
   else current_state = PE_STABLE;
 
   last_phase_shift = recent_change;

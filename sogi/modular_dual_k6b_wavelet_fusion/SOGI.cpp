@@ -108,18 +108,23 @@ void AdaptivePLL::init() {
     gain_est = 0.11f;
     hist_idx = 0;
     for (int i = 0; i < SOGI_HIST_LEN; i++) { control_hist[i] = 0.0f; phase_hist[i] = 0.0f; }
+
+    // State: [Phase Error (rad), Frequency Deviation (rad/s), SOGI Bias (rad)]
     x_theta = 0; x_omega = 0; x_beta = 0;
+
     memset(P, 0, sizeof(P));
     P[0][0] = 0.1f; P[1][1] = 1.0f; P[2][2] = 0.1f;
     memset(Q, 0, sizeof(Q));
-    Q[0][0] = 0.01f; Q[1][1] = 1.0f; Q[2][2] = 0.001f;
+    Q[0][0] = 0.001f; Q[1][1] = 0.1f; Q[2][2] = 0.0001f;
 }
 
 void AdaptivePLL::predict(float dt) {
+    // Phase error evolves with frequency deviation
     x_theta += x_omega * dt;
     while (x_theta > PI) x_theta -= 2.0f * PI;
     while (x_theta < -PI) x_theta += 2.0f * PI;
 
+    // Covariance prediction
     float P00 = P[0][0], P01 = P[0][1], P02 = P[0][2];
     float P10 = P[1][0], P11 = P[1][1], P12 = P[1][2];
     float P20 = P[2][0], P21 = P[2][1], P22 = P[2][2];
@@ -144,7 +149,10 @@ void AdaptivePLL::sequentialUpdate(const float z[], const float h[], const float
             float K[3];
             for (int r = 0; r < 3; r++) { K[r] = 0; for (int c = 0; c < 3; c++) K[r] += P[r][c] * H[i][c]; K[r] *= invS; }
             float innov = z[i] - h[i];
-            if (i < 2) { while (innov > PI) innov -= 2.0f * PI; while (innov < -PI) innov += 2.0f * PI; }
+            if (i == 0) { // SOGI Phase unwrap
+                while (innov > PI) innov -= 2.0f * PI;
+                while (innov < -PI) innov += 2.0f * PI;
+            }
             x_theta += K[0] * innov; x_omega += K[1] * innov; x_beta += K[2] * innov;
             while (x_theta > PI) x_theta -= 2.0f * PI; while (x_theta < -PI) x_theta += 2.0f * PI;
             float KHP[3][3];
@@ -166,30 +174,36 @@ void AdaptivePLL::update(float v_alpha, float v_beta, float ts) {
         float sogi_p_err = v_beta / mag_smooth;
         predict(ts);
         float z[1] = { sogi_p_err };
-        float h[1] = { x_theta + x_beta }; // No pll_phi_dev here, assume x_theta is relative
+        float h[1] = { x_theta + x_beta };
         float R[1] = { 0.1f };
         float H[1][3] = { {1.0f, 0.0f, 1.0f} };
         sequentialUpdate(z, h, R, H, 1);
-        float control_action = (x_omega / (2.0f * PI)) + (kp * x_theta);
-        freq = nominal_freq + control_action;
+        freq = nominal_freq + (x_omega / (2.0f * PI)) + (kp * x_theta);
         omega = 2.0f * PI * freq;
     }
 }
 
-void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_phase, float wavelet_drift, float confidence, float pll_phi_dev, float dt) {
+void AdaptivePLL::updateFused(float v_alpha, float v_beta, float wavelet_drift_rate, float wavelet_freq, float confidence, float dt) {
     float mag_inst = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
     mag_smooth = (MAG_ALPHA * mag_inst) + ((1.0f - MAG_ALPHA) * mag_smooth);
     if (mag_smooth > 0.10f) {
         float sogi_p_err = v_beta / mag_smooth;
         predict(dt);
-        float z[3] = { sogi_p_err, wavelet_phase, wavelet_drift * nominal_freq };
-        float h[3] = { (x_theta - pll_phi_dev) + x_beta, x_theta, x_omega };
-        float R[3] = { 0.1f, 0.01f, 0.1f };
-        if (confidence < 0.8f) { R[1] *= 10.0f; R[2] *= 10.0f; }
-        float H[3][3] = { { 1.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f } };
-        sequentialUpdate(z, h, R, H, 3);
-        float control_action = (x_omega / (2.0f * PI)) + (kp * (x_theta - pll_phi_dev));
-        freq = nominal_freq + control_action;
+
+        // wavelet_drift_rate is rad/strobe.
+        // We can treat it as a measurement of the phase change over the last strobe window.
+        // Or simply use the absolute frequency estimate.
+
+        float omega_grid_dev = (wavelet_freq - nominal_freq) * 2.0f * PI;
+
+        float z[2] = { sogi_p_err, omega_grid_dev };
+        float h[2] = { x_theta + x_beta, x_omega };
+        float R[2] = { 0.1f, 0.05f / (confidence + 0.01f) };
+        float H[2][3] = { { 1.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f } };
+
+        sequentialUpdate(z, h, R, H, 2);
+
+        freq = nominal_freq + (x_omega / (2.0f * PI)) + (kp * x_theta);
         omega = 2.0f * PI * freq;
     }
 }

@@ -12,136 +12,100 @@
 enum PhaseEstState {
   PE_INITIALIZING,        // Filling initial history
   PE_STABLE,              // Tracking stable linear drift
-  PE_NONLINEAR_DRIFT,     // Non-linear phase changes (signal variation or freq changing)
-  PE_READY               // General ready state
+  PE_NONLINEAR_DRIFT,     // Non-linear phase changes
+  PE_READY                // General ready state
 };
 
 // Configuration for phase estimator
 struct PhaseEstConfig {
-  uint16_t history_depth;          // Number of buffers to keep
-  float correction_threshold_rad;  // Threshold to detect intentional correction
-  float nonlinear_threshold_rad;   // Threshold for non-linear drift detection
-  float stable_tolerance_rad;      // Max deviation for "stable" classification
+  uint16_t history_depth;
+  float correction_threshold_rad;
+  float nonlinear_threshold_rad;
+  float stable_tolerance_rad;
 };
 
 // Result from phase estimation
 struct PhaseEstResult {
   PhaseEstState state;
-  float phase_trend[PE_HISTORY_DEPTH]; // Phase shift for each historical buffer (radians)
-  float linear_drift_rate;              // Radians per buffer (if stable drift)
-  float recent_phase_shift;             // Most recent phase shift (radians)
-  uint8_t valid_samples;                // Number of valid trend entries
-  bool correction_applied;              // True if WE applied a correction (input flag)
-  bool correction_effective;            // True if applied correction shows up in trend
-  float correction_magnitude;           // Size of detected correction (radians)
-  float drift_variance;                 // Variance in phase drift (nonlinearity indicator)
-  float absolute_phase;                 // Absolute phase relative to reference anchor (rad)
+  float phase_trend[PE_HISTORY_DEPTH]; // Chronological phase shift (rad)
+  float linear_drift_rate;              // rad per buffer (slope)
+  float recent_phase_shift;
+  uint8_t valid_samples;
+  bool correction_applied;
+  bool correction_effective;
+  float correction_magnitude;
+  float drift_variance;
 
-  // Frequency estimation
-  float estimated_frequency_error;      // Estimated frequency error (Hz)
-  float estimated_frequency;            // Estimated actual grid frequency (Hz)
-  bool frequency_estimate_valid;        // True if frequency estimate is reliable
+  float estimated_frequency_error;      // Hz
+  float estimated_frequency;            // Hz
+  bool frequency_estimate_valid;
+  float absolute_phase;                 // Cumulative phase relative to anchor (rad)
 };
 
 // Frequency estimation result
 struct FrequencyEstResult {
-  float frequency_hz;                   // Estimated grid frequency
-  float frequency_error_hz;             // Error relative to nominal (positive = grid faster)
-  float confidence;                     // Confidence in estimate (0-1)
-  bool valid;                           // True if estimate is reliable
-  float pll_correction_hz;              // Recommended PLL frequency correction
+  float frequency_hz;
+  float frequency_error_hz;
+  float confidence;
+  bool valid;
+  float pll_correction_hz;
 };
 
 class PhaseEstimator {
 private:
-  // Configuration
   PhaseEstConfig config;
 
-  // History buffer storage (Floats for millivolts)
-  float* history_buffers;     // Flat array: [depth][CYCLES][SAMPLES]
-  uint16_t history_count;     // Number of buffers currently stored
-  uint16_t history_write_idx; // Circular buffer write position
+  uint16_t* history_buffers;
+  uint16_t history_count;
+  uint16_t history_write_idx;
 
-  // Persistent reference for absolute phase
-  float* reference_frame;     // Captured reference frame [3 * 128]
-  bool reference_valid;
-
-  // State tracking
   PhaseEstState current_state;
   float last_phase_shift;
   float phase_trend_cache[PE_HISTORY_DEPTH];
   uint8_t cache_count;
-  float expected_next_shift; // Based on linear model
+  float expected_next_shift;
   float history_f_pll[PE_HISTORY_DEPTH];
   uint32_t history_ticks[PE_HISTORY_DEPTH];
   float history_jitter_rad[PE_HISTORY_DEPTH];
   float history_pll_error[PE_HISTORY_DEPTH];
   float current_pll_error;
   float strobe_cycles;
-  uint32_t correction_cooldown; // Frames to wait after correction
-  bool correction_was_applied;  // Tracks if we applied a correction
-  uint32_t frames_since_correction; // Frames elapsed since correction
+  uint32_t correction_cooldown;
+  bool correction_was_applied;
+  uint32_t frames_since_correction;
 
-  // Frequency estimation
-  float nominal_frequency;      // Nominal grid frequency (Hz)
-  float buffer_time_interval;   // Time between buffers (seconds)
-  float last_freq_estimate;     // Last frequency estimate
-  uint32_t samples_per_cycle;   // Samples per nominal cycle
+  float nominal_frequency;
+  float buffer_time_interval;
+  float last_freq_estimate;
+  uint32_t samples_per_cycle;
   uint32_t system_cpu_hz;
 
-  // Internal calculation buffers
   float* correlation_buffer;
-  float* extended_target;
+  float* residual_buffer;
 
   bool initialized;
 
-  // Helper: get buffer pointer for a specific history index
-  inline float* get_history_buffer(uint16_t idx) {
-    uint16_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
-    return &history_buffers[idx * buf_size];
+  inline uint16_t* get_history_buffer(uint16_t idx) {
+    return &history_buffers[idx * PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE];
   }
 
-  // Compute phase shift between reference wavelet and target buffer using sliding correlation
-  float compute_phase_shift(const float* reference, const float* target);
-
-  // Analyze trend to determine state
+  float compute_phase_shift(const uint16_t* reference, const uint16_t* target);
   void analyze_trend(PhaseEstResult& result);
-
-  // Fit linear model to phase trend
   void fit_linear_drift(const float* trend, uint8_t count, float& slope, float& intercept);
-
-  // Calculate variance of residuals from linear fit
   float calculate_drift_variance(const float* trend, uint8_t count, float slope, float intercept);
 
 public:
   PhaseEstimator();
   ~PhaseEstimator();
 
-  // Initialize with custom configuration
   bool begin(const PhaseEstConfig* cfg = nullptr);
-
-  // Set nominal frequency and timing parameters for frequency estimation
   void set_frequency_params(float nominal_hz, float buffer_interval_s, uint16_t samps_per_cycle, float strobe_div_cycles = 0.0f, uint32_t cpu_hz = 240000000);
-
-  // Add a new frame to history
-  void add_frame(const float* buffer, uint16_t size, float jitter_rad = 0.0f, float current_f_pll = 0.0f, uint32_t strobe_tick = 0);
-
-  // Notify that a phase correction was applied (for tracking)
+  void add_frame(const uint16_t* buffer, uint16_t size, float jitter_rad = 0.0f, float current_f_pll = 0.0f, uint32_t strobe_tick = 0);
   void notify_correction_applied(float correction_rad);
-
-  // Perform phase estimation analysis
   bool estimate_phase(PhaseEstResult& result);
-
-  // Perform frequency estimation based on phase drift
   bool estimate_frequency(FrequencyEstResult& result);
-
-  // Get current state
   PhaseEstState get_state() const { return current_state; }
-
-  // Reset estimator (clear history)
   void reset();
-
-  // Check if enough history is available for estimation
   bool is_ready() const { return history_count >= 3; }
 };
 

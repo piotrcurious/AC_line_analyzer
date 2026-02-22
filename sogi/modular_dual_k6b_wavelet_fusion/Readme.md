@@ -123,27 +123,4 @@ Included in the directory is `FastMathToolkit.h`, which provides **Ring-Table mu
 - **Buffer Utilization**: Refactor the LMS estimator to utilize the full 8-sample history window (provisions already exist) for statistical regression rather than relying on a single, noisy delta.
 
 ---
-
-## 9. Wavelet-SOGI Fusion Architecture
-
-This version introduces a **Hybrid Fusion Layer** that combines the robustness of the SOGI resonant observer with the high precision and harmonic immunity of a Wavelet-based correlator.
-
-### 9.1 The Dual-Track Strategy
-The system operates two parallel phase estimation pipelines:
-1.  **SOGI Track (The Anchor)**: Provides fast, robust initial lock and maintains synchronization through large frequency transients. It is highly resonant but can be sensitive to grid harmonics.
-2.  **Wavelet Track (The Fine-Tune)**: Uses a 3-cycle sliding window correlation to detect sub-sample phase drift. Because it correlates against a broad historical window rather than a single frequency, it is inherently immune to high-frequency harmonic distortion.
-
-### 9.2 Fusion Control Logic
-Every cycle, the system reconciles the two estimates:
-- **Confidence Gating**: The Wavelet estimator reports a confidence state (`PE_STABLE`, `PE_READY`, etc.).
-- **Frequency Biasing**: If Wavelet is confident, it applies a gentle bias to the SOGI-PLL frequency, steering it toward the "true" grid frequency detected via long-term correlation.
-- **Temporal Alignment**: It corrects for residual phase drift by adjusting the `last_sample_cycles` temporal anchor, effectively aligning the virtual sampling grid with the physical zero-crossings with sub-microsecond precision.
-
-### 9.3 Optimized Correlator Engine
-To achieve real-time performance on the ESP32, the correlator utilizes:
-- **Pre-normalized History**: Signal windows are stored as normalized floats, eliminating 45 redundant normalization passes per processing window.
-- **Fast Dot-Product Search**: Correlation is performed as a dot-product maximization across a 128-sample sliding window, using extended buffers to eliminate modulo operations in the hot path.
-- **Sub-sample Interpolation**: A parabolic fit on the correlation residuals provides sub-sample phase resolution, allowing the system to track grid drift far below the sampling interval.
-
----
 *Technical analysis for the SOGI-PLL Grid Synchronization Project.*

@@ -1,104 +1,68 @@
 #include "phase_estimator.h"
 #include <string.h>
+#include <math.h>
+#include <stdlib.h>
 
 PhaseEstimator::PhaseEstimator()
   : history_buffers(nullptr),
     history_count(0),
     history_write_idx(0),
+    reference_frame(nullptr),
+    reference_valid(false),
     current_state(PE_INITIALIZING),
     last_phase_shift(0.0f),
     cache_count(0),
     expected_next_shift(0.0f),
     current_pll_error(0.0f),
-    strobe_cycles(4.0f),
+    strobe_cycles(1.0f),
     correction_cooldown(0),
     correction_was_applied(false),
     frames_since_correction(0),
     nominal_frequency(50.0f),
-    buffer_time_interval(0.0f),
+    buffer_time_interval(0.02f),
     last_freq_estimate(50.0f),
     samples_per_cycle(128),
     system_cpu_hz(240000000),
     correlation_buffer(nullptr),
-    residual_buffer(nullptr),
-    norm_ref_3c(nullptr),
-    extended_tar(nullptr),
-    reference_frame(nullptr),
-    reference_valid(false),
-    ref_jitter_rad(0.0f),
-    ref_pll_error(0.0f),
-    prev_cycle_buf(nullptr),
-    prev_cycle_valid(false),
-    current_residue(0.0f),
-    avg_residue(0.0f),
+    extended_target(nullptr),
     initialized(false) {
   memset(&config, 0, sizeof(config));
+  memset(phase_trend_cache, 0, sizeof(phase_trend_cache));
   memset(history_pll_error, 0, sizeof(history_pll_error));
   memset(history_jitter_rad, 0, sizeof(history_jitter_rad));
-  memset(phase_history, 0, sizeof(phase_history));
 }
 
 PhaseEstimator::~PhaseEstimator() {
   if (history_buffers) free(history_buffers);
-  if (correlation_buffer) free(correlation_buffer);
-  if (residual_buffer) free(residual_buffer);
-  if (norm_ref_3c) free(norm_ref_3c);
-  if (extended_tar) free(extended_tar);
   if (reference_frame) free(reference_frame);
-  if (prev_cycle_buf) free(prev_cycle_buf);
+  if (correlation_buffer) free(correlation_buffer);
+  if (extended_target) free(extended_target);
 }
 
 bool PhaseEstimator::begin(const PhaseEstConfig* cfg) {
-  // Set default or user config
   if (cfg) {
     config = *cfg;
   } else {
     config.history_depth = PE_HISTORY_DEPTH;
-    config.correction_threshold_rad = 0.3f;      // ~17 degrees - clear correction
-    config.nonlinear_threshold_rad = 0.1f;       // ~5.7 degrees - signal changes
-    config.stable_tolerance_rad = 0.02f;         // ~1.1 degrees - stable drift tolerance
+    config.correction_threshold_rad = 0.3f;
+    config.nonlinear_threshold_rad = 0.1f;
+    config.stable_tolerance_rad = 0.02f;
   }
 
-  // Allocate history buffers
   uint32_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
   uint32_t total_size = buf_size * config.history_depth;
 
   history_buffers = (float*)malloc(total_size * sizeof(float));
   if (!history_buffers) return false;
 
-  // Allocate correlation working buffer (one cycle for sliding window)
+  reference_frame = (float*)malloc(buf_size * sizeof(float));
+  if (!reference_frame) return false;
+
   correlation_buffer = (float*)malloc(PE_SAMPLES_PER_CYCLE * sizeof(float));
-  if (!correlation_buffer) {
-    free(history_buffers);
-    history_buffers = nullptr;
-    return false;
-  }
+  if (!correlation_buffer) return false;
 
-  // Allocate residual buffer (for correlation calculations)
-  residual_buffer = (float*)malloc(PE_SAMPLES_PER_CYCLE * sizeof(float));
-  if (!residual_buffer) {
-    free(history_buffers);
-    free(correlation_buffer);
-    history_buffers = nullptr;
-    correlation_buffer = nullptr;
-    return false;
-  }
-
-  norm_ref_3c = (float*)malloc(PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE * sizeof(float));
-  extended_tar = (float*)malloc(2 * PE_SAMPLES_PER_CYCLE * sizeof(float));
-  reference_frame = (float*)malloc(PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE * sizeof(float));
-  prev_cycle_buf = (float*)malloc(PE_SAMPLES_PER_CYCLE * sizeof(float));
-
-  if (!norm_ref_3c || !extended_tar || !reference_frame || !prev_cycle_buf) {
-      if (norm_ref_3c) free(norm_ref_3c);
-      if (extended_tar) free(extended_tar);
-      if (reference_frame) free(reference_frame);
-      if (prev_cycle_buf) free(prev_cycle_buf);
-      free(history_buffers);
-      free(correlation_buffer);
-      free(residual_buffer);
-      return false;
-  }
+  extended_target = (float*)malloc(2 * PE_SAMPLES_PER_CYCLE * sizeof(float));
+  if (!extended_target) return false;
 
   memset(history_buffers, 0, total_size * sizeof(float));
 
@@ -106,6 +70,7 @@ bool PhaseEstimator::begin(const PhaseEstConfig* cfg) {
   current_state = PE_INITIALIZING;
   history_count = 0;
   history_write_idx = 0;
+  reference_valid = false;
 
   return true;
 }
@@ -117,9 +82,9 @@ void PhaseEstimator::reset() {
   current_state = PE_INITIALIZING;
   last_phase_shift = 0.0f;
   cache_count = 0;
+  memset(phase_trend_cache, 0, sizeof(phase_trend_cache));
   memset(history_pll_error, 0, sizeof(history_pll_error));
   memset(history_jitter_rad, 0, sizeof(history_jitter_rad));
-  memset(phase_history, 0, sizeof(phase_history));
   expected_next_shift = 0.0f;
   current_pll_error = 0.0f;
   correction_cooldown = 0;
@@ -134,7 +99,6 @@ void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interva
   samples_per_cycle = samps_per_cycle;
   last_freq_estimate = nominal_hz;
   system_cpu_hz = cpu_hz;
-  // If strobe_div_cycles is not provided, estimate from interval
   if (strobe_div_cycles <= 0.0f) {
     strobe_cycles = nominal_hz * buffer_interval_s;
   } else {
@@ -145,169 +109,85 @@ void PhaseEstimator::set_frequency_params(float nominal_hz, float buffer_interva
 void PhaseEstimator::notify_correction_applied(float correction_rad) {
   correction_was_applied = true;
   frames_since_correction = 0;
-  expected_next_shift = correction_rad; // Expected immediate change
+  expected_next_shift = correction_rad;
   current_pll_error += correction_rad;
-}
-
-void PhaseEstimator::pre_normalize_frame(const float* frame, float* dest_norm_3c) {
-    for (uint8_t c = 0; c < PE_CYCLES_PER_BUFFER; c++) {
-        const float* cycle = frame + c * PE_SAMPLES_PER_CYCLE;
-        float* dest = dest_norm_3c + c * PE_SAMPLES_PER_CYCLE;
-
-        float mean = 0.0f;
-        for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) mean += cycle[i];
-        mean /= PE_SAMPLES_PER_CYCLE;
-
-        float std = 0.0f;
-        for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
-            float diff = cycle[i] - mean;
-            dest[i] = diff;
-            std += diff * diff;
-        }
-        std = sqrtf(std / PE_SAMPLES_PER_CYCLE);
-        if (std < 1.0f) std = 1.0f;
-        float inv_std = 1.0f / std;
-        for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) dest[i] *= inv_std;
-    }
 }
 
 void PhaseEstimator::add_frame(const float* buffer, uint16_t size, float jitter_rad, float current_f_pll, uint32_t strobe_tick) {
   if (!initialized || !buffer) return;
 
   uint16_t buf_size = PE_CYCLES_PER_BUFFER * PE_SAMPLES_PER_CYCLE;
-  if (size != buf_size) return; // Size mismatch
+  if (size != buf_size) return;
 
-  // Normalize and store in history
   float* dest = get_history_buffer(history_write_idx);
-  pre_normalize_frame(buffer, dest);
+  memcpy(dest, buffer, buf_size * sizeof(float));
 
-  // Use the last cycle of the frame for prev_cycle_buf next time
-  // Wait, we can do it at the end of the call.
-
-  // Initialize reference if needed
-  if (!reference_valid) {
-    memcpy(reference_frame, dest, buf_size * sizeof(float));
-    ref_jitter_rad = jitter_rad;
-    ref_pll_error = current_pll_error;
-    reference_valid = true;
+  // Initialize reference with the first valid frame
+  if (!reference_valid && history_count == 0) {
+      memcpy(reference_frame, dest, buf_size * sizeof(float));
+      reference_valid = true;
   }
 
-  // Store the state for this frame
   history_f_pll[history_write_idx] = current_f_pll;
   history_ticks[history_write_idx] = strobe_tick;
   history_jitter_rad[history_write_idx] = jitter_rad;
   history_pll_error[history_write_idx] = current_pll_error;
 
-  // Update circular buffer index
   history_write_idx = (history_write_idx + 1) % config.history_depth;
-
-  // Update count (saturate at depth)
   if (history_count < config.history_depth) {
     history_count++;
     if (history_count >= 3) {
-      current_state = PE_READY; // Minimum data for estimation
+      current_state = PE_READY;
     }
   }
 
-  // Decrement cooldown
+  if (correction_was_applied) frames_since_correction++;
   if (correction_cooldown > 0) correction_cooldown--;
 }
 
-float PhaseEstimator::compute_phase_shift_norm(const float* reference, const float* target) {
-  float sum_phase = 0.0f;
-  float sum_snr = 0.0f;
-  for (uint8_t c = 0; c < PE_CYCLES_PER_BUFFER; c++) {
-    float snr_c = 0;
-    sum_phase += compute_phase_shift_cycle_norm(reference + c * PE_SAMPLES_PER_CYCLE,
-                                                target + c * PE_SAMPLES_PER_CYCLE, snr_c);
-    sum_snr += snr_c;
-  }
-  current_snr = sum_snr / (float)PE_CYCLES_PER_BUFFER;
+float PhaseEstimator::compute_phase_shift(const float* reference, const float* target) {
+  const float* ref_cycle = reference + PE_SAMPLES_PER_CYCLE;
+  const float* tar_cycle = target + PE_SAMPLES_PER_CYCLE;
 
-  // Residue: 1.0 - correlation_coefficient.
-  // max_dot for perfect match is PE_SAMPLES_PER_CYCLE.
-  // so snr_c is already the correlation coefficient.
-  current_residue = 1.0f - current_snr;
+  float ref_mean = 0.0f;
+  for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) ref_mean += ref_cycle[i];
+  ref_mean /= PE_SAMPLES_PER_CYCLE;
 
-  return sum_phase / (float)PE_CYCLES_PER_BUFFER;
-}
-
-float PhaseEstimator::compute_phase_shift_cycle_norm(const float* norm_ref_cycle, const float* norm_tar_cycle, float& snr_out) {
-    return compute_phase_shift_cycle_hierarchical(norm_ref_cycle, norm_tar_cycle, snr_out);
-}
-
-float PhaseEstimator::compute_phase_shift_cycle_hierarchical(const float* norm_ref_cycle, const float* norm_tar_cycle, float& snr_out) {
-  // Pre-fill extended target (2x length for wrapping)
+  float ref_std = 0.0f;
   for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
-    extended_tar[i] = norm_tar_cycle[i];
-    extended_tar[i + PE_SAMPLES_PER_CYCLE] = norm_tar_cycle[i];
+    correlation_buffer[i] = ref_cycle[i] - ref_mean;
+    ref_std += correlation_buffer[i] * correlation_buffer[i];
+  }
+  ref_std = sqrtf(ref_std / PE_SAMPLES_PER_CYCLE);
+  if (ref_std < 1.0f) ref_std = 1.0f;
+
+  for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) correlation_buffer[i] /= ref_std;
+
+  // Prep extended target for modulo-free inner loop
+  for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
+      extended_target[i] = (tar_cycle[i] - ref_mean) / ref_std;
+      extended_target[i + PE_SAMPLES_PER_CYCLE] = extended_target[i];
   }
 
-  // Pass 1: Coarse search
-  const int coarse_stride = 4;
-  float max_dot = -1e9f;
-  int16_t coarse_best = 0;
+  float min_residual = 1e9f;
+  int16_t best_offset = 0;
 
-  for (int16_t offset = 0; offset < PE_SAMPLES_PER_CYCLE; offset += coarse_stride) {
-    float dot = 0.0f;
-    const float* tar_ptr = extended_tar + offset;
+  for (int16_t offset = 0; offset < PE_SAMPLES_PER_CYCLE; offset++) {
+    float residual_sum = 0.0f;
+    const float* p_tar = extended_target + offset;
     for (uint16_t i = 0; i < PE_SAMPLES_PER_CYCLE; i++) {
-      dot += norm_ref_cycle[i] * tar_ptr[i];
+      float diff = correlation_buffer[i] - p_tar[i];
+      residual_sum += diff * diff;
     }
-    if (dot > max_dot) {
-      max_dot = dot;
-      coarse_best = offset;
-    }
-  }
-
-  // Pass 2: Fine search around coarse_best
-  int16_t fine_best = coarse_best;
-  float residuals[coarse_stride * 2 + 1]; // for interpolation
-  int16_t search_start = coarse_best - coarse_stride;
-
-  max_dot = -1e9f;
-  for (int i = 0; i <= coarse_stride * 2; i++) {
-    int16_t offset = (search_start + i + PE_SAMPLES_PER_CYCLE) % PE_SAMPLES_PER_CYCLE;
-    float dot = 0.0f;
-    const float* tar_ptr = extended_tar + offset;
-    for (uint16_t j = 0; j < PE_SAMPLES_PER_CYCLE; j++) {
-      dot += norm_ref_cycle[j] * tar_ptr[j];
-    }
-    residuals[i] = dot;
-    if (dot > max_dot) {
-      max_dot = dot;
-      fine_best = offset;
+    if (residual_sum < min_residual) {
+      min_residual = residual_sum;
+      best_offset = offset;
     }
   }
 
-  // Find index of fine_best in residuals array
-  int16_t best_idx_in_res = -1;
-  for (int i = 0; i <= coarse_stride * 2; i++) {
-      int16_t offset = (search_start + i + PE_SAMPLES_PER_CYCLE) % PE_SAMPLES_PER_CYCLE;
-      if (offset == fine_best) {
-          best_idx_in_res = i;
-          break;
-      }
-  }
-
-  // Sub-sample interpolation (parabolic fit)
-  float fine_offset = (float)fine_best;
-  if (best_idx_in_res > 0 && best_idx_in_res < coarse_stride * 2) {
-    float y1 = residuals[best_idx_in_res - 1];
-    float y2 = residuals[best_idx_in_res];
-    float y3 = residuals[best_idx_in_res + 1];
-    float denom = (2.0f * y2 - y1 - y3);
-    if (fabs(denom) > 1e-6f) {
-        fine_offset = (float)fine_best + (y3 - y1) / (2.0f * denom);
-    }
-  }
-
-  float phase_rad = -(2.0f * (float)M_PI * fine_offset) / PE_SAMPLES_PER_CYCLE;
-  while (phase_rad > (float)M_PI) phase_rad -= 2.0f * (float)M_PI;
-  while (phase_rad < -(float)M_PI) phase_rad += 2.0f * (float)M_PI;
-
-  // Calculate SNR (correlation score / PE_SAMPLES_PER_CYCLE)
-  snr_out = max_dot / (float)PE_SAMPLES_PER_CYCLE;
+  float phase_rad = -(2.0f * M_PI * best_offset) / PE_SAMPLES_PER_CYCLE;
+  while (phase_rad > M_PI) phase_rad -= 2.0f * M_PI;
+  while (phase_rad < -M_PI) phase_rad += 2.0f * M_PI;
 
   return phase_rad;
 }
@@ -319,25 +199,16 @@ void PhaseEstimator::fit_linear_drift(const float* trend, uint8_t count,
     intercept = trend[0];
     return;
   }
-
-  // Simple linear regression using cycles as X-axis
   float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_xx = 0.0f;
-
   for (uint8_t i = 0; i < count; i++) {
     float x = (float)i * strobe_cycles;
     float y = trend[i];
-    sum_x += x;
-    sum_y += y;
-    sum_xy += x * y;
-    sum_xx += x * x;
+    sum_x += x; sum_y += y; sum_xy += x * y; sum_xx += x * x;
   }
-
   float n = (float)count;
   float denominator = (n * sum_xx - sum_x * sum_x);
-
   if (fabs(denominator) < 1e-9f) {
-    slope = 0.0f;
-    intercept = sum_y / n;
+    slope = 0.0f; intercept = sum_y / n;
   } else {
     slope = (n * sum_xy - sum_x * sum_y) / denominator;
     intercept = (sum_y - slope * sum_x) / n;
@@ -347,14 +218,13 @@ void PhaseEstimator::fit_linear_drift(const float* trend, uint8_t count,
 float PhaseEstimator::calculate_drift_variance(const float* trend, uint8_t count,
                                                  float slope, float intercept) {
   if (count < 2) return 0.0f;
-
   float variance = 0.0f;
   for (uint8_t i = 0; i < count; i++) {
-    float expected = intercept + slope * ((float)i * strobe_cycles);
+    float x = (float)i * strobe_cycles;
+    float expected = intercept + slope * x;
     float diff = trend[i] - expected;
     variance += diff * diff;
   }
-
   return variance / count;
 }
 
@@ -365,183 +235,72 @@ void PhaseEstimator::analyze_trend(PhaseEstResult& result) {
     result.state = current_state;
     return;
   }
-
-  // Fit linear model to phase trend
   float slope, intercept;
   fit_linear_drift(result.phase_trend, count, slope, intercept);
-  // result.linear_drift_rate = slope; // Don't overwrite differential estimate
+  result.linear_drift_rate = slope;
 
-  // Calculate variance from linear fit
   float variance = calculate_drift_variance(result.phase_trend, count, slope, intercept);
   result.drift_variance = variance;
 
-  // Get most recent phase change (derivative of phase trend)
   float recent_change = 0.0f;
-  if (count >= 2) {
-    recent_change = result.phase_trend[count - 1] - result.phase_trend[count - 2];
-  }
+  if (count >= 2) recent_change = result.phase_trend[count - 1] - result.phase_trend[count - 2];
 
-  // === CORRECTION TRACKING (SIMPLIFIED) ===
-  // If we applied a correction, just measure and report the actual change
   if (correction_was_applied) {
     frames_since_correction++;
-
     if (frames_since_correction >= 2) {
-      // Measure actual phase change after correction
       result.correction_magnitude = recent_change;
-      result.correction_effective = true; // We measured it
-
-      // Clear tracking after reporting
-      if (frames_since_correction >= 3) {
-        correction_was_applied = false;
-        frames_since_correction = 0;
-      }
-    } else {
-      result.correction_magnitude = 0.0f;
-      result.correction_effective = false;
+      result.correction_effective = true;
+      if (frames_since_correction >= 3) { correction_was_applied = false; frames_since_correction = 0; }
     }
   }
 
-  // === STATE CLASSIFICATION ===
   float variance_threshold = config.nonlinear_threshold_rad * config.nonlinear_threshold_rad;
-
-  // Classify based on variance (trend linearity)
-  if (variance > variance_threshold) {
-    // High variance = non-linear (frequency changing or noise)
-    current_state = PE_NONLINEAR_DRIFT;
-  }
-  else if (fabs(slope) < config.stable_tolerance_rad) {
-    // Very low drift = locked
-    current_state = PE_STABLE;
-  }
-  else {
-    // Linear drift = stable tracking
-    current_state = PE_STABLE;
-  }
+  if (variance > variance_threshold) current_state = PE_NONLINEAR_DRIFT;
+  else if (fabs(slope) < config.stable_tolerance_rad) current_state = PE_STABLE;
+  else current_state = PE_STABLE;
 
   last_phase_shift = recent_change;
   result.state = current_state;
 }
 
 bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
-  if (!initialized || history_count < 3 || !reference_valid) {
-    return false;
-  }
+  if (!initialized || history_count < 3 || !reference_valid) return false;
 
-  // Clear result
   memset(&result, 0, sizeof(result));
   result.state = PE_INITIALIZING;
-  result.correction_applied = correction_was_applied;
-  result.correction_effective = false;
 
-  // We compute one NEW phase point for the newest frame relative to persistent reference
   uint16_t newest_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
   const float* newest_frame = get_history_buffer(newest_idx);
 
-  // 1. Long-term correlation (Absolute Phase)
-  float raw_phase = compute_phase_shift_norm(newest_frame, reference_frame);
+  // Calculate absolute phase relative to reference anchor
+  float raw_phase = compute_phase_shift(reference_frame, newest_frame);
 
-  // SHAPE TRANSITION DETECTION
-  // If current residue is significantly higher than average, signal shape changed.
-  if (avg_residue == 0) avg_residue = current_residue;
+  // Correct for jitter and previous corrections
+  float jitter_now = history_jitter_rad[newest_idx];
+  float corr_now = history_pll_error[newest_idx];
 
-  bool shape_transition = (current_residue > 2.0f * avg_residue && current_residue > 0.1f);
+  // True signal phase deviation relative to the time reference anchor
+  float absolute_phase = raw_phase - jitter_now - corr_now;
+  result.absolute_phase = absolute_phase;
 
-  if (shape_transition) {
-      // Calculate absolute phase BEFORE re-anchoring
-      float jitter_newest = history_jitter_rad[newest_idx];
-      float corr_newest = history_pll_error[newest_idx];
-      float old_absolute_phase = (ref_jitter_rad + ref_pll_error) + raw_phase - jitter_newest - corr_newest;
-
-      // Re-anchor to new shape
-      memcpy(reference_frame, newest_frame, 3 * PE_SAMPLES_PER_CYCLE * sizeof(float));
-      ref_jitter_rad = 0;
-      ref_pll_error = old_absolute_phase + jitter_newest + corr_newest;
-
-      // Re-calculate raw_phase (now 0)
-      raw_phase = 0;
-      avg_residue = current_residue;
-  } else {
-      avg_residue = 0.95f * avg_residue + 0.05f * current_residue;
-  }
-
-  // 2. Short-term correlation (Frequency)
-  float diff_phase = 0;
-  if (prev_cycle_valid) {
-      // newest_frame cycle 2 vs prev_cycle_buf
-      float snr_dummy;
-      diff_phase = compute_phase_shift_cycle_norm(prev_cycle_buf, newest_frame + 2 * PE_SAMPLES_PER_CYCLE, snr_dummy);
-  }
-
-  // Store current cycle 2 for next time
-  memcpy(prev_cycle_buf, newest_frame + 2 * PE_SAMPLES_PER_CYCLE, PE_SAMPLES_PER_CYCLE * sizeof(float));
-  prev_cycle_valid = true;
-
-  float jitter_newest = history_jitter_rad[newest_idx];
-  float corr_newest = history_pll_error[newest_idx];
-
-  // Accumulated phase relative to sampling clock:
-  // phi_true = measured_phase - jitter - correction
-  // phi_true_newest = raw_phase_absolute = (phi_ref_true) + raw_phase - jitter_newest - corr_newest
-  // We use the persistent reference as our temporal anchor (phi_ref_true = jitter_ref + corr_ref)
-  float absolute_phase = (ref_jitter_rad + ref_pll_error) + raw_phase - jitter_newest - corr_newest;
-
-  // Override linear_drift_rate if diff_phase is reliable
-  // rad/cycle
-  result.linear_drift_rate = diff_phase;
-
-  // Store in phase_history (this is already unwrapped implicitly by linear growth, but let's be careful)
-  // We'll use a local history array for regression
-  phase_history[newest_idx] = absolute_phase;
-  history_ticks_buf[newest_idx] = history_ticks[newest_idx];
-  history_f_pll_buf[newest_idx] = history_f_pll[newest_idx];
-  history_snr[newest_idx] = current_snr;
-
-  // Collect history in chronological order for result.phase_trend
+  // Build trend from history
   uint8_t valid_count = 0;
-  float last_val = 0.0f;
   for (uint16_t i = 0; i < history_count; i++) {
-    uint16_t idx = (history_write_idx + config.history_depth - history_count + i) % config.history_depth;
-    float val = phase_history[idx];
-
-    // Unwrap relative to previous
-    if (valid_count > 0) {
-        float diff = val - last_val;
-        while (diff > (float)M_PI) { val -= 2.0f * (float)M_PI; diff = val - last_val; }
-        while (diff < -(float)M_PI) { val += 2.0f * (float)M_PI; diff = val - last_val; }
-        phase_history[idx] = val; // Store back unwrapped
-    }
-
-    result.phase_trend[i] = val;
-    last_val = val;
-    valid_count++;
+      uint16_t idx = (history_write_idx + config.history_depth - history_count + i) % config.history_depth;
+      float ph = compute_phase_shift(reference_frame, get_history_buffer(idx));
+      result.phase_trend[i] = ph - history_jitter_rad[idx] - history_pll_error[idx];
+      // Unwrap trend
+      if (i > 0) {
+          float diff = result.phase_trend[i] - result.phase_trend[i-1];
+          while (diff > M_PI) { result.phase_trend[i] -= 2.0f * M_PI; diff -= 2.0f * M_PI; }
+          while (diff < -M_PI) { result.phase_trend[i] += 2.0f * M_PI; diff += 2.0f * M_PI; }
+      }
+      valid_count++;
   }
 
   result.valid_samples = valid_count;
-  result.recent_phase_shift = (valid_count >= 2) ?
-    (result.phase_trend[valid_count - 1] - result.phase_trend[valid_count - 2]) : 0.0f;
-  result.snr = current_snr;
-  result.absolute_phase = absolute_phase;
-
-  cache_count = valid_count;
-
-  // Analyze trend and update state machine
   analyze_trend(result);
 
-  // Overwrite state machine result with a more continuous confidence metric
-  // If snr is high, we are more confident.
-  // current_snr is dot_product / PE_SAMPLES_PER_CYCLE.
-  // For identical normalized signals, it is 1.0.
-  float snr_conf = constrain((current_snr - 0.7f) / 0.3f, 0.0f, 1.0f);
-
-  // Also account for stability (variance)
-  float var_conf = 1.0f / (1.0f + 100.0f * result.drift_variance);
-
-  if (current_state == PE_STABLE) result.snr = snr_conf * var_conf;
-  else if (current_state == PE_READY) result.snr = 0.5f * snr_conf;
-  else result.snr = 0.1f * snr_conf;
-
-  // Add frequency estimation if parameters are set
   if (buffer_time_interval > 0.0f) {
     FrequencyEstResult freq_result;
     if (estimate_frequency(freq_result)) {
@@ -555,78 +314,26 @@ bool PhaseEstimator::estimate_phase(PhaseEstResult& result) {
 }
 
 bool PhaseEstimator::estimate_frequency(FrequencyEstResult& result) {
-  // Clear result first to avoid garbage values
   memset(&result, 0, sizeof(result));
   result.frequency_hz = nominal_frequency;
-  result.valid = false;
+  if (!initialized || history_count < 2 || system_cpu_hz == 0) return false;
 
-  if (!initialized || history_count < 3 || system_cpu_hz == 0 || cache_count < 2) {
-    return false;
-  }
+  uint16_t r_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
+  uint16_t h_idx = (history_write_idx + config.history_depth - 2) % config.history_depth;
 
-  // OPTIMIZED: Use the trend slope from estimate_phase instead of re-calculating correlations.
-  // slope is radians per cycle.
-  // f_grid = f_pll * (1 - slope / 2pi)
+  float delta_phi = compute_phase_shift(get_history_buffer(h_idx), get_history_buffer(r_idx));
+  uint32_t dt_ticks = history_ticks[r_idx] - history_ticks[h_idx];
+  float dt = (float)dt_ticks / system_cpu_hz;
 
-  uint16_t newest_idx = (history_write_idx + config.history_depth - 1) % config.history_depth;
-  float current_f_pll = history_f_pll[newest_idx];
-
-  // PRINCIPLED FREQUENCY ESTIMATION
-  // Use the short-term differential phase (drift rate)
-  // linear_drift_rate is rad/cycle.
-  float drift_rad_per_cycle = 0;
-
-  // We can't access 'result' here, so we look at the newest phase_history entries
-  uint16_t idx_new = (history_write_idx + config.history_depth - 1) % config.history_depth;
-  uint16_t idx_old = (history_write_idx + config.history_depth - 2) % config.history_depth;
-
-  float diff = phase_history[idx_new] - phase_history[idx_old];
-  while (diff > (float)M_PI) diff -= 2.0f * (float)M_PI;
-  while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-
-  float slope = diff / strobe_cycles;
-  float estimated_freq = current_f_pll * (1.0f + slope / (2.0f * (float)M_PI));
-
-  // PLL error for correction is f_pll - f_grid
-  float pll_error_hz = current_f_pll - estimated_freq;
-
-  // Confidence based on current state
-  float confidence = 0.0f;
-  switch(current_state) {
-    case PE_STABLE:
-      confidence = 0.9f;
-      break;
-    case PE_NONLINEAR_DRIFT:
-      confidence = 0.7f; // Still useful during frequency changes
-      break;
-    case PE_READY:
-      confidence = 0.6f;
-      break;
-    default:
-      confidence = 0.3f;
-      break;
-  }
-
-  // Sanity checks - be more permissive for rapid changes
-  bool freq_reasonable = (fabs(pll_error_hz) < 15.0f); // Max ±15 Hz error
-  bool confidence_ok = (confidence > 0.2f);
-
-  if (freq_reasonable && confidence_ok) {
-    result.frequency_hz = estimated_freq;
-    result.frequency_error_hz = estimated_freq - nominal_frequency;
-    result.confidence = confidence;
+  if (dt > 0.001f) {
+    float f_est = (strobe_cycles + delta_phi / (2.0f * M_PI)) / dt;
+    result.frequency_hz = f_est;
+    result.frequency_error_hz = f_est - nominal_frequency;
     result.valid = true;
-    result.pll_correction_hz = pll_error_hz;
-
-    last_freq_estimate = estimated_freq;
-  } else {
-    // Fall back to last estimate
-    result.frequency_hz = last_freq_estimate;
-    result.frequency_error_hz = last_freq_estimate - nominal_frequency;
-    result.confidence = 0.0f;
-    result.valid = false;
-    result.pll_correction_hz = last_freq_estimate - current_f_pll;
+    result.confidence = (current_state == PE_STABLE) ? 0.9f : 0.6f;
+    result.pll_correction_hz = history_f_pll[r_idx] - f_est;
+    last_freq_estimate = f_est;
+    return true;
   }
-
-  return result.valid;
+  return false;
 }

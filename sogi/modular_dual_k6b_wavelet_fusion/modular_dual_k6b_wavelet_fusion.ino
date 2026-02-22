@@ -34,6 +34,12 @@ SOGI sogi_v(SOGI_K);
 AdaptivePLL pll(NOMINAL_FREQ, PLL_KP, PLL_KI, 0.1001f);
 PhaseEstimator phase_est;
 
+struct {
+    float prev_phase = 0.0f;
+    float phase_offset = 0.0f;
+    bool initialized = false;
+} phase_track;
+
 struct TimestampedFrame {
     uint32_t end_timestamp;
     uint8_t raw_data[CONV_FRAME_SIZE];
@@ -53,6 +59,7 @@ adc_continuous_handle_t adc_handle = NULL;
 uint32_t base_ticks_per_sample = 0;
 uint32_t ticks_remainder = 0;
 uint32_t bresenham_acc = 0;
+uint32_t sample_slot_count = 0;
 
 static const float RAW_TO_MV = 3300.0f / 4095.0f;
 
@@ -222,12 +229,7 @@ int buf_idx = 0;
 
 float v_dc_offset = 1650.0f, i_dc_offset = 1650.0f;
 uint32_t last_sample_cycles = 0, last_cycle_boundary = 0;
-uint32_t nominal_sample_cycles = 0;
 uint32_t interpolation_count = 0, nearest_sample_count = 0, max_jitter_ticks = 0;
-
-uint32_t nominal_ticks_per_sample = 0;
-float wavelet_v_circ_buf[PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER * 2];
-int wavelet_circ_idx = 0;
 
 void setup() {
     Serial.begin(115200);
@@ -235,11 +237,8 @@ void setup() {
     inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
     cycles_per_adc_sample = cpu_freq_hz / (ADC_OVERSAMPLE_RATE / 2);
     updateTimingParameters(NOMINAL_FREQ);
-    nominal_ticks_per_sample = cpu_freq_hz / (NOMINAL_FREQ * SAMPLES_PER_CYCLE);
-
     uint32_t start_c = get_cycle_count();
     last_sample_cycles = start_c; last_cycle_boundary = start_c;
-    nominal_sample_cycles = start_c;
     vis.begin();
     PhaseEstConfig pe_config; pe_config.history_depth = PE_HISTORY_DEPTH; pe_config.correction_threshold_rad = 0.3f; pe_config.nonlinear_threshold_rad = 0.1f; pe_config.stable_tolerance_rad = 0.02f;
     phase_est.begin(&pe_config);
@@ -255,32 +254,15 @@ void loop() {
     if (++cleanup_counter >= 50) { cleanupOldFrames(now); cleanup_counter = 0; }
 
     if ((int32_t)(now - last_sample_cycles) >= 0) {
-        float ts = (float)ticks_per_sample * inv_cpu_freq;
         float v_interp = 0.0f, i_interp = 0.0f;
-
         if (interpolateSampleAtTime(last_sample_cycles, v_interp, i_interp)) {
             v_samp_buf[buf_idx] = v_interp; i_samp_buf[buf_idx] = i_interp; interpolation_count++;
         } else {
-            v_samp_buf[buf_idx] = v_dc_offset; i_samp_buf[buf_idx] = i_dc_offset; nearest_sample_count++;
+            v_samp_buf[buf_idx] = 0.0f; i_samp_buf[buf_idx] = 0.0f; nearest_sample_count++;
         }
-
-        // --- Continuous EKF Path ---
-        sogi_v.step(v_samp_buf[buf_idx] - v_dc_offset, pll.omega, ts);
-        pll.predict(ts);
-        pll.updateSOGI(sogi_v.v_alpha, sogi_v.v_beta, ts);
-
         buf_idx = (buf_idx + 1) % BUF_N;
         last_sample_cycles += ticks_per_sample;
-
-        // --- Uniform Wavelet Capture ---
-        while ((int32_t)(now - nominal_sample_cycles) >= 0) {
-            float vw = 0.0f, iw = 0.0f;
-            if (interpolateSampleAtTime(nominal_sample_cycles, vw, iw)) {
-                wavelet_v_circ_buf[wavelet_circ_idx] = vw - v_dc_offset;
-                wavelet_circ_idx = (wavelet_circ_idx + 1) % (PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER * 2);
-            }
-            nominal_sample_cycles += nominal_ticks_per_sample;
-        }
+        sample_slot_count++;
 
         uint32_t step = base_ticks_per_sample;
         bresenham_acc += ticks_remainder;
@@ -289,64 +271,78 @@ void loop() {
 
         uint32_t elapsed_cycle = now - last_cycle_boundary;
         if (elapsed_cycle >= single_cycle_cycles) {
-            int32_t jitter_cycles = (int32_t)(elapsed_cycle - single_cycle_cycles);
+            int32_t jitter_ticks = (int32_t)(elapsed_cycle - single_cycle_cycles);
             last_cycle_boundary += single_cycle_cycles;
             int prev_cycle = current_cycle;
             current_cycle = (current_cycle + 1) % 4;
             cycle_start_idx[current_cycle] = buf_idx;
 
-            // Feed Wavelet with UNIFORM samples
+            // Feed the wavelet phase estimator every cycle
             static float pe_buf[PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER];
-            int pe_len = PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER;
-            for (int i = 0; i < pe_len; i++) {
-                int id = (wavelet_circ_idx - pe_len + i + pe_len*2) % (pe_len*2);
-                pe_buf[i] = wavelet_v_circ_buf[id];
+            int pe_start = cycle_start_idx[(current_cycle + 1) % 4];
+            for (int i = 0; i < PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER; i++) {
+                pe_buf[i] = v_samp_buf[(pe_start + i) % BUF_N] - v_dc_offset;
             }
-            // Since samples are at nominal rate, we can pass NOMINAL_FREQ
-            // Capture jitter is now relative to nominal_sample_cycles grid.
-            int32_t jit_cycles = (int32_t)(now - (nominal_sample_cycles - nominal_ticks_per_sample));
-            float jitter_rad = (2.0f * PI * NOMINAL_FREQ * (float)jit_cycles) * inv_cpu_freq;
-            phase_est.add_frame(pe_buf, pe_len, jitter_rad, NOMINAL_FREQ, nominal_sample_cycles);
+            float jitter_rad = (2.0f * PI * pll.freq * (float)jitter_ticks) * inv_cpu_freq;
+            phase_est.add_frame(pe_buf, PE_SAMPLES_PER_CYCLE * PE_CYCLES_PER_BUFFER, jitter_rad, pll.freq, last_cycle_boundary);
 
             if (prev_cycle == 2) {
                 uint32_t proc_start = get_cycle_count();
+                sample_slot_count = 0;
+                bresenham_acc = 0;
                 int s_idx = cycle_start_idx[1], e_idx = cycle_start_idx[2];
                 int actual_count = (e_idx - s_idx + BUF_N) % BUF_N;
+
                 if (actual_count > 0) {
-                    float v_sum = 0; for (int i = 0; i < actual_count; ++i) v_sum += v_samp_buf[(s_idx + i) % BUF_N];
-                    v_dc_offset = (0.1f * (v_sum / (float)actual_count)) + (0.9f * v_dc_offset);
+                    float v_sum = 0, i_sum = 0;
+                    for (int i = 0; i < actual_count; ++i) {
+                        int id = (s_idx + i) % BUF_N;
+                        v_sum += v_samp_buf[id]; i_sum += i_samp_buf[id];
+                    }
+                    v_dc_offset = (0.2f * (v_sum / (float)actual_count)) + (0.8f * v_dc_offset);
+                    i_dc_offset = (0.2f * (i_sum / (float)actual_count)) + (0.8f * i_dc_offset);
+
+                    float ts = (float)ticks_per_sample * inv_cpu_freq;
+                    sogi_v.processWindow(v_samp_buf, BUF_N, s_idx, actual_count, pll.omega, ts, v_dc_offset);
+                    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts * actual_count);
 
                     PhaseEstResult pe_res;
-                    if (phase_est.estimate_phase(pe_res) && (pe_res.state == PE_STABLE || pe_res.state == PE_READY)) {
-                        float confidence = (pe_res.state == PE_STABLE) ? 0.9f : 0.6f;
-                        // Samples are now at nominal rate, so linear_drift_rate is already deviation from nominal.
-                        // x_omega = omega_sig - omega_nom = (2pi*50 + drift_rad_cyc*50) - 2pi*50 = drift_rad_cyc*50
-                        float drift_rad_s = pe_res.linear_drift_rate * NOMINAL_FREQ;
-                        pll.updateWavelet(pe_res.absolute_phase, drift_rad_s, confidence, (float)actual_count * ts);
+                    if (phase_est.estimate_phase(pe_res)) {
+                        float confidence = (pe_res.state == PE_STABLE) ? 1.0f : 0.5f;
+                        pll.updateWavelet(pe_res.absolute_phase, pe_res.linear_drift_rate, confidence, ts * actual_count);
 
-                        float err_phase = pll.getPhaseError();
-                        if (fabs(err_phase) > 0.01f && confidence > 0.8f) {
-                            float shift_rad = err_phase * 0.5f;
+                        // Principled timeline adjustment (Fudge Factor)
+                        float err_phi = pll.getFusedPhase();
+                        if (fabs(err_phi) > 0.02f && confidence > 0.8f) {
+                            float shift_rad = err_phi * 0.7f;
                             int32_t shift_ticks = (int32_t)lrintf((shift_rad / (2.0f * PI)) * ((float)cpu_freq_hz / pll.freq));
                             last_sample_cycles += shift_ticks;
                             last_cycle_boundary += shift_ticks;
-                            // Update EKF's internal model of sampling phase to reflect the hardware jump
-                            pll.sampling_phi += shift_rad;
-                            while (pll.sampling_phi > PI) pll.sampling_phi -= TWO_PI;
-                            while (pll.sampling_phi < -PI) pll.sampling_phi += TWO_PI;
-
+                            pll.x_theta -= shift_rad;
                             phase_est.notify_correction_applied(shift_rad);
                         }
                     }
-                    updateTimingParameters(pll.freq);
 
-                    float err_phi = pll.getPhaseError();
+                    float phase = pll.getFusedPhase();
+                    if (phase < 0) phase += 2.0f * PI;
+                    if (phase_track.initialized) {
+                        float phase_delta = phase - phase_track.prev_phase;
+                        while (phase_delta < -PI) { phase_track.phase_offset += 2.0f * PI; phase_delta += 2.0f * PI; }
+                        while (phase_delta > PI)  { phase_track.phase_offset -= 2.0f * PI; phase_delta -= 2.0f * PI; }
+                    } else { phase_track.initialized = true; }
+                    phase_track.prev_phase = phase;
+                    float unwrapped_phase = phase + phase_track.phase_offset;
+                    float phase_for_alignment = fmodf(unwrapped_phase, 2.0f * PI);
+                    if (phase_for_alignment < 0) phase_for_alignment += 2.0f * PI;
+
                     float samples_per_cycle_f = 1.0f / (pll.freq * ts);
-                    float samples_back = (err_phi / (2.0f * PI)) * samples_per_cycle_f;
-                    int vis_start = (s_idx + actual_count - (int)(samples_back + 0.5f) + BUF_N) % BUF_N;
-                    vis.update(v_samp_buf, i_samp_buf, BUF_N, vis_start, (int)samples_per_cycle_f, pll.freq, pll.mag_smooth, v_dc_offset, i_dc_offset);
+                    float samples_back = (phase_for_alignment / (2.0f * PI)) * samples_per_cycle_f;
+                    int aligned_start_idx = (s_idx + actual_count - (int)(samples_back + 0.5f) + BUF_N) % BUF_N;
 
-                    Serial.printf("F:%.3fHz, Mag:%.2f, Vdc:%.1f, Core:%.0fus, PE:%d, Interp:%d/%d\n", pll.freq, pll.mag_smooth, v_dc_offset, (float)(get_cycle_count()-proc_start)*inv_cpu_freq*1e6f, phase_est.get_state(), interpolation_count, interpolation_count+nearest_sample_count);
+                    updateTimingParameters(pll.freq);
+                    vis.update(v_samp_buf, i_samp_buf, BUF_N, aligned_start_idx, (int)samples_per_cycle_f, pll.freq, pll.mag_smooth, v_dc_offset, i_dc_offset);
+
+                    Serial.printf("F:%.3fHz, Mag:%.2f, Vdc:%.1f, PE:%d, Drift:%.4f, Interp:%d/%d\n", pll.freq, pll.mag_smooth, v_dc_offset, phase_est.get_state(), pe_res.linear_drift_rate, interpolation_count, interpolation_count+nearest_sample_count);
                     interpolation_count = 0; nearest_sample_count = 0;
                 }
             }

@@ -227,7 +227,7 @@ void PhaseEstimator::fit_linear_drift(const float* trend, uint8_t count,
   }
   float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_xx = 0.0f;
   for (uint8_t i = 0; i < count; i++) {
-    float x = (float)i; // X is frame index (each frame is strobe_cycles)
+    float x = (float)i * strobe_cycles; // X is cycles
     float y = trend[i];
     sum_x += x; sum_y += y; sum_xy += x * y; sum_xx += x * x;
   }
@@ -246,7 +246,7 @@ float PhaseEstimator::calculate_drift_variance(const float* trend, uint8_t count
   if (count < 2) return 0.0f;
   float variance = 0.0f;
   for (uint8_t i = 0; i < count; i++) {
-    float x = (float)i;
+    float x = (float)i * strobe_cycles;
     float expected = intercept + slope * x;
     float diff = trend[i] - expected;
     variance += diff * diff;

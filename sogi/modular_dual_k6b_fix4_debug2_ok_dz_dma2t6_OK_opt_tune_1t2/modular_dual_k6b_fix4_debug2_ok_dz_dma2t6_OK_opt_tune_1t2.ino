@@ -58,16 +58,16 @@
 
 // ── Frame ring ───────────────────────────────────────────────────────────────
 #define FRAME_BUFFER_SIZE     1200
-#define MAX_SEARCH            600
+#define MAX_SEARCH            100
 
 // Keep at least 2 full AC cycles of DMA frames so Path A can always find data.
 // keep_duration = cpu_freq_hz / CLEANUP_FRAMES_DIVIDER
 // 240e6 / 25 = 9.6e6 cycles ≈ 40 ms  (covers two 50 Hz cycles)
-#define CLEANUP_FRAMES_DIVIDER  25
+#define CLEANUP_FRAMES_DIVIDER  250
 
 // ── Diagnostics throttle ─────────────────────────────────────────────────────
 #define SERIAL_EVERY_N_CYCLES   2
-#define FULL_DEBUG_SERIAL 1 // full debug takes too long so can produce artifacts
+#define FULL_DEBUG_SERIAL  // full debug takes too long so can produce artifacts
 
 // ── Global objects ───────────────────────────────────────────────────────────
 SOGIVisualizer vis;
@@ -186,7 +186,7 @@ static inline uint32_t IRAM_ATTR frameSampleTimestamp(uint32_t frame_end,
 // ─────────────────────────────────────────────────────────────────────────────
 //  Core interpolation
 // ─────────────────────────────────────────────────────────────────────────────
-bool interpolateSampleAtTime(uint32_t target, float &v_out, float &i_out) {
+bool IRAM_ATTR interpolateSampleAtTime(uint32_t target, float &v_out, float &i_out) {
     uint32_t rd = frame_read_idx;
     uint32_t wr = frame_write_idx;
     if (rd == wr) return false;
@@ -271,7 +271,7 @@ bool interpolateSampleAtTime(uint32_t target, float &v_out, float &i_out) {
 }
 
 // Discard frames older than ~40 ms
-void cleanupOldFrames(uint32_t now) {
+static inline void IRAM_ATTR cleanupOldFrames(uint32_t now) {
     uint32_t keep = cpu_freq_hz / CLEANUP_FRAMES_DIVIDER;
     while (frame_read_idx != frame_write_idx) {
         int32_t age = (int32_t)(now - frame_buffer[frame_read_idx].end_timestamp);
@@ -281,7 +281,7 @@ void cleanupOldFrames(uint32_t now) {
 }
 
 // Recompute single_cycle_cycles and ticks_per_sample from current PLL frequency
-void updateTimingParameters(float frequency) {
+void IRAM_ATTR updateTimingParameters(float frequency) {
     float fc            = constrain(frequency, 40.0f, 90.0f);
     single_cycle_cycles = (uint32_t)lrintf((float)cpu_freq_hz / fc);
     ticks_per_sample    = single_cycle_cycles / SAMPLES_PER_CYCLE;
@@ -400,7 +400,7 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  loop()
 // ─────────────────────────────────────────────────────────────────────────────
-void loop() {
+void IRAM_ATTR loop() {
     static uint32_t cleanup_ctr = 0;
     static uint32_t serial_ctr  = 0;
 
@@ -435,7 +435,7 @@ void loop() {
         next_sample_time += ticks_per_sample;
     }
 
-    if (++cleanup_ctr >= 100) {
+    if (++cleanup_ctr >= 50) {
         cleanupOldFrames(now);
         cleanup_ctr = 0;
     }

@@ -523,10 +523,8 @@ void loop() {
                     dft.analyze(v_samp_buf, BUF_N, s_idx, actual_count, pll.freq, ts, v_dc_offset);
                     pll.updateWithDFT(sogi_v.v_alpha, sogi_v.v_beta, dft, ts);
 
-                    SOGI phase_sogi(SOGI_K);
-                    phase_sogi.processWindow(v_samp_buf, BUF_N, s_idx, actual_count, pll.omega, ts, v_dc_offset);
-
-                    float phase = atan2f(phase_sogi.v_alpha, -phase_sogi.v_beta);
+                    // Use DFT fundamental phase for alignment (immune to harmonics)
+                    float phase = dft.fundamental.phase;
                     if (phase < 0) phase += 2.0f * PI;
 
                     if (phase_track.initialized) {
@@ -568,10 +566,12 @@ void loop() {
                                   interpolation_count, interpolation_count + nearest_sample_count, frames_dropped);
 
                     float sogi_err = sogi_v.v_beta / (pll.mag_smooth + 1e-6f);
-                    Serial.printf("  [PLL] SOGI_err:%.3f, DFT_err:%.3f, Disc:%.3f\n",
-                                  sogi_err, dft.fundamental.phase_err, pll.filtered_discrepancy);
+                    Serial.printf("  [PLL] SOGI_err:%.3f, DFT_phi1:%.3f, Disc:%.3f, Stability:%.2f\n",
+                                  sogi_err, dft.fundamental.phase, pll.filtered_discrepancy, dft.shape_stability);
                     if (dft.thd_approx > 0.05f) {
-                        Serial.printf("  [DFT] H1:%.1f, H3:%.1f, H5:%.1f, H7:%.1f\n", dft.fundamental.mag, dft.h3.mag, dft.h5.mag, dft.h7.mag);
+                        Serial.printf("  [DFT] H1:%.1f, H3:%.1f, H5:%.1f, H7:%.1f | Res:%.2f,%.2f,%.2f\n",
+                                      dft.fundamental.mag, dft.h3.mag, dft.h5.mag, dft.h7.mag,
+                                      dft.res3, dft.res5, dft.res7);
                     }
 
                     yield();

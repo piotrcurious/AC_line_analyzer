@@ -49,7 +49,7 @@ const float PHASE_DEADBAND = 0.01f;  // Adjust based on your noise level
 
 struct DFTResult {
     float mag;
-    float phase_err; // Relative to the PLL reference sine
+    float phase;     // Phase in radians [-PI, PI]
     float real;      // Correlation with cos
     float imag;      // Correlation with sin
 };
@@ -64,6 +64,11 @@ public:
     DFTResult h5; // 5th harmonic
     DFTResult h7; // 7th harmonic
     float thd_approx;
+
+    // Residuals: phase_n - n * phase_1
+    float res3, res5, res7;
+    float prev_res3, prev_res5, prev_res7;
+    float shape_stability; // Metric of how stable the harmonic profile is
 };
 
 class AdaptivePLL : public FrequencyAdaptivePLL {

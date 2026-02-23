@@ -204,6 +204,15 @@ DFTAnalyzer::DFTAnalyzer() {
     h5 = {0,0,0,0};
     h7 = {0,0,0,0};
     thd_approx = 0;
+    res3 = res5 = res7 = 0;
+    prev_res3 = prev_res5 = prev_res7 = 0;
+    shape_stability = 1.0f;
+}
+
+static inline float wrap_pi(float a) {
+    while (a > PI) a -= 2.0f * PI;
+    while (a < -PI) a += 2.0f * PI;
+    return a;
 }
 
 void DFTAnalyzer::analyze(const float* buffer, int bufLen, int startIdx, int count, float freq, float ts, float offset) {
@@ -220,18 +229,12 @@ void DFTAnalyzer::analyze(const float* buffer, int bufLen, int startIdx, int cou
         float u = buffer[idx] - offset;
         float theta = omega * i * ts;
 
-        float c1 = cosf(theta);
-        float s1 = sinf(theta);
-
-        sum_re1 += u * c1;
-        sum_im1 += u * s1;
-
+        sum_re1 += u * cosf(theta);
+        sum_im1 += u * sinf(theta);
         sum_re3 += u * cosf(3.0f * theta);
         sum_im3 += u * sinf(3.0f * theta);
-
         sum_re5 += u * cosf(5.0f * theta);
         sum_im5 += u * sinf(5.0f * theta);
-
         sum_re7 += u * cosf(7.0f * theta);
         sum_im7 += u * sinf(7.0f * theta);
     }
@@ -241,17 +244,46 @@ void DFTAnalyzer::analyze(const float* buffer, int bufLen, int startIdx, int cou
     fundamental.real = sum_re1 * inv_count_2;
     fundamental.imag = sum_im1 * inv_count_2;
     fundamental.mag = sqrtf(fundamental.real * fundamental.real + fundamental.imag * fundamental.imag);
-    // phase_err is atan2(real, imag) so that u = sin(theta + err)
-    fundamental.phase_err = atan2f(fundamental.real, fundamental.imag);
+    fundamental.phase = atan2f(fundamental.real, fundamental.imag);
 
-    h3.mag = sqrtf(sum_re3 * sum_re3 + sum_im3 * sum_im3) * inv_count_2;
-    h5.mag = sqrtf(sum_re5 * sum_re5 + sum_im5 * sum_im5) * inv_count_2;
-    h7.mag = sqrtf(sum_re7 * sum_re7 + sum_im7 * sum_im7) * inv_count_2;
+    h3.real = sum_re3 * inv_count_2;
+    h3.imag = sum_im3 * inv_count_2;
+    h3.mag = sqrtf(h3.real * h3.real + h3.imag * h3.imag);
+    h3.phase = atan2f(h3.real, h3.imag);
 
-    if (fundamental.mag > 10.0f) { // threshold to avoid noise
+    h5.real = sum_re5 * inv_count_2;
+    h5.imag = sum_im5 * inv_count_2;
+    h5.mag = sqrtf(h5.real * h5.real + h5.imag * h5.imag);
+    h5.phase = atan2f(h5.real, h5.imag);
+
+    h7.real = sum_re7 * inv_count_2;
+    h7.imag = sum_im7 * inv_count_2;
+    h7.mag = sqrtf(h7.real * h7.real + h7.imag * h7.imag);
+    h7.phase = atan2f(h7.real, h7.imag);
+
+    if (fundamental.mag > 10.0f) {
         thd_approx = sqrtf(h3.mag * h3.mag + h5.mag * h5.mag + h7.mag * h7.mag) / fundamental.mag;
+
+        // Save previous for stability check
+        prev_res3 = res3; prev_res5 = res5; prev_res7 = res7;
+
+        // Calculate Phase Profile Residuals
+        res3 = wrap_pi(h3.phase - 3.0f * fundamental.phase);
+        res5 = wrap_pi(h5.phase - 5.0f * fundamental.phase);
+        res7 = wrap_pi(h7.phase - 7.0f * fundamental.phase);
+
+        // Shape stability: how much did the harmonic profile change?
+        float d_res = fabsf(wrap_pi(res3 - prev_res3)) +
+                      0.5f * fabsf(wrap_pi(res5 - prev_res5)) +
+                      0.3f * fabsf(wrap_pi(res7 - prev_res7));
+
+        // Convert to stability metric [0, 1]
+        float current_stability = 1.0f / (1.0f + 10.0f * d_res);
+        shape_stability = 0.8f * shape_stability + 0.2f * current_stability;
     } else {
         thd_approx = 0;
+        res3 = res5 = res7 = 0;
+        shape_stability = 1.0f;
     }
 }
 
@@ -262,81 +294,68 @@ void AdaptivePLL::updateWithDFT(float v_alpha, float v_beta, const DFTAnalyzer& 
 
     if (mag_smooth > 0.10f) {
         // 2. Extract Phase Errors
-        // SOGI phase error (approx sin(phi))
         float sogi_p_err = v_beta / mag_smooth;
 
-        // DFT phase error (absolute phase relative to reference)
-        // Correcting for window-center to window-end projection:
-        // DFT measures the average phase over the window, which corresponds to the MIDDLE of the window.
-        // SOGI measures the instantaneous phase at the END of the window.
-        // If there is a frequency error df, the phase shifts by 2*PI*df*t.
-        // The difference between middle and end is df * PI * T.
         float window_duration = dft.fundamental.mag > 0 ? (float)1.0f / freq : 0.02f;
 
-        // We project the DFT phase to the end of the window.
-        // To avoid circular dependency, we use the last known stable frequency offset (integral_state).
-        float dft_p_err = dft.fundamental.phase_err + (integral_state * PI * window_duration);
+        // DFT measures absolute phase at window-center (if window is full period)
+        // Project to window-end:
+        float dft_fundamental_err = dft.fundamental.phase + (integral_state * PI * window_duration);
+        dft_fundamental_err = wrap_pi(dft_fundamental_err);
 
-        // Wrap DFT phase error to [-PI, PI]
-        if (dft_p_err > PI) dft_p_err -= 2.0f * PI;
-        if (dft_p_err < -PI) dft_p_err += 2.0f * PI;
+        // 3. Harmonic-Aware Zero-Crossing Inference
+        // We use the harmonic profile to calculate the offset between fundamental zero-crossing
+        // and the composite signal's zero-crossing.
+        // Formula: delta_zc = - sum(An * sin(alphan)) / sum(n * An * cos(alphan))
+        // where alphan is the residual (phase_n - n * phase_1).
 
-        // 3. Harmonic Discrepancy Detection
-        // A real frequency change will affect both DFT and SOGI similarly.
-        // Harmonic distortion (especially odd harmonics like 3rd, 5th) affects SOGI
-        // significantly because it's only a 2nd order filter, but DFT rejects them perfectly
-        // (if the window is one period).
-        float discrepancy = sogi_p_err - dft_p_err;
+        float num = dft.h3.mag * sinf(dft.res3) + dft.h5.mag * sinf(dft.res5) + dft.h7.mag * sinf(dft.res7);
+        float den = dft.fundamental.mag + 3.0f * dft.h3.mag * cosf(dft.res3) +
+                    5.0f * dft.h5.mag * cosf(dft.res5) + 7.0f * dft.h7.mag * cosf(dft.res7);
+
+        float delta_zc = (fabsf(den) > 1e-6f) ? -num / den : 0;
+
+        // The 'overall' phase error that accounts for the zero-crossing shift:
+        float overall_p_err = dft_fundamental_err + delta_zc;
+        overall_p_err = wrap_pi(overall_p_err);
+
+        // 4. Decision Logic based on Harmonic Profile
+        // If the shape is stable, we trust the fundamental tracking.
+        // If the shape is morphing, we dampen the update.
+        float harmonic_trust = dft.shape_stability;
+        if (dft.thd_approx < 0.02f) harmonic_trust = 1.0f; // clean signal is always stable
+
+        // Discrepancy between SOGI and DFT-Fundamental
+        float discrepancy = wrap_pi(sogi_p_err - dft_fundamental_err);
         filtered_discrepancy = 0.9f * filtered_discrepancy + 0.1f * discrepancy;
 
-        // 4. Determine Trust and Combined Error
-        float trust_in_dft = 0.0f;
-        float distortion_score = dft.thd_approx + 0.5f * fabsf(filtered_discrepancy);
+        // 5. Blended Error for PI controller
+        // We use overall_p_err (which includes zero-crossing correction)
+        // to keep the PLL aligned with the signal's "main body".
+        float combined_err = (harmonic_trust * overall_p_err) + ((1.0f - harmonic_trust) * dft_fundamental_err);
 
-        if (distortion_score > 0.05f) {
-            // Significant distortion -> trust DFT's harmonic rejection
-            trust_in_dft = distortion_score * 10.0f;
-            if (trust_in_dft > 0.95f) trust_in_dft = 0.95f;
-        } else {
-            // Clean signal -> use SOGI for faster response
-            trust_in_dft = 0.1f;
-        }
-
-        float combined_err = (1.0f - trust_in_dft) * sogi_p_err + trust_in_dft * dft_p_err;
-
-        // 5. Stable PI Controller
-        // Windowed updates (50Hz rate) require lower gains than per-sample updates.
-        float local_kp = 0.4f;
+        // 6. PI Controller
+        float local_kp = 0.5f;
         float local_ki = 6.0f;
 
-        // Proportional term
         float p_term = local_kp * combined_err;
 
-        // Integral term (governs stable frequency)
-        // Use Kahan summation or simple integration.
-        // Note: ts here is the window duration if we call this once per cycle.
-        // But the user calls it with 'ts' (per-sample). We should use window duration.
+        // Integral term tracks the actual grid frequency
         float dt_window = window_duration;
-
-        float y = (local_ki * dft_p_err * dt_window) - integral_err_c; // Use DFT for stable integration
+        float y = (local_ki * dft_fundamental_err * dt_window) - integral_err_c;
         float t = integral_state + y;
         integral_err_c = (t - integral_state) - y;
         integral_state = t;
-
-        // Anti-windup
         integral_state = constrain(integral_state, -10.0f, 10.0f);
 
-        // 6. Update Frequency
-        float control_action = p_term + integral_state;
-        float f_new = nominal_freq + control_action;
-
-        // Clamping to avoid crazy oscillations
-        freq = constrain(f_new, nominal_freq - 10.0f, nominal_freq + 10.0f);
+        // 7. Apply Control Action
+        float f_new = nominal_freq + p_term + integral_state;
+        freq = constrain(f_new, nominal_freq - 15.0f, nominal_freq + 15.0f);
         omega = 2.0f * PI * freq;
 
-        // 7. Update History (optional, for monitoring)
+        // History
         phase_hist[hist_idx] = combined_err;
-        control_hist[hist_idx] = control_action;
+        control_hist[hist_idx] = p_term + integral_state;
         hist_idx = (hist_idx + 1) & (SOGI_HIST_LEN - 1);
         dft_initialized = true;
     }

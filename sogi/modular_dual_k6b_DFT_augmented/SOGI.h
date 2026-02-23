@@ -49,9 +49,9 @@ const float PHASE_DEADBAND = 0.01f;  // Adjust based on your noise level
 
 struct DFTResult {
     float mag;
-    float phase;
-    float real;
-    float imag;
+    float phase_err; // Relative to the PLL reference sine
+    float real;      // Correlation with cos
+    float imag;      // Correlation with sin
 };
 
 class DFTAnalyzer {
@@ -62,6 +62,7 @@ public:
     DFTResult fundamental;
     DFTResult h3; // 3rd harmonic
     DFTResult h5; // 5th harmonic
+    DFTResult h7; // 7th harmonic
     float thd_approx;
 };
 
@@ -82,7 +83,7 @@ public:
     float phase_hist[SOGI_HIST_LEN];
     uint8_t hist_idx;
 
-    float prev_dft_phase;
+    float filtered_discrepancy;
     bool dft_initialized;
 };
 

@@ -131,7 +131,7 @@ void AdaptivePLL::init() {
         control_hist[i] = 0.0f;
         phase_hist[i] = 0.0f;
     }
-    prev_dft_phase = 0.0f;
+    filtered_discrepancy = 0.0f;
     dft_initialized = false;
 }
 
@@ -202,6 +202,7 @@ DFTAnalyzer::DFTAnalyzer() {
     fundamental = {0,0,0,0};
     h3 = {0,0,0,0};
     h5 = {0,0,0,0};
+    h7 = {0,0,0,0};
     thd_approx = 0;
 }
 
@@ -212,20 +213,27 @@ void DFTAnalyzer::analyze(const float* buffer, int bufLen, int startIdx, int cou
     float sum_re1 = 0, sum_im1 = 0;
     float sum_re3 = 0, sum_im3 = 0;
     float sum_re5 = 0, sum_im5 = 0;
+    float sum_re7 = 0, sum_im7 = 0;
 
     for (int i = 0; i < count; ++i) {
         int idx = (startIdx + i) % bufLen;
         float u = buffer[idx] - offset;
         float theta = omega * i * ts;
 
-        sum_re1 += u * cosf(theta);
-        sum_im1 += u * sinf(theta);
+        float c1 = cosf(theta);
+        float s1 = sinf(theta);
+
+        sum_re1 += u * c1;
+        sum_im1 += u * s1;
 
         sum_re3 += u * cosf(3.0f * theta);
         sum_im3 += u * sinf(3.0f * theta);
 
         sum_re5 += u * cosf(5.0f * theta);
         sum_im5 += u * sinf(5.0f * theta);
+
+        sum_re7 += u * cosf(7.0f * theta);
+        sum_im7 += u * sinf(7.0f * theta);
     }
 
     float inv_count_2 = 2.0f / (float)count;
@@ -233,115 +241,103 @@ void DFTAnalyzer::analyze(const float* buffer, int bufLen, int startIdx, int cou
     fundamental.real = sum_re1 * inv_count_2;
     fundamental.imag = sum_im1 * inv_count_2;
     fundamental.mag = sqrtf(fundamental.real * fundamental.real + fundamental.imag * fundamental.imag);
-    fundamental.phase = atan2f(fundamental.imag, fundamental.real);
+    // phase_err is atan2(real, imag) so that u = sin(theta + err)
+    fundamental.phase_err = atan2f(fundamental.real, fundamental.imag);
 
-    h3.real = sum_re3 * inv_count_2;
-    h3.imag = sum_im3 * inv_count_2;
-    h3.mag = sqrtf(h3.real * h3.real + h3.imag * h3.imag);
-
-    h5.real = sum_re5 * inv_count_2;
-    h5.imag = sum_im5 * inv_count_2;
-    h5.mag = sqrtf(h5.real * h5.real + h5.imag * h5.imag);
+    h3.mag = sqrtf(sum_re3 * sum_re3 + sum_im3 * sum_im3) * inv_count_2;
+    h5.mag = sqrtf(sum_re5 * sum_re5 + sum_im5 * sum_im5) * inv_count_2;
+    h7.mag = sqrtf(sum_re7 * sum_re7 + sum_im7 * sum_im7) * inv_count_2;
 
     if (fundamental.mag > 10.0f) { // threshold to avoid noise
-        thd_approx = sqrtf(h3.mag * h3.mag + h5.mag * h5.mag) / fundamental.mag;
+        thd_approx = sqrtf(h3.mag * h3.mag + h5.mag * h5.mag + h7.mag * h7.mag) / fundamental.mag;
     } else {
         thd_approx = 0;
     }
 }
 
 void AdaptivePLL::updateWithDFT(float v_alpha, float v_beta, const DFTAnalyzer& dft, float ts) {
-    // Current SOGI-based phase error
+    // 1. Update Magnitude
     float mag_inst = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
     mag_smooth = (MAG_ALPHA * mag_inst) + ((1.0f - MAG_ALPHA) * mag_smooth);
 
     if (mag_smooth > 0.10f) {
+        // 2. Extract Phase Errors
+        // SOGI phase error (approx sin(phi))
         float sogi_p_err = v_beta / mag_smooth;
 
-        // DFT-based phase error
-        float dft_p_err = 0.0f;
-        if (dft_initialized) {
-            float d_phi = dft.fundamental.phase - prev_dft_phase;
-            if (d_phi > PI) d_phi -= 2.0f * PI;
-            if (d_phi < -PI) d_phi += 2.0f * PI;
+        // DFT phase error (absolute phase relative to reference)
+        // Correcting for window-center to window-end projection:
+        // DFT measures the average phase over the window, which corresponds to the MIDDLE of the window.
+        // SOGI measures the instantaneous phase at the END of the window.
+        // If there is a frequency error df, the phase shifts by 2*PI*df*t.
+        // The difference between middle and end is df * PI * T.
+        float window_duration = dft.fundamental.mag > 0 ? (float)1.0f / freq : 0.02f;
 
-            // d_phi is the phase drift over one cycle.
-            // Frequency error df = d_phi / (2*PI * T) = d_phi / (2*PI * count * ts)
-            // But we can just use d_phi as a proportional error term.
-            dft_p_err = d_phi;
-        }
-        prev_dft_phase = dft.fundamental.phase;
-        dft_initialized = true;
+        // We project the DFT phase to the end of the window.
+        // To avoid circular dependency, we use the last known stable frequency offset (integral_state).
+        float dft_p_err = dft.fundamental.phase_err + (integral_state * PI * window_duration);
 
-        // Compare SOGI and DFT
-        // SOGI error is instantaneous at the end of window.
-        // DFT error (d_phi) is averaged over the window.
+        // Wrap DFT phase error to [-PI, PI]
+        if (dft_p_err > PI) dft_p_err -= 2.0f * PI;
+        if (dft_p_err < -PI) dft_p_err += 2.0f * PI;
 
-        float combined_err = sogi_p_err;
+        // 3. Harmonic Discrepancy Detection
+        // A real frequency change will affect both DFT and SOGI similarly.
+        // Harmonic distortion (especially odd harmonics like 3rd, 5th) affects SOGI
+        // significantly because it's only a 2nd order filter, but DFT rejects them perfectly
+        // (if the window is one period).
+        float discrepancy = sogi_p_err - dft_p_err;
+        filtered_discrepancy = 0.9f * filtered_discrepancy + 0.1f * discrepancy;
 
-        // If THD is high, or if SOGI and DFT disagree significantly,
-        // we suspect harmonic distortion is affecting SOGI.
-        float discrepancy = fabsf(sogi_p_err - dft_p_err);
+        // 4. Determine Trust and Combined Error
+        float trust_in_dft = 0.0f;
+        float distortion_score = dft.thd_approx + 0.5f * fabsf(filtered_discrepancy);
 
-        float trust_factor = 1.0f;
-        if (dft.thd_approx > 0.05f || discrepancy > 0.1f) {
-            // Reduce trust in SOGI if distortion is high or discrepancy is large
-            trust_factor = 1.0f / (1.0f + 5.0f * dft.thd_approx + 2.0f * discrepancy);
-            if (trust_factor < 0.2f) trust_factor = 0.2f;
-
-            // Blend with DFT error if we have it
-            if (dft_initialized) {
-                 combined_err = (trust_factor * sogi_p_err) + ((1.0f - trust_factor) * dft_p_err);
-            } else {
-                 combined_err = sogi_p_err * trust_factor;
-            }
+        if (distortion_score > 0.05f) {
+            // Significant distortion -> trust DFT's harmonic rejection
+            trust_in_dft = distortion_score * 10.0f;
+            if (trust_in_dft > 0.95f) trust_in_dft = 0.95f;
+        } else {
+            // Clean signal -> use SOGI for faster response
+            trust_in_dft = 0.1f;
         }
 
-        float raw_p_err = combined_err;
+        float combined_err = (1.0f - trust_in_dft) * sogi_p_err + trust_in_dft * dft_p_err;
 
-        float predicted_effect = gain_est * last_control_action;
-        float residual_err = raw_p_err - predicted_effect;
+        // 5. Stable PI Controller
+        // Windowed updates (50Hz rate) require lower gains than per-sample updates.
+        float local_kp = 0.4f;
+        float local_ki = 6.0f;
 
-        uint8_t idx_prev = (hist_idx + SOGI_HIST_LEN - 1) & (SOGI_HIST_LEN - 1);
-        float prev_phase = phase_hist[idx_prev];
-        float prev_control = control_hist[idx_prev];
-        float dy = raw_p_err - prev_phase;
+        // Proportional term
+        float p_term = local_kp * combined_err;
 
-        float denom = (prev_control * prev_control) + 1e-6f;
-        float err_gain = (dy - gain_est * prev_control);
-        gain_est += learn_rate * (prev_control * err_gain) / denom;
-        gain_est = constrain(gain_est, -5.0f, 5.0f);
+        // Integral term (governs stable frequency)
+        // Use Kahan summation or simple integration.
+        // Note: ts here is the window duration if we call this once per cycle.
+        // But the user calls it with 'ts' (per-sample). We should use window duration.
+        float dt_window = window_duration;
 
-        float p_term = 0;
-        if (fabs(raw_p_err) > PHASE_DEADBAND) {
-            p_term = kp * raw_p_err;
-            float y = residual_err - integral_err_c;
-            float t = integral_state + y;
-            integral_err_c = (t - integral_state) - y;
-            integral_state = t;
-            i_term = ki * integral_state;
-        }
+        float y = (local_ki * dft_p_err * dt_window) - integral_err_c; // Use DFT for stable integration
+        float t = integral_state + y;
+        integral_err_c = (t - integral_state) - y;
+        integral_state = t;
 
-        const float I_MAX = 5.0f;
-        if (i_term > I_MAX) {
-            i_term = I_MAX;
-            integral_state = i_term / ki;
-            integral_err_c = 0.0f;
-        } else if (i_term < -I_MAX) {
-            i_term = -I_MAX;
-            integral_state = i_term / ki;
-            integral_err_c = 0.0f;
-        }
+        // Anti-windup
+        integral_state = constrain(integral_state, -10.0f, 10.0f);
 
-        float control_action = p_term + i_term;
-        last_control_action = control_action;
-
+        // 6. Update Frequency
+        float control_action = p_term + integral_state;
         float f_new = nominal_freq + control_action;
-        freq = f_new;
+
+        // Clamping to avoid crazy oscillations
+        freq = constrain(f_new, nominal_freq - 10.0f, nominal_freq + 10.0f);
         omega = 2.0f * PI * freq;
 
-        phase_hist[hist_idx] = raw_p_err;
+        // 7. Update History (optional, for monitoring)
+        phase_hist[hist_idx] = combined_err;
         control_hist[hist_idx] = control_action;
         hist_idx = (hist_idx + 1) & (SOGI_HIST_LEN - 1);
+        dft_initialized = true;
     }
 }

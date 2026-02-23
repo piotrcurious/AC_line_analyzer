@@ -566,8 +566,12 @@ void loop() {
                                   pll.freq, pll.mag_smooth, dft.thd_approx * 100.0f, v_dc_offset, core_us,
                                   max_jitter_us, buf_frames, buf_util, isr_callback_count,
                                   interpolation_count, interpolation_count + nearest_sample_count, frames_dropped);
+
+                    float sogi_err = sogi_v.v_beta / (pll.mag_smooth + 1e-6f);
+                    Serial.printf("  [PLL] SOGI_err:%.3f, DFT_err:%.3f, Disc:%.3f\n",
+                                  sogi_err, dft.fundamental.phase_err, pll.filtered_discrepancy);
                     if (dft.thd_approx > 0.05f) {
-                        Serial.printf("  [DFT] H1:%.1f, H3:%.1f, H5:%.1f\n", dft.fundamental.mag, dft.h3.mag, dft.h5.mag);
+                        Serial.printf("  [DFT] H1:%.1f, H3:%.1f, H5:%.1f, H7:%.1f\n", dft.fundamental.mag, dft.h3.mag, dft.h5.mag, dft.h7.mag);
                     }
 
                     yield();

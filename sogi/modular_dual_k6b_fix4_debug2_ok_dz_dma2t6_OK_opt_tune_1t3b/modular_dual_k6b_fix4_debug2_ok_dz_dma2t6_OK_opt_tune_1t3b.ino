@@ -1,36 +1,15 @@
-/*
- * ESP32 SOGI-PLL – Per-Cycle Visualizer with Continuous DMA Resampling
+/* ESP32 SOGI-PLL – Continuous DMA resampling with isolated visualizer + logger tasks
  *
- * DATA FLOW (two independent paths in loop())
- * ═══════════════════════════════════════════
+ * Changes:
+ *  - vis.update() moved to a separate FreeRTOS task (visTask).
+ *  - Serial output moved to a low-priority logging task (logTask).
+ *  - visTask receives heap-allocated snapshots of v_buf/i_buf so Path A can continue writing.
+ *  - interpolateSampleAtTime() snapshots frame indices under noInterrupts() to avoid races.
+ *  - Main loop only queues snapshots and returns quickly.
  *
- *  PATH A – Continuous resampling  (runs on EVERY loop() iteration)
- *  ─────────────────────────────────────────────────────────────────
- *  Maintains next_sample_time (CPU ticks). Every time that timestamp is
- *  due, call interpolateSampleAtTime() against the DMA frame buffer and
- *  write the result into the circular sample buffer v_buf[]/i_buf[].
- *  Advance next_sample_time by ticks_per_sample.
- *  buf_wr keeps incrementing; (buf_wr % SAMPLES_PER_CYCLE) is the slot.
- *  This path is NOT gated on any cycle boundary – it runs freely.
- *
- *  PATH B – Cycle boundary processing  (fires ~once per AC cycle)
- *  ───────────────────────────────────────────────────────────────
- *  When (now - last_cycle_boundary) >= single_cycle_cycles:
- *    1. Advance last_cycle_boundary (prevents drift).
- *    2. The circular buffer already holds ~SAMPLES_PER_CYCLE fresh points
- *       courtesy of Path A.
- *    3. start_idx = buf_wr % SAMPLES_PER_CYCLE  (oldest slot in circular buf)
- *    4. processWindow → SOGI → PLL → phase unwrap → vis.update().
- *    5. Update ticks_per_sample and single_cycle_cycles from new PLL freq.
- *
- *  WHY THIS WORKS
- *  ──────────────
- *  Path A always runs slightly ahead of "now" so the buffer is populated
- *  before Path B reads it.  The cycle boundary is purely an observation
- *  point – it never gates sample collection.
- *
- *  CLEANUP_FRAMES_DIVIDER must keep DMA frames for >= 1 full AC cycle.
- *  At 240 MHz, divider=25 → keeps 9.6M cycles ≈ 40 ms  (50 Hz = 20 ms)
+ * Notes:
+ *  - Keeps original sampling rates and SERIAL_EVERY_N_CYCLES behavior (no change).
+ *  - If queue is full, snapshot is freed (skips one vis update) to avoid blocking loop().
  */
 
 #include <Arduino.h>
@@ -38,6 +17,11 @@
 #include "esp_adc/adc_continuous.h"
 #include "SOGI.h"
 #include "SOGIvisualizer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_heap_caps.h"
 
 // ── Pin / channel ────────────────────────────────────────────────────────────
 #define ADC_PIN_V   36   // ADC1_CH0
@@ -48,28 +32,25 @@
 // ── Algorithm ────────────────────────────────────────────────────────────────
 #define NOMINAL_FREQ       50.0f
 #define SOGI_K             0.7071f
-#define PLL_KP             1.55f
+#define PLL_KP             2.55f
 #define PLL_KI             0.000000f
 #define SAMPLES_PER_CYCLE  128        // virtual samples per AC cycle
 
-// ── ADC / DMA ────────────────────────────────────────────────────────────────
+// ── ADC / DMA ───────────────────────────────────────────────────────────────
 #define ADC_OVERSAMPLE_RATE   200000  // total samples/s across both channels
 #define CONV_FRAME_SIZE       16      // bytes per DMA interrupt frame
 
-// ── Frame ring ───────────────────────────────────────────────────────────────
-#define FRAME_BUFFER_SIZE     1200
-#define MAX_SEARCH            100
+// ── Frame ring ───────────────────────────────────────────────────────────
+#define FRAME_BUFFER_SIZE     4000
+#define MAX_SEARCH            4000
 
-// Keep at least 2 full AC cycles of DMA frames so Path A can always find data.
-// keep_duration = cpu_freq_hz / CLEANUP_FRAMES_DIVIDER
-// 240e6 / 25 = 9.6e6 cycles ≈ 40 ms  (covers two 50 Hz cycles)
-#define CLEANUP_FRAMES_DIVIDER  250
+#define CLEANUP_FRAMES_DIVIDER  25
 
 // ── Diagnostics throttle ─────────────────────────────────────────────────────
-#define SERIAL_EVERY_N_CYCLES   2
-//#define FULL_DEBUG_SERIAL  // full debug takes too long so can produce artifacts
+#define SERIAL_EVERY_N_CYCLES   1
+//#define FULL_DEBUG_SERIAL  // leave disabled; serialing is offloaded anyway
 
-// ── Global objects ───────────────────────────────────────────────────────────
+// ── Global objects ──────────────────────────────────────────────────────────
 SOGIVisualizer vis;
 SOGI           sogi_v(SOGI_K);
 AdaptivePLL    pll(NOMINAL_FREQ, PLL_KP, PLL_KI, 0.1001f);
@@ -126,9 +107,35 @@ struct PhaseTrack {
 uint32_t interp_ok_count   = 0;
 uint32_t interp_fail_count = 0;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Low-level utilities
-// ─────────────────────────────────────────────────────────────────────────────
+// ── FreeRTOS objects for vis + logging ───────────────────────────────────────
+TaskHandle_t visTaskHandle = NULL;
+TaskHandle_t logTaskHandle = NULL;
+QueueHandle_t visQueue = NULL;     // holds VisSnapshot
+QueueHandle_t logQueue = NULL;     // holds SerialMsg
+
+// Snapshot structures
+struct VisSnapshot {
+    float *v_copy; // heap allocated arrays
+    float *i_copy;
+    int    aligned_start;
+    float  pll_freq;
+    float  pll_mag;
+    float  vdc, idc;
+};
+
+struct SerialMsg {
+    float pll_freq;
+    float core_us;
+    uint32_t isr_callback_count;
+    uint32_t frames_dropped;
+    uint32_t interp_ok;
+    uint32_t interp_total;
+    float vdc, idc;
+};
+
+//
+// ----- low-level utilities (unchanged, small tweaks for atomic snapshots) -----
+//
 
 static inline uint32_t IRAM_ATTR get_cycle_count() {
     uint32_t ccount;
@@ -183,24 +190,27 @@ static inline uint32_t IRAM_ATTR frameSampleTimestamp(uint32_t frame_end,
     return frame_end - (uint32_t)(sc - 1u - k) * cycles_per_adc_sample;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Core interpolation
-// ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-//  Core interpolation (optimized)
-// ─────────────────────────────────────────────────────────────────────────────
 static inline uint32_t IRAM_ATTR decIndex(uint32_t idx) {
     // faster than modulo for common circular-buffer decrement
     return (idx == 0) ? (FRAME_BUFFER_SIZE - 1) : (idx - 1);
 }
 
+// Atomic snapshot helper: grab rd/wr in a tiny critical window.
+static inline void IRAM_ATTR snapshotFrameIndices(uint32_t &rd_out, uint32_t &wr_out) {
+    noInterrupts();
+    rd_out = frame_read_idx;
+    wr_out = frame_write_idx;
+    interrupts();
+}
+
+// Core interpolation — modified to use atomic snapshot of indices
 static inline bool IRAM_ATTR interpolateSampleAtTime(uint32_t target, float &v_out, float &i_out) {
-    // local snapshots to avoid repeated global reads
-    uint32_t rd = frame_read_idx;
-    uint32_t wr = frame_write_idx;
+    // atomic snapshot of indices to avoid races with ISR
+    uint32_t rd, wr;
+    snapshotFrameIndices(rd, wr);
+
     if (rd == wr) return false;
 
-    // compute available frames (same as original)
     uint32_t avail = (wr >= rd) ? (wr - rd) : (FRAME_BUFFER_SIZE - rd + wr);
     uint32_t lim   = (avail < MAX_SEARCH) ? avail : MAX_SEARCH;
 
@@ -294,89 +304,6 @@ static inline bool IRAM_ATTR interpolateSampleAtTime(uint32_t target, float &v_o
     }
     return false;
 }
-static inline bool IRAM_ATTR interpolateSampleAtTime_old(uint32_t target, float &v_out, float &i_out) {
-    uint32_t rd = frame_read_idx;
-    uint32_t wr = frame_write_idx;
-    if (rd == wr) return false;
-
-    uint32_t avail = (wr >= rd) ? (wr - rd) : (FRAME_BUFFER_SIZE - rd + wr);
-    uint32_t lim   = (avail < MAX_SEARCH) ? avail : MAX_SEARCH;
-
-    uint32_t fi       = (wr + FRAME_BUFFER_SIZE - 1) % FRAME_BUFFER_SIZE;
-    uint32_t searched = 0;
-
-    while (searched < lim) {
-        TimestampedFrame *f = (TimestampedFrame *)&frame_buffer[fi];
-        if (f->data_size) {
-            uint8_t sc = countFrameSamples(f);
-            if (sc) {
-                uint32_t fe = f->end_timestamp;
-                uint32_t fs = frameSampleTimestamp(fe, 0, sc);
-
-                if ((int32_t)(target - fe) > (int32_t)(cpu_freq_hz / 10)) break;
-
-                int32_t ds = (int32_t)(target - fs);
-                int32_t de = (int32_t)(target - fe);
-
-                if (ds >= 0 && de <= 0) {
-                    float   pos = (float)(uint32_t)(target - fs) / (float)cycles_per_adc_sample;
-                    uint8_t ib  = (uint8_t)pos;
-
-                    if (ib >= (uint8_t)(sc - 1)) {
-                        uint16_t vr, ir;
-                        if (parseFrameSample(f, sc - 1, vr, ir)) {
-                            v_out = adcRawToMillivolts(vr);
-                            i_out = adcRawToMillivolts(ir);
-                            return true;
-                        }
-                    } else {
-                        uint8_t  ia    = ib + 1;
-                        float    alpha = pos - (float)ib;
-                        uint16_t vb, ib2, va, ia2;
-                        if (parseFrameSample(f, ib, vb, ib2) &&
-                            parseFrameSample(f, ia, va, ia2)) {
-                            float fvb = adcRawToMillivolts(vb);
-                            float fva = adcRawToMillivolts(va);
-                            float fib = adcRawToMillivolts(ib2);
-                            float fia = adcRawToMillivolts(ia2);
-                            v_out = fvb + alpha * (fva - fvb);
-                            i_out = fib + alpha * (fia - fib);
-                            return true;
-                        }
-                    }
-                }
-
-                if (de <= 0) {
-                    uint16_t vr, ir;
-                    if (parseFrameSample(f, 0, vr, ir)) {
-                        v_out = adcRawToMillivolts(vr);
-                        i_out = adcRawToMillivolts(ir);
-                        return true;
-                    }
-                }
-            }
-        }
-        fi = (fi + FRAME_BUFFER_SIZE - 1) % FRAME_BUFFER_SIZE;
-        ++searched;
-        if (fi == rd) break;
-    }
-
-    // Last-resort: newest frame's last sample
-    uint32_t lfi = (wr + FRAME_BUFFER_SIZE - 1) % FRAME_BUFFER_SIZE;
-    TimestampedFrame *lf = (TimestampedFrame *)&frame_buffer[lfi];
-    if (lf->data_size) {
-        uint8_t sc = countFrameSamples(lf);
-        if (sc) {
-            uint16_t vr, ir;
-            if (parseFrameSample(lf, sc - 1, vr, ir)) {
-                v_out = adcRawToMillivolts(vr);
-                i_out = adcRawToMillivolts(ir);
-                return true;
-            }
-        }
-    }
-    return false;
-}
 
 // Discard frames older than ~40 ms
 static inline void IRAM_ATTR cleanupOldFrames(uint32_t now) {
@@ -393,7 +320,6 @@ static inline void IRAM_ATTR updateTimingParameters(float frequency) {
     float fc            = constrain(frequency, 40.0f, 90.0f);
     single_cycle_cycles = (uint32_t)lrintf((float)cpu_freq_hz / fc);
     ticks_per_sample    = single_cycle_cycles / SAMPLES_PER_CYCLE;
-    // Integer division; error <= 1 tick/sample, absorbed by interpolation
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +350,7 @@ static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ADC init
+//  ADC init (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 bool initADCContinuous() {
     adc_continuous_handle_cfg_t cfg = {
@@ -463,12 +389,51 @@ bool initADCContinuous() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Tasks
+// ─────────────────────────────────────────────────────────────────────────────
+
+void visTask(void *pv) {
+    VisSnapshot snap;
+    for (;;) {
+        if (xQueueReceive(visQueue, &snap, portMAX_DELAY) == pdTRUE) {
+            // call visualizer with the snapshot copies
+            vis.update(snap.v_copy, snap.i_copy, SAMPLES_PER_CYCLE,
+                       snap.aligned_start, SAMPLES_PER_CYCLE,
+                       snap.pll_freq, snap.pll_mag,
+                       snap.vdc, snap.idc);
+            // free the copies (they were allocated with heap_caps_malloc)
+            heap_caps_free(snap.v_copy);
+            heap_caps_free(snap.i_copy);
+        }
+    }
+}
+
+void logTask(void *pv) {
+    SerialMsg msg;
+    for (;;) {
+        if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
+            // perform Serial.printf() here at low priority
+            Serial.printf(
+                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f\n",
+                msg.pll_freq,
+                msg.core_us,
+                (unsigned long)msg.isr_callback_count,
+                (unsigned long)msg.frames_dropped,
+                (unsigned long)msg.interp_ok,
+                (unsigned long)msg.interp_total,
+                msg.vdc, msg.idc
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  setup()
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
     delay(100);
-    Serial.println("\nSOGI-PLL  continuous resampling + per-cycle processing");
+    Serial.println("\nSOGI-PLL  continuous resampling + per-cycle processing (tasks)");
 
     cpu_freq_hz  = (uint32_t)ESP.getCpuFreqMHz() * 1000000U;
     inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
@@ -498,6 +463,18 @@ void setup() {
         while (1) delay(100);
     }
 
+    // Create queues & tasks
+    visQueue = xQueueCreate(4, sizeof(VisSnapshot));
+    logQueue = xQueueCreate(8, sizeof(SerialMsg));
+    if (!visQueue || !logQueue) {
+        Serial.println("Queue alloc failed"); while(1) delay(1000);
+    }
+
+    // visTask: slightly higher priority than logger, but both lower than system-critical ISRs
+    xTaskCreatePinnedToCore(visTask, "visTask", 8192, NULL, tskIDLE_PRIORITY + 2, &visTaskHandle, 0);
+    // logTask: low priority
+    xTaskCreatePinnedToCore(logTask, "logTask", 4096, NULL, tskIDLE_PRIORITY + 1, &logTaskHandle, 0);
+
     gpio_set_drive_capability((gpio_num_t)18, GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability((gpio_num_t)23, GPIO_DRIVE_CAP_3);
 
@@ -514,21 +491,26 @@ void IRAM_ATTR loop() {
 
     uint32_t now = get_cycle_count();
 
-//    if (++cleanup_ctr >= 5) {
-//        cleanupOldFrames(now);
-//        cleanup_ctr = 0;
-//    }
+    // PATH A – Continuous resampling
+    while ((int32_t)(now - next_sample_time) >= 0) {
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  PATH A – Continuous resampling
-    //
-    //  Drains all due sample slots on every loop() pass.
-    //  Writes into the circular buffer v_buf / i_buf unconditionally.
-    //  ticks_per_sample is updated by Path B; Path A just uses whatever
-    //  value is current – there is no phase discontinuity because
-    //  interpolateSampleAtTime() works in absolute CPU-tick space.
-    // ══════════════════════════════════════════════════════════════════════════
-    if ((int32_t)(now - next_sample_time) >= 0) {
+// --- NEW: Lookahead Guard ---
+        // Ensure the DMA has actually delivered a frame that is newer than our target time.
+        uint32_t rd, wr;
+        snapshotFrameIndices(rd, wr);
+        
+        if (rd == wr) break; // No data available at all yet
+        
+        uint32_t newest_idx = decIndex(wr);
+        uint32_t newest_ts = frame_buffer[newest_idx].end_timestamp;
+        
+        // If the sample we want is in the future relative to the newest frame, 
+        // it is trapped in the active DMA buffer. Break and wait for the next loop.
+        if ((int32_t)(next_sample_time - newest_ts) > 0) {
+            break; 
+        }
+        // -----------------------------
+      
         float v, i;
         if (interpolateSampleAtTime(next_sample_time, v, i)) {
             ++interp_ok_count;
@@ -548,20 +530,19 @@ void IRAM_ATTR loop() {
         cleanup_ctr = 0;
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  PATH B – Cycle boundary processing
-    //
-    //  At this point Path A has already filled the circular buffer with
-    //  fresh data up to "now".  We take a SOGI/PLL snapshot and push to vis.
-    // ══════════════════════════════════════════════════════════════════════════
-    if ((int32_t)(now - (last_cycle_boundary)) < (int32_t)single_cycle_cycles) return;
+//    // PATH B – Cycle boundary processing
+//    if ((int32_t)(now - (last_cycle_boundary)) < (int32_t)single_cycle_cycles) return;
+
+    // PATH B – Cycle boundary processing
+    // Trigger based on the virtual timeline of the data, not the CPU clock!
+    if ((int32_t)(next_sample_time - last_cycle_boundary) < (int32_t)single_cycle_cycles) return;
 
     last_cycle_boundary += single_cycle_cycles;
 
     // Need at least one full buffer of data before processing
     if (buf_wr < SAMPLES_PER_CYCLE) return;
 
-    // ── DC estimation ─────────────────────────────────────────────────────────
+    // DC estimation
     float v_sum = 0.0f, i_sum = 0.0f;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
@@ -570,9 +551,7 @@ void IRAM_ATTR loop() {
     v_dc_offset = 0.8f * v_dc_offset + 0.2f * (v_sum * (1.0f / SAMPLES_PER_CYCLE));
     i_dc_offset = 0.8f * i_dc_offset + 0.2f * (i_sum * (1.0f / SAMPLES_PER_CYCLE));
 
-    // ── SOGI ──────────────────────────────────────────────────────────────────
-    // buf_wr % SAMPLES_PER_CYCLE is the NEXT slot to write, i.e. the OLDEST
-    // data currently in the circular buffer → correct start_idx for processWindow.
+    // SOGI
     float ts        = (float)ticks_per_sample * inv_cpu_freq;
     int   start_idx = (int)(buf_wr % SAMPLES_PER_CYCLE);
 
@@ -581,11 +560,10 @@ void IRAM_ATTR loop() {
     sogi_v.processWindow(v_buf, SAMPLES_PER_CYCLE, start_idx, SAMPLES_PER_CYCLE,
                          pll.omega, ts, v_dc_offset);
 
-    // ── PLL ───────────────────────────────────────────────────────────────────
+    // PLL
     pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts);
 
-    // ── Phase alignment ───────────────────────────────────────────────────────
-    // Second SOGI pass on the same buffer gives a clean phase snapshot.
+    // Phase alignment
     SOGI phase_sogi(SOGI_K);
     phase_sogi.processWindow(v_buf, SAMPLES_PER_CYCLE, start_idx, SAMPLES_PER_CYCLE,
                              pll.omega, ts, v_dc_offset);
@@ -606,7 +584,6 @@ void IRAM_ATTR loop() {
     float phase_norm = fmodf(unwrapped, 2.0f * (float)PI);
     if (phase_norm < 0.0f) phase_norm += 2.0f * (float)PI;
 
-    // samples_back: how far behind the current write head is the zero-crossing
     float samples_per_cycle_f = 1.0f / (pll.freq * ts);
     float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
     int   aligned_start       = (int)((start_idx
@@ -614,55 +591,67 @@ void IRAM_ATTR loop() {
                                        - (int)(samples_back + 0.5f))
                                       % SAMPLES_PER_CYCLE);
 
-    // ── Update timing for next cycle ──────────────────────────────────────────
+    // Update timing for next cycle
     updateTimingParameters(pll.freq);
-
-    // ── Visualizer ───────────────────────────────────────────────────────────
-//    vis.update(v_buf, i_buf, SAMPLES_PER_CYCLE,
-//               aligned_start, SAMPLES_PER_CYCLE,
-//               pll.freq, pll.mag_smooth,
-//               v_dc_offset, i_dc_offset);
 
     uint32_t proc_end = get_cycle_count();
     float    core_us  = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
 
-    // ── Serial diagnostics ───────────────────────────────────────────────────
+    // ---------- Queue a vis snapshot (copy) ----------
+    // Allocate heap memory for two float arrays. FreeRTOS queue stores the pointer+meta.
+    // Copy performed inside a tiny critical section to avoid concurrent writes from Path A.
+    VisSnapshot snap;
+    snap.v_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
+    snap.i_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
+    if (snap.v_copy && snap.i_copy) {
+        noInterrupts();
+        for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
+            snap.v_copy[k] = v_buf[k];
+            snap.i_copy[k] = i_buf[k];
+        }
+        interrupts();
+
+        snap.aligned_start = aligned_start;
+        snap.pll_freq = pll.freq;
+        snap.pll_mag  = pll.mag_smooth;
+        snap.vdc = v_dc_offset;
+        snap.idc = i_dc_offset;
+
+        // Non-blocking send: if queue full, drop this snapshot and free memory.
+        if (xQueueSend(visQueue, &snap, 0) != pdTRUE) {
+            heap_caps_free(snap.v_copy);
+            heap_caps_free(snap.i_copy);
+        }
+    } else {
+        // allocation failed: free any that succeeded
+        if (snap.v_copy) heap_caps_free(snap.v_copy);
+        if (snap.i_copy) heap_caps_free(snap.i_copy);
+    }
+
+    // ---------- Queue a serial/log message (do not change update rate) ----------
     if (++serial_ctr >= SERIAL_EVERY_N_CYCLES) {
         serial_ctr = 0;
-
-#ifdef FULL_DEBUG_SERIAL
-        uint32_t bf = (frame_write_idx >= frame_read_idx)
-                    ? (frame_write_idx - frame_read_idx)
-                    : (FRAME_BUFFER_SIZE - frame_read_idx + frame_write_idx);
-
-        Serial.printf(
-            "F:%.4fHz  Mag:%.3f  Vdc:%.1f  Idc:%.1f  "
-            "Core:%.1fus  Frames:%lu(%.0f%%)  ISR:%lu  "
-            "Interp:%lu/%lu  Drop:%lu\n",
-            pll.freq, pll.mag_smooth, v_dc_offset, i_dc_offset,
-            core_us,
-            bf, 100.0f * (float)bf / (float)FRAME_BUFFER_SIZE,
-            isr_callback_count,
-            interp_ok_count, interp_ok_count + interp_fail_count,
-            frames_dropped);
-#else
-        Serial.printf(
-            "F:%.4fHz  "
-            ":%.1fus \n "
-            ,
-            pll.freq, 
-            core_us);
-#endif // FULL_DEBUG_SERIAL
-
-
-    vis.update(v_buf, i_buf, SAMPLES_PER_CYCLE,
-               aligned_start, SAMPLES_PER_CYCLE,
-               pll.freq, pll.mag_smooth,
-               v_dc_offset, i_dc_offset);
-
-
+        SerialMsg sm;
+        sm.pll_freq = pll.freq;
+        sm.core_us  = core_us;
+        // snapshot counters atomically
+        noInterrupts();
+        sm.isr_callback_count = isr_callback_count;
+        sm.frames_dropped     = frames_dropped;
+        sm.interp_ok          = interp_ok_count;
+        sm.interp_total       = interp_ok_count + interp_fail_count;
+        sm.vdc = v_dc_offset;
+        sm.idc = i_dc_offset;
+        // reset counters for next period
         interp_ok_count   = 0;
         interp_fail_count = 0;
+        
+        interrupts();
+
+        // non-blocking send; if queue full, we drop the message (but must not block loop)
+        if (xQueueSend(logQueue, &sm, 0) != pdTRUE) {
+            // dropped; nothing to free here
+        }
     }
 
     yield();

@@ -18,7 +18,7 @@
 #define V_CHANNEL   0
 #define I_CHANNEL   3
 
-// ── Algorithm ────────────────────────────────────────────────────────────────
+// ── Algorithm ───────────────────────────────────────────────────────────────
 #define NOMINAL_FREQ       50.0f
 #define SOGI_K             0.7071f
 #define PLL_KP             2.55f
@@ -29,7 +29,7 @@
 #define ADC_OVERSAMPLE_RATE   200000  // total samples/s across both channels
 #define CONV_FRAME_SIZE       16      // bytes per DMA interrupt frame (approx 4 samples V+I)
 
-// ── Frame ring ───────────────────────────────────────────────────────────
+// ── Frame ring ────────────────────────────────────────────────────────────
 #define FRAME_BUFFER_SIZE     256     // Reduced size, we process as they arrive
 
 // ── Diagnostics throttle ─────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ SOGIVisualizer vis;
 SOGI           sogi_v(SOGI_K);
 AdaptivePLL    pll(NOMINAL_FREQ, PLL_KP, PLL_KI, 0.1001f);
 
-// ── DMA frame ring ───────────────────────────────────────────────────────────
+// ── DMA frame ring ──────────────────────────────────────────────────────────
 struct TimestampedFrame {
     uint32_t end_timestamp;
     uint8_t  raw_data[CONV_FRAME_SIZE];
@@ -133,9 +133,19 @@ static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw) {
 }
 
 static inline void IRAM_ATTR updateTimingParameters(float frequency) {
+    // clamp frequency to stable range before computing integer cycle counts
     float fc            = (frequency < 40.0f) ? 40.0f : (frequency > 90.0f ? 90.0f : frequency);
     single_cycle_cycles = (uint32_t)lrintf((float)cpu_freq_hz / fc);
-    ticks_per_sample    = single_cycle_cycles / SAMPLES_PER_CYCLE;
+    uint32_t ticks = (single_cycle_cycles / SAMPLES_PER_CYCLE);
+    if (ticks == 0) ticks = 1; // defensive: ensure at least 1 tick per virtual sample
+    ticks_per_sample = ticks;
+}
+
+// Small helper to compute signed difference robustly (handles modulo-32 wrap fine for small deltas)
+static inline int32_t IRAM_ATTR signed_time_diff(uint32_t a, uint32_t b) {
+    // (a - b) computed as unsigned modulo 2^32, then reinterpreted as signed.
+    // useful when differences are small (< 2^31) which is our case.
+    return (int32_t)(a - b);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -145,21 +155,34 @@ static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
                                               const adc_continuous_evt_data_t *edata,
                                               void *user_data) {
     uint32_t ts      = get_cycle_count();
-    uint32_t next_wr = (frame_write_idx + 1) % FRAME_BUFFER_SIZE;
 
-    if (next_wr == frame_read_idx) {
-        frame_read_idx = (frame_read_idx + 1) % FRAME_BUFFER_SIZE;
+    // Load the current read index atomically
+    uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE);
+    uint32_t next_wr = ( __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED) + 1 ) % FRAME_BUFFER_SIZE;
+
+    // If advancing will collide with read pointer, drop oldest frame by advancing read pointer
+    if (next_wr == rd) {
+        rd = (rd + 1) % FRAME_BUFFER_SIZE;
+        __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
         ++frames_dropped;
     }
 
+    // copy up to buffer size
     uint32_t sz = edata->size;
     if (sz > CONV_FRAME_SIZE) sz = CONV_FRAME_SIZE;
-    memcpy((void *)frame_buffer[frame_write_idx].raw_data, edata->conv_frame_buffer, sz);
 
-    frame_buffer[frame_write_idx].end_timestamp = ts;
-    frame_buffer[frame_write_idx].data_size     = (uint16_t)sz;
+    // Copy raw data into buffer slot (CONV_FRAME_SIZE is small — kept in ISR for simplicity)
+    memcpy((void *)frame_buffer[ __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED) ].raw_data,
+           edata->conv_frame_buffer, sz);
 
-    frame_write_idx = next_wr;
+    // publish metadata, then bump write index atomically
+    uint32_t wr_idx = __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED);
+    frame_buffer[wr_idx].end_timestamp = ts;
+    frame_buffer[wr_idx].data_size     = (uint16_t)sz;
+
+    uint32_t next_wr_actual = (wr_idx + 1) % FRAME_BUFFER_SIZE;
+    __atomic_store_n(&frame_write_idx, next_wr_actual, __ATOMIC_RELEASE);
+
     ++isr_callback_count;
     return false;
 }
@@ -234,26 +257,36 @@ void logTask(void *pv) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR processIncomingDMA() {
-    uint32_t rd = frame_read_idx;
-    uint32_t wr = frame_write_idx;
+    // Acquire atomic snapshot of indices
+    uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE);
+    uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_ACQUIRE);
 
     if (rd == wr) return;
 
-    const float inv_cps = 1.0f / (float)cycles_per_adc_sample;
-
     while (rd != wr) {
-        volatile TimestampedFrame &f = frame_buffer[rd];
+        // local reference to frame (we copy fields before progressing)
+        TimestampedFrame f;
+        // copy the frame atomically: small struct -> safe to copy
+        // Note: we copy data out of the shared buffer index since ISR will not touch 'rd' once write_idx moved past it.
+        uint32_t idx = rd;
+        // Copy raw frame to local stack struct (small)
+        memcpy(&f, (const void*)&frame_buffer[idx], sizeof(TimestampedFrame));
+
         uint32_t fe = f.end_timestamp;
 
-        // Count samples in frame
         const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f.raw_data;
         int n = f.data_size / sizeof(adc_digi_output_data_t);
+        if (n <= 0) { // nothing sensible
+            rd = (rd + 1) % FRAME_BUFFER_SIZE;
+            continue;
+        }
 
-        // We expect interleaved V, I, V, I...
-        // We'll process them in pairs
-        for (int i = 0; i < n; i += 2) {
-            // Robust parsing: check channels
+        // We'll process samples in pairs (V, I)
+        int total_pairs = n / 2;
+        for (int pair = 0; pair < total_pairs; ++pair) {
+            int i = pair * 2;
             uint16_t rv = 0, ri = 0;
+            // robust parsing: test both entries
             if (p[i].type1.channel == V_CHANNEL) rv = p[i].type1.data;
             else if (p[i].type1.channel == I_CHANNEL) ri = p[i].type1.data;
 
@@ -265,10 +298,9 @@ void IRAM_ATTR processIncomingDMA() {
             float fv = adcRawToMillivolts(rv);
             float fi = adcRawToMillivolts(ri);
 
-            // Approximate sample count in frame to get timestamp for this pair
-            int pair_idx = i / 2;
-            int total_pairs = n / 2;
-            uint32_t ts = fe - (uint32_t)(total_pairs - 1 - pair_idx) * cycles_per_adc_sample;
+            // compute timestamp for this pair robustly: use 64-bit for multiply
+            uint64_t offset64 = (uint64_t)(total_pairs - 1 - pair) * (uint64_t)cycles_per_adc_sample;
+            uint32_t ts = (uint32_t)(fe - (uint32_t)offset64);
 
             if (!resamp.initialized) {
                 resamp.last_ts = ts;
@@ -279,10 +311,25 @@ void IRAM_ATTR processIncomingDMA() {
                 continue;
             }
 
-            // Interpolate virtual samples between last_ts and current ts
-            while ((int32_t)(ts - next_sample_time) >= 0) {
-                float dt = (float)(ts - resamp.last_ts);
-                float alpha = (dt > 0) ? (float)(next_sample_time - resamp.last_ts) / dt : 1.0f;
+            // Fill virtual samples between resamp.last_ts and ts
+            // loop while next_sample_time is <= ts (robust with wrap using signed_time_diff)
+            while ( signed_time_diff(ts, next_sample_time) >= 0 ) {
+                uint32_t dt_u = (uint32_t)(ts - resamp.last_ts); // unsigned delta (mod 2^32)
+                float dt = (float)dt_u;
+                float alpha;
+                if (dt > 0.0f) {
+                    uint32_t delta_to_next = (uint32_t)(next_sample_time - resamp.last_ts);
+                    alpha = (float)delta_to_next / dt;
+                    if (!(alpha >= 0.0f && alpha <= 1.0f)) {
+                        // alpha out of expected range => numerical oddity, skip and mark fail
+                        interp_fail_count++;
+                        break;
+                    }
+                } else {
+                    // two timestamps identical (rare) — fallback
+                    alpha = 1.0f;
+                    interp_fail_count++;
+                }
 
                 float v_interp = resamp.last_v + alpha * (fv - resamp.last_v);
                 float i_interp = resamp.last_i + alpha * (fi - resamp.last_i);
@@ -300,8 +347,10 @@ void IRAM_ATTR processIncomingDMA() {
         }
 
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
-        frame_read_idx = rd; // Update globally
     }
+
+    // publish the read index atomically
+    __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +361,7 @@ void setup() {
     delay(100);
     cpu_freq_hz  = (uint32_t)ESP.getCpuFreqMHz() * 1000000U;
     inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
+    // cycles per ADC sample (per channel), note ADC_OVERSAMPLE_RATE counts both channels
     cycles_per_adc_sample = cpu_freq_hz / (ADC_OVERSAMPLE_RATE / 2);
 
     updateTimingParameters(NOMINAL_FREQ);
@@ -343,7 +393,7 @@ void IRAM_ATTR loop() {
     processIncomingDMA();
 
     // PATH B – Cycle boundary processing
-    if ((int32_t)(next_sample_time - last_cycle_boundary) < (int32_t)single_cycle_cycles) return;
+    if ( signed_time_diff(next_sample_time, last_cycle_boundary) < (int32_t)single_cycle_cycles ) return;
 
     last_cycle_boundary += single_cycle_cycles;
     if (buf_wr < SAMPLES_PER_CYCLE) return;

@@ -1,4 +1,4 @@
-/* ESP32 SOGI-PLL – High-performance streaming resampler with decimation and latency compensation
+/* ESP32 SOGI-PLL – Optimized streaming resampler with continuous SOGI state advancement
  */
 
 #include <Arduino.h>
@@ -80,7 +80,7 @@ struct ResamplerState {
 } resamp;
 
 // ── PATH B state – cycle boundary ────────────────────────────────────────────
-uint32_t last_cycle_boundary = 0;
+uint32_t last_cycle_boundary_samples = 0;
 
 // ── DC offsets ───────────────────────────────────────────────────────────────
 float v_dc_offset = 1650.0f;
@@ -239,7 +239,7 @@ void logTask(void *pv) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Decimating Resampler
+//  Decimating Resampler + Continuous SOGI Advancement
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR processIncomingDMA() {
@@ -262,13 +262,8 @@ void IRAM_ATTR processIncomingDMA() {
         }
 
         int total_pairs = n / 2;
-        if (total_pairs <= 0) {
-             rd = (rd + 1) % FRAME_BUFFER_SIZE;
-             continue;
-        }
-
         uint32_t elapsed = (uint32_t)(fe - resamp.last_ts);
-        float local_cycles_per_pair = (float)elapsed / (float)total_pairs;
+        float local_cycles_per_pair = (total_pairs > 0) ? (float)elapsed / (float)total_pairs : 0.0f;
 
         for (int pair = 0; pair < total_pairs; ++pair) {
             int i = pair * 2;
@@ -292,34 +287,40 @@ void IRAM_ATTR processIncomingDMA() {
                 continue;
             }
 
-            // Accumulate for decimation
             resamp.acc_v += fv;
             resamp.acc_i += fi;
             resamp.acc_count++;
 
-            // If we've crossed the boundary for a new virtual sample
             while ( signed_time_diff(ts, next_sample_time) >= 0 ) {
+                float v_val = v_dc_offset, i_val = i_dc_offset;
                 if (resamp.acc_count > 0) {
                     float inv_count = 1.0f / (float)resamp.acc_count;
-                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = resamp.acc_v * inv_count;
-                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = resamp.acc_i * inv_count;
+                    v_val = resamp.acc_v * inv_count;
+                    i_val = resamp.acc_i * inv_count;
                 } else {
-                    // Fallback to previous sample if no new data points
                     int prev_idx = (buf_wr + SAMPLES_PER_CYCLE - 1) % SAMPLES_PER_CYCLE;
-                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_buf[prev_idx];
-                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_buf[prev_idx];
+                    v_val = v_buf[prev_idx];
+                    i_val = i_buf[prev_idx];
                 }
+
+                v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_val;
+                i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
+
+                // --- CONTINUOUS SOGI ADVANCEMENT ---
+                // Process SOGI immediately for every virtual sample produced.
+                // This keeps the SOGI state synchronized with the latest data head.
+                float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
+                sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
+                // ------------------------------------
 
                 buf_wr++;
                 next_sample_time += ticks_per_sample;
                 interp_ok_count++;
 
-                // Reset accumulator for next virtual sample
                 resamp.acc_v = 0.0f;
                 resamp.acc_i = 0.0f;
                 resamp.acc_count = 0;
             }
-
             resamp.last_ts = ts;
         }
         resamp.last_ts = fe;
@@ -366,45 +367,39 @@ void IRAM_ATTR loop() {
 
     processIncomingDMA();
 
-    // PATH B – Cycle boundary processing
-    // Use the latest available data timestamp to compensate for DMA lag
-    if ( signed_time_diff(next_sample_time, last_cycle_boundary) < (int32_t)single_cycle_cycles ) return;
+    // PATH B – Decoupled Control/Vis Trigger
+    // Trigger based on virtual sample count instead of CPU clock
+    if (buf_wr - last_cycle_boundary_samples < SAMPLES_PER_CYCLE) return;
 
-    // Compensate for DMA lag: next_sample_time is the time of the NEWEST virtual sample.
-    // The delay between real-time and this sample is roughly CONV_FRAME_SIZE / ADC_RATE.
-    // We projection the phase forward to compensate for this.
+    last_cycle_boundary_samples += SAMPLES_PER_CYCLE;
+
+    // Use current time to calculate lag to the MOST RECENT virtual sample
     uint32_t now = get_cycle_count();
-    uint32_t dma_lag_ticks = signed_time_diff(now, resamp.last_ts);
-    float    dma_lag_sec   = (float)dma_lag_ticks * inv_cpu_freq;
+    uint32_t last_virtual_ts = next_sample_time - ticks_per_sample;
+    int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
+    float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
-    last_cycle_boundary += single_cycle_cycles;
-    if (buf_wr < SAMPLES_PER_CYCLE) return;
-
-    // DC estimation
+    // DC estimation (low pass filter)
     float v_sum = 0.0f, i_sum = 0.0f;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
         i_sum += i_buf[k];
     }
     float inv_n = 1.0f / SAMPLES_PER_CYCLE;
-    v_dc_offset = 0.8f * v_dc_offset + 0.2f * (v_sum * inv_n);
-    i_dc_offset = 0.8f * i_dc_offset + 0.2f * (i_sum * inv_n);
+    v_dc_offset = 0.95f * v_dc_offset + 0.05f * (v_sum * inv_n);
+    i_dc_offset = 0.95f * i_dc_offset + 0.05f * (i_sum * inv_n);
 
-    float ts        = (float)ticks_per_sample * inv_cpu_freq;
-    int   start_idx = (int)(buf_wr % SAMPLES_PER_CYCLE);
+    float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    sogi_v.processWindow(v_buf, SAMPLES_PER_CYCLE, start_idx, SAMPLES_PER_CYCLE,
-                         pll.omega, ts, v_dc_offset);
+    // --- PLL UPDATE ---
+    // The sogi_v state is already at the latest data head thanks to Path A.
+    // We update the PLL using this instantaneous state.
+    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
+    // ------------------
 
-    // Update PLL with current data
-    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts);
-
-    // Compensation: Project phase forward by dma_lag_sec
-    // This reduces the phase jitter caused by the DMA buffer latency.
-    float phase_corr = pll.omega * dma_lag_sec;
-
-    // Phase alignment for visualization
+    // Accurate phase projection to present moment
+    float phase_corr = pll.omega * lag_sec;
     float phase = atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr;
     if (phase < 0.0f) phase += 2.0f * (float)PI;
     else if (phase > 2.0f * (float)PI) phase -= 2.0f * (float)PI;
@@ -422,8 +417,9 @@ void IRAM_ATTR loop() {
     float phase_norm = fmodf(unwrapped, 2.0f * (float)PI);
     if (phase_norm < 0.0f) phase_norm += 2.0f * (float)PI;
 
-    float samples_per_cycle_f = 1.0f / (pll.freq * ts);
+    float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
     float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
+    int   start_idx           = (int)(buf_wr % SAMPLES_PER_CYCLE);
     int   aligned_start       = (int)((start_idx
                                        + SAMPLES_PER_CYCLE
                                        - (int)(samples_back + 0.5f))

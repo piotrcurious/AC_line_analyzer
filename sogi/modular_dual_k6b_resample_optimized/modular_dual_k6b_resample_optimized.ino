@@ -1,4 +1,4 @@
-/* ESP32 SOGI-PLL – Hardware-Anchored streaming resampler with decimation and lag compensation
+/* ESP32 SOGI-PLL – Hardware-Anchored Streaming Resampler with Batch SOGI-PLL
  */
 
 #include <Arduino.h>
@@ -30,7 +30,7 @@
 #define CONV_FRAME_SIZE       128     // Large DMA frame size
 
 // ── Frame ring ────────────────────────────────────────────────────────────
-#define FRAME_BUFFER_SIZE     128
+#define FRAME_BUFFER_SIZE     256
 
 // ── Diagnostics throttle ─────────────────────────────────────────────────────
 #define SERIAL_EVERY_N_CYCLES   50
@@ -72,30 +72,23 @@ uint32_t buf_wr = 0;
 uint32_t next_sample_time = 0;
 
 struct ResamplerState {
-    uint32_t last_hw_ts = 0;      // Continuous hardware-anchored timeline
+    uint32_t last_hw_ts = 0;
     float    acc_v = 0.0f;
     float    acc_i = 0.0f;
     int      acc_count = 0;
     bool     initialized = false;
 } resamp;
 
-// ── PATH B state – cycle boundary ────────────────────────────────────────────
+// ── PATH B state ─────────────────────────────────────────────────────────────
 uint32_t last_cycle_boundary_samples = 0;
-
-// ── DC offsets ───────────────────────────────────────────────────────────────
 float v_dc_offset = 1650.0f;
 float i_dc_offset = 1650.0f;
 
-// ── Phase unwrap ─────────────────────────────────────────────────────────────
 struct PhaseTrack {
     float prev_phase   = 0.0f;
     float phase_offset = 0.0f;
     bool  initialized  = false;
 } phase_track;
-
-// ── Diagnostics ──────────────────────────────────────────────────────────────
-uint32_t interp_ok_count   = 0;
-uint32_t interp_fail_count = 0;
 
 // ── FreeRTOS objects ────────────────────────────────────────────────────────
 TaskHandle_t visTaskHandle = NULL;
@@ -225,21 +218,16 @@ void logTask(void *pv) {
     for (;;) {
         if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
             Serial.printf(
-                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f\n",
-                msg.pll_freq,
-                msg.core_us,
-                (unsigned long)msg.isr_callback_count,
-                (unsigned long)msg.frames_dropped,
-                (unsigned long)msg.interp_ok,
-                (unsigned long)msg.interp_total,
-                msg.vdc, msg.idc
+                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Vdc:%.1f Idc:%.1f\n",
+                msg.pll_freq, msg.core_us, (unsigned long)msg.isr_callback_count,
+                (unsigned long)msg.frames_dropped, msg.vdc, msg.idc
             );
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Hardware-Anchored Decimating Resampler
+//  Continuous Hardware-Anchored Resampler (PATH A)
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR processIncomingDMA() {
@@ -248,7 +236,6 @@ void IRAM_ATTR processIncomingDMA() {
 
     if (rd == wr) return;
 
-    // Deterministic hardware cadence
     const uint32_t cycles_per_pair = cycles_per_adc_sample;
 
     while (rd != wr) {
@@ -258,32 +245,24 @@ void IRAM_ATTR processIncomingDMA() {
 
         const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f_ptr->raw_data;
         int n = sz / sizeof(adc_digi_output_data_t);
-        if (n <= 0) {
-            rd = (rd + 1) % FRAME_BUFFER_SIZE;
-            continue;
-        }
+        if (n <= 0) { rd = (rd + 1) % FRAME_BUFFER_SIZE; continue; }
 
         int total_pairs = n / 2;
 
         if (!resamp.initialized) {
-            // INITIALIZATION: Anchor to hardware timeline.
-            uint32_t frame_start_ts = isr_end_ts - (total_pairs * cycles_per_pair);
-            resamp.last_hw_ts = frame_start_ts;
+            // Anchor timeline to hardware
+            resamp.last_hw_ts = isr_end_ts - (total_pairs * cycles_per_pair);
             resamp.initialized = true;
-            if (next_sample_time == 0) next_sample_time = frame_start_ts + cycles_per_pair;
+            if (next_sample_time == 0) next_sample_time = isr_end_ts;
         }
 
-        // --- HARDWARE-ANCHORED TIMESTAMP RECONSTRUCTION ---
-        // Use deterministic hardware timeline. Jittery ISR timestamp is used only for long-term drift correction.
+        // Timeline drift correction (very slow low-pass)
         uint32_t projected_end = resamp.last_hw_ts + (total_pairs * cycles_per_pair);
-        int32_t  drift = signed_time_diff(isr_end_ts, projected_end);
-
+        int32_t drift = signed_time_diff(isr_end_ts, projected_end);
         if (abs(drift) > (int)(cycles_per_pair * total_pairs * 4)) {
-            // Massive drift/drop: reset timeline anchor
             resamp.last_hw_ts = isr_end_ts - (total_pairs * cycles_per_pair);
         } else {
-            // Small nudge to correct clock skew (1 part in 128)
-            resamp.last_hw_ts += (drift >> 7);
+            resamp.last_hw_ts += (drift >> 8); // Nudge
         }
 
         for (int pair = 0; pair < total_pairs; ++pair) {
@@ -296,36 +275,21 @@ void IRAM_ATTR processIncomingDMA() {
                 else if (p[i+1].type1.channel == I_CHANNEL) ri = p[i+1].type1.data;
             }
 
-            float fv = adcRawToMillivolts(rv);
-            float fi = adcRawToMillivolts(ri);
-
-            // Deterministic timeline advance
-            uint32_t ts = resamp.last_hw_ts + cycles_per_pair;
-
-            resamp.acc_v += fv;
-            resamp.acc_i += fi;
+            resamp.acc_v += adcRawToMillivolts(rv);
+            resamp.acc_i += adcRawToMillivolts(ri);
             resamp.acc_count++;
+
+            uint32_t ts = resamp.last_hw_ts + cycles_per_pair;
 
             while ( signed_time_diff(ts, next_sample_time) >= 0 ) {
                 if (resamp.acc_count > 0) {
-                    float inv_count = 1.0f / (float)resamp.acc_count;
-                    float v_val = resamp.acc_v * inv_count;
-                    float i_val = resamp.acc_i * inv_count;
-
-                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_val;
-                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
-
-                    // Continuous SOGI Advancement
-                    float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
-                    sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
+                    float inv = 1.0f / (float)resamp.acc_count;
+                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = resamp.acc_v * inv;
+                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = resamp.acc_i * inv;
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
-                    interp_ok_count++;
-
-                    resamp.acc_v = 0.0f;
-                    resamp.acc_i = 0.0f;
-                    resamp.acc_count = 0;
+                    resamp.acc_v = 0; resamp.acc_i = 0; resamp.acc_count = 0;
                 } else {
                     next_sample_time += ticks_per_sample;
                 }
@@ -375,99 +339,75 @@ void IRAM_ATTR loop() {
 
     processIncomingDMA();
 
-    // Trigger Path B based on virtual sample count
+    // Trigger Path B every cycle
     if (buf_wr - last_cycle_boundary_samples < SAMPLES_PER_CYCLE) return;
 
     uint32_t now = get_cycle_count();
     uint32_t last_virtual_ts = next_sample_time - ticks_per_sample;
-    int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
-    float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
+    float lag_sec = (float)signed_time_diff(now, last_virtual_ts) * inv_cpu_freq;
 
-    // DC estimation (low pass filter)
-    float v_sum = 0.0f, i_sum = 0.0f;
-    for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
-        v_sum += v_buf[k];
-        i_sum += i_buf[k];
-    }
-    float inv_n = 1.0f / SAMPLES_PER_CYCLE;
-    v_dc_offset = 0.98f * v_dc_offset + 0.02f * (v_sum * inv_n);
-    i_dc_offset = 0.98f * i_dc_offset + 0.02f * (i_sum * inv_n);
-
+    // Batch SOGI processing for stability
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
+    int start_idx = (int)(buf_wr % SAMPLES_PER_CYCLE); // current write head
+
     uint32_t proc_start = get_cycle_count();
 
-    // PLL UPDATE: using continuous SOGI state
+    // Estimate DC offset from this cycle
+    float v_sum = 0, i_sum = 0;
+    for(int k=0; k<SAMPLES_PER_CYCLE; k++) { v_sum += v_buf[k]; i_sum += i_buf[k]; }
+    v_dc_offset = 0.95f * v_dc_offset + 0.05f * (v_sum / SAMPLES_PER_CYCLE);
+    i_dc_offset = 0.95f * i_dc_offset + 0.05f * (i_sum / SAMPLES_PER_CYCLE);
+
+    // Process exactly one cycle ending at data head
+    sogi_v.processWindow(v_buf, SAMPLES_PER_CYCLE, start_idx, SAMPLES_PER_CYCLE,
+                         pll.omega, ts_virtual, v_dc_offset);
+
+    // Update PLL
     pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
 
-    // Accurate phase projection to present moment
+    // Lag compensation for visualization ONLY
     float phase_corr = pll.omega * lag_sec;
     float phase = atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr;
-    if (phase < 0.0f) phase += 2.0f * (float)PI;
-    else if (phase > 2.0f * (float)PI) phase -= 2.0f * (float)PI;
+    if (phase < 0) phase += 2*PI; else if (phase > 2*PI) phase -= 2*PI;
 
     if (phase_track.initialized) {
         float delta = phase - phase_track.prev_phase;
-        if      (delta < -(float)PI) phase_track.phase_offset += 2.0f * (float)PI;
-        else if (delta >  (float)PI) phase_track.phase_offset -= 2.0f * (float)PI;
-    } else {
-        phase_track.initialized = true;
-    }
+        if (delta < -PI) phase_track.phase_offset += 2*PI;
+        else if (delta > PI) phase_track.phase_offset -= 2*PI;
+    } else { phase_track.initialized = true; }
     phase_track.prev_phase = phase;
 
-    float unwrapped  = phase + phase_track.phase_offset;
-    float phase_norm = fmodf(unwrapped, 2.0f * (float)PI);
-    if (phase_norm < 0.0f) phase_norm += 2.0f * (float)PI;
+    float unwrapped = phase + phase_track.phase_offset;
+    float phase_norm = fmodf(unwrapped, 2*PI);
+    if (phase_norm < 0) phase_norm += 2*PI;
 
     float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
-    float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
-    int   curr_head_idx       = (int)(buf_wr % SAMPLES_PER_CYCLE);
-    int   aligned_start       = (int)((curr_head_idx
-                                       + SAMPLES_PER_CYCLE
-                                       - (int)(samples_back + 0.5f))
-                                      % SAMPLES_PER_CYCLE);
+    float samples_back = (phase_norm / (2*PI)) * samples_per_cycle_f;
+    int aligned_start = (int)((start_idx + SAMPLES_PER_CYCLE - (int)(samples_back + 0.5f)) % SAMPLES_PER_CYCLE);
 
     last_cycle_boundary_samples = buf_wr;
     updateTimingParameters(pll.freq);
 
     uint32_t proc_end = get_cycle_count();
-    float    core_us  = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
+    float core_us = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
 
     VisSnapshot snap;
-    snap.v_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
-    snap.i_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
+    snap.v_copy = (float*)heap_caps_malloc(sizeof(float)*SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
+    snap.i_copy = (float*)heap_caps_malloc(sizeof(float)*SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
     if (snap.v_copy && snap.i_copy) {
         memcpy(snap.v_copy, v_buf, sizeof(v_buf));
         memcpy(snap.i_copy, i_buf, sizeof(i_buf));
-        snap.aligned_start = aligned_start;
-        snap.pll_freq = pll.freq;
-        snap.pll_mag  = pll.mag_smooth;
-        snap.vdc = v_dc_offset;
-        snap.idc = i_dc_offset;
-
-        if (xQueueSend(visQueue, &snap, 0) != pdTRUE) {
-            heap_caps_free(snap.v_copy);
-            heap_caps_free(snap.i_copy);
-        }
-    } else {
-        if (snap.v_copy) heap_caps_free(snap.v_copy);
-        if (snap.i_copy) heap_caps_free(snap.i_copy);
-    }
+        snap.aligned_start = aligned_start; snap.pll_freq = pll.freq;
+        snap.pll_mag = pll.mag_smooth; snap.vdc = v_dc_offset; snap.idc = i_dc_offset;
+        if (xQueueSend(visQueue, &snap, 0) != pdTRUE) { heap_caps_free(snap.v_copy); heap_caps_free(snap.i_copy); }
+    } else { if(snap.v_copy) heap_caps_free(snap.v_copy); if(snap.i_copy) heap_caps_free(snap.i_copy); }
 
     if (++serial_ctr >= SERIAL_EVERY_N_CYCLES) {
         serial_ctr = 0;
-        SerialMsg sm;
-        sm.pll_freq = pll.freq;
-        sm.core_us  = core_us;
-        sm.isr_callback_count = isr_callback_count;
-        sm.frames_dropped     = frames_dropped;
-        sm.interp_ok          = interp_ok_count;
-        sm.interp_total       = interp_ok_count + interp_fail_count;
-        sm.vdc = v_dc_offset;
-        sm.idc = i_dc_offset;
-        interp_ok_count = 0;
-        interp_fail_count = 0;
+        SerialMsg sm; sm.pll_freq = pll.freq; sm.core_us = core_us;
+        sm.isr_callback_count = isr_callback_count; sm.frames_dropped = frames_dropped;
+        sm.vdc = v_dc_offset; sm.idc = i_dc_offset;
         xQueueSend(logQueue, &sm, 0);
     }
-
     yield();
 }

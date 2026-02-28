@@ -72,7 +72,7 @@ uint32_t buf_wr = 0;
 uint32_t next_sample_time = 0;
 
 struct ResamplerState {
-    uint32_t last_ts = 0;
+    uint32_t last_frame_end_ts = 0;
     float    acc_v = 0.0f;
     float    acc_i = 0.0f;
     int      acc_count = 0;
@@ -250,20 +250,21 @@ void IRAM_ATTR processIncomingDMA() {
 
     while (rd != wr) {
         volatile TimestampedFrame *f_ptr = &frame_buffer[rd];
-        uint32_t fe = f_ptr->end_timestamp;
+        uint32_t frame_end_ts = f_ptr->end_timestamp;
         uint16_t sz = f_ptr->data_size;
 
         const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f_ptr->raw_data;
         int n = sz / sizeof(adc_digi_output_data_t);
-
         if (n <= 0) {
             rd = (rd + 1) % FRAME_BUFFER_SIZE;
             continue;
         }
 
         int total_pairs = n / 2;
-        uint32_t elapsed = (uint32_t)(fe - resamp.last_ts);
+        // Accurate elapsed time for the entire frame
+        uint32_t elapsed = (uint32_t)(frame_end_ts - resamp.last_frame_end_ts);
         float local_cycles_per_pair = (total_pairs > 0) ? (float)elapsed / (float)total_pairs : 0.0f;
+        uint32_t frame_start_ts = resamp.last_frame_end_ts;
 
         for (int pair = 0; pair < total_pairs; ++pair) {
             int i = pair * 2;
@@ -278,12 +279,13 @@ void IRAM_ATTR processIncomingDMA() {
             float fv = adcRawToMillivolts(rv);
             float fi = adcRawToMillivolts(ri);
 
-            uint32_t ts = (uint32_t)(resamp.last_ts + (uint32_t)((float)(pair + 1) * local_cycles_per_pair));
+            // Linear timestamp within frame based on frame_start_ts
+            uint32_t ts = (uint32_t)(frame_start_ts + (uint32_t)((float)(pair + 1) * local_cycles_per_pair));
 
             if (!resamp.initialized) {
-                resamp.last_ts = fe;
+                resamp.last_frame_end_ts = frame_end_ts;
                 resamp.initialized = true;
-                if (next_sample_time == 0) next_sample_time = fe;
+                if (next_sample_time == 0) next_sample_time = frame_end_ts;
                 continue;
             }
 
@@ -292,38 +294,34 @@ void IRAM_ATTR processIncomingDMA() {
             resamp.acc_count++;
 
             while ( signed_time_diff(ts, next_sample_time) >= 0 ) {
-                float v_val = v_dc_offset, i_val = i_dc_offset;
                 if (resamp.acc_count > 0) {
                     float inv_count = 1.0f / (float)resamp.acc_count;
-                    v_val = resamp.acc_v * inv_count;
-                    i_val = resamp.acc_i * inv_count;
+                    float v_val = resamp.acc_v * inv_count;
+                    float i_val = resamp.acc_i * inv_count;
+
+                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_val;
+                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
+
+                    // --- CONTINUOUS SOGI ADVANCEMENT ---
+                    // Process SOGI for every virtual sample. NEVER reset state.
+                    float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
+                    sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
+                    // ------------------------------------
+
+                    buf_wr++;
+                    next_sample_time += ticks_per_sample;
+                    interp_ok_count++;
+
+                    resamp.acc_v = 0.0f;
+                    resamp.acc_i = 0.0f;
+                    resamp.acc_count = 0;
                 } else {
-                    int prev_idx = (buf_wr + SAMPLES_PER_CYCLE - 1) % SAMPLES_PER_CYCLE;
-                    v_val = v_buf[prev_idx];
-                    i_val = i_buf[prev_idx];
+                    // This case should be rare with ADC_OVERSAMPLE_RATE >> SAMPLES_PER_CYCLE
+                    next_sample_time += ticks_per_sample;
                 }
-
-                v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_val;
-                i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
-
-                // --- CONTINUOUS SOGI ADVANCEMENT ---
-                // Process SOGI immediately for every virtual sample produced.
-                // This keeps the SOGI state synchronized with the latest data head.
-                float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
-                sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-                // ------------------------------------
-
-                buf_wr++;
-                next_sample_time += ticks_per_sample;
-                interp_ok_count++;
-
-                resamp.acc_v = 0.0f;
-                resamp.acc_i = 0.0f;
-                resamp.acc_count = 0;
             }
-            resamp.last_ts = ts;
         }
-        resamp.last_ts = fe;
+        resamp.last_frame_end_ts = frame_end_ts;
 
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
         __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
@@ -367,34 +365,29 @@ void IRAM_ATTR loop() {
 
     processIncomingDMA();
 
-    // PATH B – Decoupled Control/Vis Trigger
-    // Trigger based on virtual sample count instead of CPU clock
+    // Trigger based on virtual sample count
     if (buf_wr - last_cycle_boundary_samples < SAMPLES_PER_CYCLE) return;
 
-    last_cycle_boundary_samples += SAMPLES_PER_CYCLE;
-
-    // Use current time to calculate lag to the MOST RECENT virtual sample
     uint32_t now = get_cycle_count();
     uint32_t last_virtual_ts = next_sample_time - ticks_per_sample;
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
-    // DC estimation (low pass filter)
+    // DC estimation (using samples currently in buffer)
     float v_sum = 0.0f, i_sum = 0.0f;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
         i_sum += i_buf[k];
     }
     float inv_n = 1.0f / SAMPLES_PER_CYCLE;
-    v_dc_offset = 0.95f * v_dc_offset + 0.05f * (v_sum * inv_n);
-    i_dc_offset = 0.95f * i_dc_offset + 0.05f * (i_sum * inv_n);
+    v_dc_offset = 0.98f * v_dc_offset + 0.02f * (v_sum * inv_n);
+    i_dc_offset = 0.98f * i_dc_offset + 0.02f * (i_sum * inv_n);
 
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
     // --- PLL UPDATE ---
-    // The sogi_v state is already at the latest data head thanks to Path A.
-    // We update the PLL using this instantaneous state.
+    // Use the continuous SOGI state advanced in Path A.
     pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
     // ------------------
 
@@ -419,12 +412,13 @@ void IRAM_ATTR loop() {
 
     float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
     float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
-    int   start_idx           = (int)(buf_wr % SAMPLES_PER_CYCLE);
-    int   aligned_start       = (int)((start_idx
+    int   curr_head_idx       = (int)(buf_wr % SAMPLES_PER_CYCLE);
+    int   aligned_start       = (int)((curr_head_idx
                                        + SAMPLES_PER_CYCLE
                                        - (int)(samples_back + 0.5f))
                                       % SAMPLES_PER_CYCLE);
 
+    last_cycle_boundary_samples = buf_wr;
     updateTimingParameters(pll.freq);
 
     uint32_t proc_end = get_cycle_count();

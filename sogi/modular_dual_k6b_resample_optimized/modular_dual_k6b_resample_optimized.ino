@@ -27,7 +27,7 @@
 
 // ── ADC / DMA ───────────────────────────────────────────────────────────────
 #define ADC_OVERSAMPLE_RATE   200000  // total samples/s across both channels
-#define CONV_FRAME_SIZE       16      // bytes per DMA interrupt frame (approx 4 samples V+I)
+#define CONV_FRAME_SIZE       32      // bytes per DMA interrupt frame (approx 8 samples V+I)
 
 // ── Frame ring ────────────────────────────────────────────────────────────
 #define FRAME_BUFFER_SIZE     256     // Reduced size, we process as they arrive
@@ -257,36 +257,43 @@ void logTask(void *pv) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR processIncomingDMA() {
-    // Acquire atomic snapshot of indices
     uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE);
     uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_ACQUIRE);
 
     if (rd == wr) return;
 
     while (rd != wr) {
-        // local reference to frame (we copy fields before progressing)
-        TimestampedFrame f;
-        // copy the frame atomically: small struct -> safe to copy
-        // Note: we copy data out of the shared buffer index since ISR will not touch 'rd' once write_idx moved past it.
-        uint32_t idx = rd;
-        // Copy raw frame to local stack struct (small)
-        memcpy(&f, (const void*)&frame_buffer[idx], sizeof(TimestampedFrame));
+        // Use a pointer to the frame in the ring buffer to avoid large stack copies
+        volatile TimestampedFrame *f_ptr = &frame_buffer[rd];
+        uint32_t fe = f_ptr->end_timestamp;
+        uint16_t sz = f_ptr->data_size;
 
-        uint32_t fe = f.end_timestamp;
+        const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f_ptr->raw_data;
+        int n = sz / sizeof(adc_digi_output_data_t);
 
-        const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f.raw_data;
-        int n = f.data_size / sizeof(adc_digi_output_data_t);
-        if (n <= 0) { // nothing sensible
+        if (n <= 0) {
             rd = (rd + 1) % FRAME_BUFFER_SIZE;
             continue;
         }
 
         // We'll process samples in pairs (V, I)
         int total_pairs = n / 2;
+        if (total_pairs <= 0) {
+             rd = (rd + 1) % FRAME_BUFFER_SIZE;
+             continue;
+        }
+
+        // IMPROVED: Calculate local intra-frame cycle spacing based on ACTUAL elapsed time
+        // between this frame end and the previous frame end. This eliminates the "sawtooth"
+        // jitter caused by slight clock drift or interrupt latency variations.
+        uint32_t elapsed = (uint32_t)(fe - resamp.last_ts);
+        float local_cycles_per_pair = (float)elapsed / (float)total_pairs;
+
         for (int pair = 0; pair < total_pairs; ++pair) {
             int i = pair * 2;
             uint16_t rv = 0, ri = 0;
-            // robust parsing: test both entries
+
+            // Robust parsing of V and I from potentially imperfect DMA stream
             if (p[i].type1.channel == V_CHANNEL) rv = p[i].type1.data;
             else if (p[i].type1.channel == I_CHANNEL) ri = p[i].type1.data;
 
@@ -298,38 +305,25 @@ void IRAM_ATTR processIncomingDMA() {
             float fv = adcRawToMillivolts(rv);
             float fi = adcRawToMillivolts(ri);
 
-            // compute timestamp for this pair robustly: use 64-bit for multiply
-            uint64_t offset64 = (uint64_t)(total_pairs - 1 - pair) * (uint64_t)cycles_per_adc_sample;
-            uint32_t ts = (uint32_t)(fe - (uint32_t)offset64);
+            // Compute precise timestamp for this pair using the local spacing
+            uint32_t ts = (uint32_t)(resamp.last_ts + (uint32_t)((float)(pair + 1) * local_cycles_per_pair));
 
             if (!resamp.initialized) {
-                resamp.last_ts = ts;
+                resamp.last_ts = fe;
                 resamp.last_v = fv;
                 resamp.last_i = fi;
                 resamp.initialized = true;
-                if (next_sample_time == 0) next_sample_time = ts;
+                if (next_sample_time == 0) next_sample_time = fe;
                 continue;
             }
 
-            // Fill virtual samples between resamp.last_ts and ts
-            // loop while next_sample_time is <= ts (robust with wrap using signed_time_diff)
+            // Fill virtual samples between resamp.last_ts and current ts
             while ( signed_time_diff(ts, next_sample_time) >= 0 ) {
-                uint32_t dt_u = (uint32_t)(ts - resamp.last_ts); // unsigned delta (mod 2^32)
-                float dt = (float)dt_u;
-                float alpha;
-                if (dt > 0.0f) {
-                    uint32_t delta_to_next = (uint32_t)(next_sample_time - resamp.last_ts);
-                    alpha = (float)delta_to_next / dt;
-                    if (!(alpha >= 0.0f && alpha <= 1.0f)) {
-                        // alpha out of expected range => numerical oddity, skip and mark fail
-                        interp_fail_count++;
-                        break;
-                    }
-                } else {
-                    // two timestamps identical (rare) — fallback
-                    alpha = 1.0f;
-                    interp_fail_count++;
-                }
+                uint32_t dt_u = (uint32_t)(ts - resamp.last_ts);
+                float alpha = (dt_u > 0) ? (float)(next_sample_time - resamp.last_ts) / (float)dt_u : 1.0f;
+
+                if (alpha < 0.0f) alpha = 0.0f;
+                if (alpha > 1.0f) alpha = 1.0f;
 
                 float v_interp = resamp.last_v + alpha * (fv - resamp.last_v);
                 float i_interp = resamp.last_i + alpha * (fi - resamp.last_i);
@@ -346,11 +340,12 @@ void IRAM_ATTR processIncomingDMA() {
             resamp.last_i = fi;
         }
 
-        rd = (rd + 1) % FRAME_BUFFER_SIZE;
-    }
+        // Ensure resamp.last_ts is exactly fe at the end of the frame to prevent accumulation errors
+        resamp.last_ts = fe;
 
-    // publish the read index atomically
-    __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
+        rd = (rd + 1) % FRAME_BUFFER_SIZE;
+        __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,7 +356,6 @@ void setup() {
     delay(100);
     cpu_freq_hz  = (uint32_t)ESP.getCpuFreqMHz() * 1000000U;
     inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
-    // cycles per ADC sample (per channel), note ADC_OVERSAMPLE_RATE counts both channels
     cycles_per_adc_sample = cpu_freq_hz / (ADC_OVERSAMPLE_RATE / 2);
 
     updateTimingParameters(NOMINAL_FREQ);
@@ -453,7 +447,6 @@ void IRAM_ATTR loop() {
     snap.v_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
     snap.i_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
     if (snap.v_copy && snap.i_copy) {
-        // Simple copy, Path A won't write to these indices for a while
         memcpy(snap.v_copy, v_buf, sizeof(v_buf));
         memcpy(snap.i_copy, i_buf, sizeof(i_buf));
 

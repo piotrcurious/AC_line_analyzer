@@ -1,4 +1,4 @@
-/* ESP32 SOGI-PLL – Optimized streaming resampler with continuous SOGI state advancement
+/* ESP32 SOGI-PLL – Hardware-Anchored streaming resampler with decimation and lag compensation
  */
 
 #include <Arduino.h>
@@ -72,7 +72,7 @@ uint32_t buf_wr = 0;
 uint32_t next_sample_time = 0;
 
 struct ResamplerState {
-    uint32_t last_frame_end_ts = 0;
+    uint32_t last_hw_ts = 0;      // Continuous hardware-anchored timeline
     float    acc_v = 0.0f;
     float    acc_i = 0.0f;
     int      acc_count = 0;
@@ -239,7 +239,7 @@ void logTask(void *pv) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Decimating Resampler + Continuous SOGI Advancement
+//  Hardware-Anchored Decimating Resampler
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR processIncomingDMA() {
@@ -248,9 +248,12 @@ void IRAM_ATTR processIncomingDMA() {
 
     if (rd == wr) return;
 
+    // Deterministic hardware cadence
+    const uint32_t cycles_per_pair = cycles_per_adc_sample;
+
     while (rd != wr) {
         volatile TimestampedFrame *f_ptr = &frame_buffer[rd];
-        uint32_t frame_end_ts = f_ptr->end_timestamp;
+        uint32_t isr_end_ts = f_ptr->end_timestamp;
         uint16_t sz = f_ptr->data_size;
 
         const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f_ptr->raw_data;
@@ -261,10 +264,27 @@ void IRAM_ATTR processIncomingDMA() {
         }
 
         int total_pairs = n / 2;
-        // Accurate elapsed time for the entire frame
-        uint32_t elapsed = (uint32_t)(frame_end_ts - resamp.last_frame_end_ts);
-        float local_cycles_per_pair = (total_pairs > 0) ? (float)elapsed / (float)total_pairs : 0.0f;
-        uint32_t frame_start_ts = resamp.last_frame_end_ts;
+
+        if (!resamp.initialized) {
+            // INITIALIZATION: Anchor to hardware timeline.
+            uint32_t frame_start_ts = isr_end_ts - (total_pairs * cycles_per_pair);
+            resamp.last_hw_ts = frame_start_ts;
+            resamp.initialized = true;
+            if (next_sample_time == 0) next_sample_time = frame_start_ts + cycles_per_pair;
+        }
+
+        // --- HARDWARE-ANCHORED TIMESTAMP RECONSTRUCTION ---
+        // Use deterministic hardware timeline. Jittery ISR timestamp is used only for long-term drift correction.
+        uint32_t projected_end = resamp.last_hw_ts + (total_pairs * cycles_per_pair);
+        int32_t  drift = signed_time_diff(isr_end_ts, projected_end);
+
+        if (abs(drift) > (int)(cycles_per_pair * total_pairs * 4)) {
+            // Massive drift/drop: reset timeline anchor
+            resamp.last_hw_ts = isr_end_ts - (total_pairs * cycles_per_pair);
+        } else {
+            // Small nudge to correct clock skew (1 part in 128)
+            resamp.last_hw_ts += (drift >> 7);
+        }
 
         for (int pair = 0; pair < total_pairs; ++pair) {
             int i = pair * 2;
@@ -279,15 +299,8 @@ void IRAM_ATTR processIncomingDMA() {
             float fv = adcRawToMillivolts(rv);
             float fi = adcRawToMillivolts(ri);
 
-            // Linear timestamp within frame based on frame_start_ts
-            uint32_t ts = (uint32_t)(frame_start_ts + (uint32_t)((float)(pair + 1) * local_cycles_per_pair));
-
-            if (!resamp.initialized) {
-                resamp.last_frame_end_ts = frame_end_ts;
-                resamp.initialized = true;
-                if (next_sample_time == 0) next_sample_time = frame_end_ts;
-                continue;
-            }
+            // Deterministic timeline advance
+            uint32_t ts = resamp.last_hw_ts + cycles_per_pair;
 
             resamp.acc_v += fv;
             resamp.acc_i += fi;
@@ -302,11 +315,9 @@ void IRAM_ATTR processIncomingDMA() {
                     v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_val;
                     i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
 
-                    // --- CONTINUOUS SOGI ADVANCEMENT ---
-                    // Process SOGI for every virtual sample. NEVER reset state.
+                    // Continuous SOGI Advancement
                     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
                     sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-                    // ------------------------------------
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
@@ -316,12 +327,11 @@ void IRAM_ATTR processIncomingDMA() {
                     resamp.acc_i = 0.0f;
                     resamp.acc_count = 0;
                 } else {
-                    // This case should be rare with ADC_OVERSAMPLE_RATE >> SAMPLES_PER_CYCLE
                     next_sample_time += ticks_per_sample;
                 }
             }
+            resamp.last_hw_ts = ts;
         }
-        resamp.last_frame_end_ts = frame_end_ts;
 
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
         __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
@@ -365,7 +375,7 @@ void IRAM_ATTR loop() {
 
     processIncomingDMA();
 
-    // Trigger based on virtual sample count
+    // Trigger Path B based on virtual sample count
     if (buf_wr - last_cycle_boundary_samples < SAMPLES_PER_CYCLE) return;
 
     uint32_t now = get_cycle_count();
@@ -373,7 +383,7 @@ void IRAM_ATTR loop() {
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
-    // DC estimation (using samples currently in buffer)
+    // DC estimation (low pass filter)
     float v_sum = 0.0f, i_sum = 0.0f;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
@@ -386,10 +396,8 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    // --- PLL UPDATE ---
-    // Use the continuous SOGI state advanced in Path A.
+    // PLL UPDATE: using continuous SOGI state
     pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
-    // ------------------
 
     // Accurate phase projection to present moment
     float phase_corr = pll.omega * lag_sec;

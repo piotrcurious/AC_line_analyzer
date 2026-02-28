@@ -1,4 +1,4 @@
-/* ESP32 SOGI-PLL – Optimized streaming resampler with isolated visualizer + logger tasks
+/* ESP32 SOGI-PLL – High-performance streaming resampler with decimation and latency compensation
  */
 
 #include <Arduino.h>
@@ -27,10 +27,10 @@
 
 // ── ADC / DMA ───────────────────────────────────────────────────────────────
 #define ADC_OVERSAMPLE_RATE   200000  // total samples/s across both channels
-#define CONV_FRAME_SIZE       32      // bytes per DMA interrupt frame (approx 8 samples V+I)
+#define CONV_FRAME_SIZE       128     // Large DMA frame size
 
 // ── Frame ring ────────────────────────────────────────────────────────────
-#define FRAME_BUFFER_SIZE     256     // Reduced size, we process as they arrive
+#define FRAME_BUFFER_SIZE     128
 
 // ── Diagnostics throttle ─────────────────────────────────────────────────────
 #define SERIAL_EVERY_N_CYCLES   50
@@ -58,24 +58,24 @@ adc_continuous_handle_t adc_handle = NULL;
 // ── CPU timing ───────────────────────────────────────────────────────────────
 uint32_t cpu_freq_hz           = 0;
 float    inv_cpu_freq          = 0.0f;
-uint32_t cycles_per_adc_sample = 0;   // CPU ticks between successive DMA samples (per channel)
-uint32_t single_cycle_cycles   = 0;   // CPU ticks per AC cycle at pll.freq
-uint32_t ticks_per_sample      = 0;   // single_cycle_cycles / SAMPLES_PER_CYCLE
+uint32_t cycles_per_adc_sample = 0;
+uint32_t single_cycle_cycles   = 0;
+uint32_t ticks_per_sample      = 0;
 
 // ── Precomputed constant ─────────────────────────────────────────────────────
 static const float RAW_TO_MV = 3300.0f / 4095.0f;
 
-// ── PATH A state – streaming resampler ──────────────────────────────────────
+// ── PATH A state – Decimating Resampler ─────────────────────────────────────
 float    v_buf[SAMPLES_PER_CYCLE];
 float    i_buf[SAMPLES_PER_CYCLE];
 uint32_t buf_wr = 0;
 uint32_t next_sample_time = 0;
 
-// Streaming resampler state
 struct ResamplerState {
     uint32_t last_ts = 0;
-    float    last_v = 1650.0f;
-    float    last_i = 1650.0f;
+    float    acc_v = 0.0f;
+    float    acc_i = 0.0f;
+    int      acc_count = 0;
     bool     initialized = false;
 } resamp;
 
@@ -97,11 +97,11 @@ struct PhaseTrack {
 uint32_t interp_ok_count   = 0;
 uint32_t interp_fail_count = 0;
 
-// ── FreeRTOS objects for vis + logging ───────────────────────────────────────
+// ── FreeRTOS objects ────────────────────────────────────────────────────────
 TaskHandle_t visTaskHandle = NULL;
 TaskHandle_t logTaskHandle = NULL;
-QueueHandle_t visQueue = NULL;     // holds VisSnapshot
-QueueHandle_t logQueue = NULL;     // holds SerialMsg
+QueueHandle_t visQueue = NULL;
+QueueHandle_t logQueue = NULL;
 
 struct VisSnapshot {
     float *v_copy;
@@ -133,18 +133,14 @@ static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw) {
 }
 
 static inline void IRAM_ATTR updateTimingParameters(float frequency) {
-    // clamp frequency to stable range before computing integer cycle counts
     float fc            = (frequency < 40.0f) ? 40.0f : (frequency > 90.0f ? 90.0f : frequency);
     single_cycle_cycles = (uint32_t)lrintf((float)cpu_freq_hz / fc);
     uint32_t ticks = (single_cycle_cycles / SAMPLES_PER_CYCLE);
-    if (ticks == 0) ticks = 1; // defensive: ensure at least 1 tick per virtual sample
+    if (ticks == 0) ticks = 1;
     ticks_per_sample = ticks;
 }
 
-// Small helper to compute signed difference robustly (handles modulo-32 wrap fine for small deltas)
 static inline int32_t IRAM_ATTR signed_time_diff(uint32_t a, uint32_t b) {
-    // (a - b) computed as unsigned modulo 2^32, then reinterpreted as signed.
-    // useful when differences are small (< 2^31) which is our case.
     return (int32_t)(a - b);
 }
 
@@ -154,35 +150,25 @@ static inline int32_t IRAM_ATTR signed_time_diff(uint32_t a, uint32_t b) {
 static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
                                               const adc_continuous_evt_data_t *edata,
                                               void *user_data) {
-    uint32_t ts      = get_cycle_count();
-
-    // Load the current read index atomically
+    uint32_t ts = get_cycle_count();
     uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE);
-    uint32_t next_wr = ( __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED) + 1 ) % FRAME_BUFFER_SIZE;
+    uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED);
+    uint32_t next_wr = (wr + 1) % FRAME_BUFFER_SIZE;
 
-    // If advancing will collide with read pointer, drop oldest frame by advancing read pointer
     if (next_wr == rd) {
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
         __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
         ++frames_dropped;
     }
 
-    // copy up to buffer size
     uint32_t sz = edata->size;
     if (sz > CONV_FRAME_SIZE) sz = CONV_FRAME_SIZE;
+    memcpy((void *)frame_buffer[wr].raw_data, edata->conv_frame_buffer, sz);
 
-    // Copy raw data into buffer slot (CONV_FRAME_SIZE is small — kept in ISR for simplicity)
-    memcpy((void *)frame_buffer[ __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED) ].raw_data,
-           edata->conv_frame_buffer, sz);
+    frame_buffer[wr].end_timestamp = ts;
+    frame_buffer[wr].data_size     = (uint16_t)sz;
 
-    // publish metadata, then bump write index atomically
-    uint32_t wr_idx = __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED);
-    frame_buffer[wr_idx].end_timestamp = ts;
-    frame_buffer[wr_idx].data_size     = (uint16_t)sz;
-
-    uint32_t next_wr_actual = (wr_idx + 1) % FRAME_BUFFER_SIZE;
-    __atomic_store_n(&frame_write_idx, next_wr_actual, __ATOMIC_RELEASE);
-
+    __atomic_store_n(&frame_write_idx, next_wr, __ATOMIC_RELEASE);
     ++isr_callback_count;
     return false;
 }
@@ -253,7 +239,7 @@ void logTask(void *pv) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Streaming Resampling Logic
+//  Decimating Resampler
 // ─────────────────────────────────────────────────────────────────────────────
 
 void IRAM_ATTR processIncomingDMA() {
@@ -263,7 +249,6 @@ void IRAM_ATTR processIncomingDMA() {
     if (rd == wr) return;
 
     while (rd != wr) {
-        // Use a pointer to the frame in the ring buffer to avoid large stack copies
         volatile TimestampedFrame *f_ptr = &frame_buffer[rd];
         uint32_t fe = f_ptr->end_timestamp;
         uint16_t sz = f_ptr->data_size;
@@ -276,27 +261,20 @@ void IRAM_ATTR processIncomingDMA() {
             continue;
         }
 
-        // We'll process samples in pairs (V, I)
         int total_pairs = n / 2;
         if (total_pairs <= 0) {
              rd = (rd + 1) % FRAME_BUFFER_SIZE;
              continue;
         }
 
-        // IMPROVED: Calculate local intra-frame cycle spacing based on ACTUAL elapsed time
-        // between this frame end and the previous frame end. This eliminates the "sawtooth"
-        // jitter caused by slight clock drift or interrupt latency variations.
         uint32_t elapsed = (uint32_t)(fe - resamp.last_ts);
         float local_cycles_per_pair = (float)elapsed / (float)total_pairs;
 
         for (int pair = 0; pair < total_pairs; ++pair) {
             int i = pair * 2;
             uint16_t rv = 0, ri = 0;
-
-            // Robust parsing of V and I from potentially imperfect DMA stream
             if (p[i].type1.channel == V_CHANNEL) rv = p[i].type1.data;
             else if (p[i].type1.channel == I_CHANNEL) ri = p[i].type1.data;
-
             if (i+1 < n) {
                 if (p[i+1].type1.channel == V_CHANNEL) rv = p[i+1].type1.data;
                 else if (p[i+1].type1.channel == I_CHANNEL) ri = p[i+1].type1.data;
@@ -305,42 +283,45 @@ void IRAM_ATTR processIncomingDMA() {
             float fv = adcRawToMillivolts(rv);
             float fi = adcRawToMillivolts(ri);
 
-            // Compute precise timestamp for this pair using the local spacing
             uint32_t ts = (uint32_t)(resamp.last_ts + (uint32_t)((float)(pair + 1) * local_cycles_per_pair));
 
             if (!resamp.initialized) {
                 resamp.last_ts = fe;
-                resamp.last_v = fv;
-                resamp.last_i = fi;
                 resamp.initialized = true;
                 if (next_sample_time == 0) next_sample_time = fe;
                 continue;
             }
 
-            // Fill virtual samples between resamp.last_ts and current ts
+            // Accumulate for decimation
+            resamp.acc_v += fv;
+            resamp.acc_i += fi;
+            resamp.acc_count++;
+
+            // If we've crossed the boundary for a new virtual sample
             while ( signed_time_diff(ts, next_sample_time) >= 0 ) {
-                uint32_t dt_u = (uint32_t)(ts - resamp.last_ts);
-                float alpha = (dt_u > 0) ? (float)(next_sample_time - resamp.last_ts) / (float)dt_u : 1.0f;
+                if (resamp.acc_count > 0) {
+                    float inv_count = 1.0f / (float)resamp.acc_count;
+                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = resamp.acc_v * inv_count;
+                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = resamp.acc_i * inv_count;
+                } else {
+                    // Fallback to previous sample if no new data points
+                    int prev_idx = (buf_wr + SAMPLES_PER_CYCLE - 1) % SAMPLES_PER_CYCLE;
+                    v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_buf[prev_idx];
+                    i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_buf[prev_idx];
+                }
 
-                if (alpha < 0.0f) alpha = 0.0f;
-                if (alpha > 1.0f) alpha = 1.0f;
-
-                float v_interp = resamp.last_v + alpha * (fv - resamp.last_v);
-                float i_interp = resamp.last_i + alpha * (fi - resamp.last_i);
-
-                v_buf[buf_wr % SAMPLES_PER_CYCLE] = v_interp;
-                i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_interp;
                 buf_wr++;
                 next_sample_time += ticks_per_sample;
                 interp_ok_count++;
+
+                // Reset accumulator for next virtual sample
+                resamp.acc_v = 0.0f;
+                resamp.acc_i = 0.0f;
+                resamp.acc_count = 0;
             }
 
             resamp.last_ts = ts;
-            resamp.last_v = fv;
-            resamp.last_i = fi;
         }
-
-        // Ensure resamp.last_ts is exactly fe at the end of the frame to prevent accumulation errors
         resamp.last_ts = fe;
 
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
@@ -383,11 +364,18 @@ void setup() {
 void IRAM_ATTR loop() {
     static uint32_t serial_ctr  = 0;
 
-    // PATH A – Streaming resampling
     processIncomingDMA();
 
     // PATH B – Cycle boundary processing
+    // Use the latest available data timestamp to compensate for DMA lag
     if ( signed_time_diff(next_sample_time, last_cycle_boundary) < (int32_t)single_cycle_cycles ) return;
+
+    // Compensate for DMA lag: next_sample_time is the time of the NEWEST virtual sample.
+    // The delay between real-time and this sample is roughly CONV_FRAME_SIZE / ADC_RATE.
+    // We projection the phase forward to compensate for this.
+    uint32_t now = get_cycle_count();
+    uint32_t dma_lag_ticks = signed_time_diff(now, resamp.last_ts);
+    float    dma_lag_sec   = (float)dma_lag_ticks * inv_cpu_freq;
 
     last_cycle_boundary += single_cycle_cycles;
     if (buf_wr < SAMPLES_PER_CYCLE) return;
@@ -402,7 +390,6 @@ void IRAM_ATTR loop() {
     v_dc_offset = 0.8f * v_dc_offset + 0.2f * (v_sum * inv_n);
     i_dc_offset = 0.8f * i_dc_offset + 0.2f * (i_sum * inv_n);
 
-    // SOGI
     float ts        = (float)ticks_per_sample * inv_cpu_freq;
     int   start_idx = (int)(buf_wr % SAMPLES_PER_CYCLE);
     uint32_t proc_start = get_cycle_count();
@@ -410,12 +397,17 @@ void IRAM_ATTR loop() {
     sogi_v.processWindow(v_buf, SAMPLES_PER_CYCLE, start_idx, SAMPLES_PER_CYCLE,
                          pll.omega, ts, v_dc_offset);
 
-    // PLL
+    // Update PLL with current data
     pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts);
 
+    // Compensation: Project phase forward by dma_lag_sec
+    // This reduces the phase jitter caused by the DMA buffer latency.
+    float phase_corr = pll.omega * dma_lag_sec;
+
     // Phase alignment for visualization
-    float phase = atan2f(sogi_v.v_alpha, -sogi_v.v_beta);
+    float phase = atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr;
     if (phase < 0.0f) phase += 2.0f * (float)PI;
+    else if (phase > 2.0f * (float)PI) phase -= 2.0f * (float)PI;
 
     if (phase_track.initialized) {
         float delta = phase - phase_track.prev_phase;
@@ -442,14 +434,12 @@ void IRAM_ATTR loop() {
     uint32_t proc_end = get_cycle_count();
     float    core_us  = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
 
-    // Queue vis snapshot
     VisSnapshot snap;
     snap.v_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
     snap.i_copy = (float*)heap_caps_malloc(sizeof(float) * SAMPLES_PER_CYCLE, MALLOC_CAP_DEFAULT);
     if (snap.v_copy && snap.i_copy) {
         memcpy(snap.v_copy, v_buf, sizeof(v_buf));
         memcpy(snap.i_copy, i_buf, sizeof(i_buf));
-
         snap.aligned_start = aligned_start;
         snap.pll_freq = pll.freq;
         snap.pll_mag  = pll.mag_smooth;

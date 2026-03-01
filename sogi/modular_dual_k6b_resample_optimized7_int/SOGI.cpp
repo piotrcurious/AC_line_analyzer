@@ -10,12 +10,11 @@
 static constexpr float TWO_PI_F = 2.0f * M_PI;
 static constexpr float OMEGA_MIN = TWO_PI_F * 5.0f;
 
-// High-precision multiplication: Q32.32 * Q2.30 -> Q32.32
-// (A_hi * 2^30 + A_lo) * B / 2^30 = A_hi * B + (A_lo * B) / 2^30
-static inline int64_t q32_30_mul(int64_t a, int32_t b) {
+// High-precision multiplication: Q24.40 * Q2.30 -> Q26.70 -> Q24.40
+static inline int64_t q40_30_mul(int64_t a, int32_t b) {
     int64_t a_hi = a >> 30;
     uint64_t a_lo = (uint64_t)a & 0x3FFFFFFF;
-    return (a_hi * b) + ((int64_t)(a_lo * b) >> 30);
+    return (a_hi * (int64_t)b) + ((int64_t)(a_lo * (int64_t)b) >> 30);
 }
 
 // ==============================
@@ -71,19 +70,19 @@ void IRAM_ATTR SOGI::step(q16_t u, float omega, float ts)
         updateCoefficients(omega, ts);
     }
 
-    q32_t u_32 = Q16_TO_Q32(u);
+    q40_t u_40 = Q16_TO_Q40(u);
 
     // Alpha filter
-    q32_t in_a = u_32 - q32_30_mul(wz1_a, a_a1) - q32_30_mul(wz2_a, a_a2);
-    q32_t va_32 = q32_30_mul(in_a, a_b0) + q32_30_mul(wz2_a, a_b2);
-    v_alpha = Q32_TO_Q16(va_32);
+    q40_t in_a = u_40 - q40_30_mul(wz1_a, a_a1) - q40_30_mul(wz2_a, a_a2);
+    q40_t va_40 = q40_30_mul(in_a, a_b0) + q40_30_mul(wz2_a, a_b2);
+    v_alpha = Q40_TO_Q16(va_40);
     wz2_a = wz1_a;
     wz1_a = in_a;
 
     // Beta filter
-    q32_t in_b = u_32 - q32_30_mul(wz1_b, a_a1) - q32_30_mul(wz2_b, a_a2);
-    q32_t vb_32 = q32_30_mul(in_b, b_b0) + q32_30_mul(wz1_b, b_b1) + q32_30_mul(wz2_b, b_b2);
-    v_beta = Q32_TO_Q16(vb_32);
+    q40_t in_b = u_40 - q40_30_mul(wz1_b, a_a1) - q40_30_mul(wz2_b, a_a2);
+    q40_t vb_40 = q40_30_mul(in_b, b_b0) + q40_30_mul(wz1_b, b_b1) + q40_30_mul(wz2_b, b_b2);
+    v_beta = Q40_TO_Q16(vb_40);
     wz2_b = wz1_b;
     wz1_b = in_b;
 }
@@ -102,21 +101,26 @@ void IRAM_ATTR SOGI::processWindow(
         updateCoefficients(omega, ts);
     }
 
-    q32_t l_wz1_a = wz1_a;
-    q32_t l_wz2_a = wz2_a;
-    q32_t l_wz1_b = wz1_b;
-    q32_t l_wz2_b = wz2_b;
+    q40_t l_wz1_a = wz1_a;
+    q40_t l_wz2_a = wz2_a;
+    q40_t l_wz1_b = wz1_b;
+    q40_t l_wz2_b = wz2_b;
+    q40_t l_v_alpha = 0;
+    q40_t l_v_beta = 0;
 
     int endIdx = startIdx + count;
 
     auto process = [&](int i)
     {
-        q32_t u = Q16_TO_Q32(buffer[i] - offset);
-        q32_t in_a = u - q32_30_mul(l_wz1_a, a_a1) - q32_30_mul(l_wz2_a, a_a2);
+        q40_t u = Q16_TO_Q40(buffer[i] - offset);
+
+        q40_t in_a = u - q40_30_mul(l_wz1_a, a_a1) - q40_30_mul(l_wz2_a, a_a2);
+        l_v_alpha = q40_30_mul(in_a, a_b0) + q40_30_mul(l_wz2_a, a_b2);
         l_wz2_a = l_wz1_a;
         l_wz1_a = in_a;
 
-        q32_t in_b = u - q32_30_mul(l_wz1_b, a_a1) - q32_30_mul(l_wz2_b, a_a2);
+        q40_t in_b = u - q40_30_mul(l_wz1_b, a_a1) - q40_30_mul(l_wz2_b, a_a2);
+        l_v_beta = q40_30_mul(in_b, b_b0) + q40_30_mul(l_wz1_b, b_b1) + q40_30_mul(l_wz2_b, b_b2);
         l_wz2_b = l_wz1_b;
         l_wz1_b = in_b;
     };
@@ -131,9 +135,8 @@ void IRAM_ATTR SOGI::processWindow(
 
     wz1_a = l_wz1_a; wz2_a = l_wz2_a;
     wz1_b = l_wz1_b; wz2_b = l_wz2_b;
-
-    v_alpha = Q32_TO_Q16(q32_30_mul(wz1_a, a_b0) + q32_30_mul(wz2_a, a_b2));
-    v_beta = Q32_TO_Q16(q32_30_mul(wz1_b, b_b0) + q32_30_mul(wz1_b, b_b1) + q32_30_mul(wz2_b, b_b2));
+    v_alpha = Q40_TO_Q16(l_v_alpha);
+    v_beta = Q40_TO_Q16(l_v_beta);
 }
 
 // ==============================
@@ -195,8 +198,6 @@ AdaptivePLL::AdaptivePLL(float nf, float kp_, float ki_, float lr)
 
 void AdaptivePLL::init() {
     FrequencyAdaptivePLL::init();
-    integral_state = 0.0f;
-    i_term = 0.0f;
     last_control_action = 0.0f;
     gain_est = 0.1f;
     hist_idx = 0;
@@ -212,9 +213,11 @@ void IRAM_ATTR AdaptivePLL::update(q16_t v_alpha, q16_t v_beta, float ts)
     float vb_f = Q16_TO_FLOAT(v_beta);
 
     float grid_phase_est = atan2f(va_f, -vb_f);
+
     phase += TWO_PI_F * freq * ts;
     while (phase > M_PI) phase -= TWO_PI_F;
     while (phase < -M_PI) phase += TWO_PI_F;
+
     float raw_p_err = grid_phase_est - phase;
     if (raw_p_err > M_PI) raw_p_err -= TWO_PI_F;
     if (raw_p_err < -M_PI) raw_p_err += TWO_PI_F;
@@ -232,25 +235,28 @@ void IRAM_ATTR AdaptivePLL::update(q16_t v_alpha, q16_t v_beta, float ts)
     if (gain_est < 0.01f) gain_est = 0.01f;
     if (gain_est > 5.0f)  gain_est = 5.0f;
 
-    // PI terms
+    // Frequency integration
+    int64_t delta_i = (int64_t)(ki * raw_p_err * ts * ((double)(1LL << 32)));
+    integral_q32 += delta_i;
+    const int64_t I_MAX_Q32 = (int64_t)10 * (1LL << 32);
+    if (integral_q32 > I_MAX_Q32) integral_q32 = I_MAX_Q32;
+    else if (integral_q32 < -I_MAX_Q32) integral_q32 = -I_MAX_Q32;
+
     float p_term = 0.0f;
     if (fabsf(raw_p_err) > PHASE_DEADBAND) {
         p_term = (kp * p_scale) * raw_p_err;
-        integral_state += (raw_p_err * ts);
-        i_term = ki * integral_state;
     }
 
-    const float I_MAX = 10.0f;
-    if (i_term > I_MAX) {
-        i_term = I_MAX;
-        integral_state = i_term / (ki + 1e-9f);
-    } else if (i_term < -I_MAX) {
-        i_term = -I_MAX;
-        integral_state = i_term / (ki + 1e-9f);
-    }
+    float integral_f = (float)integral_q32 / (float)(1LL << 32);
+    float control = p_term + integral_f;
 
-    float control = p_term + i_term;
-    freq = nominal_freq + control;
+    float f_new = nominal_freq + control;
+    float f_max = nominal_freq * 1.5f;
+    float f_min = nominal_freq * 0.6f;
+    if (f_new > f_max) f_new = f_max;
+    else if (f_new < f_min) f_new = f_min;
+
+    freq = f_new;
     omega = TWO_PI_F * freq;
 
     phase_hist[hist_idx] = raw_p_err;

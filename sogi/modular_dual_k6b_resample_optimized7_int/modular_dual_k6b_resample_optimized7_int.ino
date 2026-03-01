@@ -70,7 +70,6 @@ uint32_t single_cycle_cycles   = 0;
 uint32_t ticks_per_sample      = 0;
 
 // ── Precomputed constant ─────────────────────────────────────────────────────
-// RAW_TO_Q16 = (3300.0 / 4095.0) * 65536 = 52827.4
 static const q16_t RAW_TO_Q16 = (q16_t)( (3300.0f / 4095.0f) * 65536.0f );
 
 // ── PATH A state – Decimating Resampler ─────────────────────────────────────
@@ -141,9 +140,6 @@ static inline uint32_t IRAM_ATTR get_cycle_count() {
 }
 
 static inline q16_t IRAM_ATTR adcRawToQ16(uint16_t raw) {
-    // raw is 12-bit (0-4095).
-    // RAW_TO_Q16 is (3300/4095) * 2^16.
-    // product is raw * (3300/4095) * 2^16, which is millivolts in Q16.16.
     return (q16_t)(((int64_t)raw * RAW_TO_Q16));
 }
 
@@ -232,7 +228,7 @@ void logTask(void *pv) {
     for (;;) {
         if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
             Serial.printf(
-                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f  H3ratio:%.3f\n",
+                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f  Ratio:%.3f\n",
                 msg.pll_freq, msg.core_us,
                 (unsigned long)msg.isr_callback_count,
                 (unsigned long)msg.frames_dropped,
@@ -312,10 +308,8 @@ void IRAM_ATTR processIncomingDMA() {
                     sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
                     sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
 
-                    float mag1 = sqrtf(Q16_TO_FLOAT(sogi_v.v_alpha) * Q16_TO_FLOAT(sogi_v.v_alpha) +
-                                       Q16_TO_FLOAT(sogi_v.v_beta) * Q16_TO_FLOAT(sogi_v.v_beta));
-                    float mag3 = sqrtf(Q16_TO_FLOAT(sogi_v3.v_alpha) * Q16_TO_FLOAT(sogi_v3.v_alpha) +
-                                       Q16_TO_FLOAT(sogi_v3.v_beta) * Q16_TO_FLOAT(sogi_v3.v_beta));
+                    float mag1 = sqrtf(pow(Q16_TO_FLOAT(sogi_v.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v.v_beta), 2));
+                    float mag3 = sqrtf(pow(Q16_TO_FLOAT(sogi_v3.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v3.v_beta), 2));
 
                     harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
                     harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
@@ -323,7 +317,7 @@ void IRAM_ATTR processIncomingDMA() {
                     float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
                     float damp_factor = 1.0f;
                     if (ratio > SOGI3_HARMONIC_THRESHOLD) {
-                        float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (3.0f * SOGI3_HARMONIC_THRESHOLD);
+                        float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (SOGI3_HARMONIC_THRESHOLD * 2.0f);
                         if (overshoot < 0.0f) overshoot = 0.0f;
                         if (overshoot > 1.0f) overshoot = 1.0f;
                         damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
@@ -405,7 +399,7 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    // Fix visualization alignment: use instantaneous SOGI phase + projection
+    // Use instantaneous phase for display alignment
     float phase_raw = atan2f(Q16_TO_FLOAT(sogi_v.v_alpha), -Q16_TO_FLOAT(sogi_v.v_beta));
     float phase = phase_raw + pll.omega * lag_sec;
     while (phase > 2.0f * PI) phase -= 2.0f * PI;
@@ -432,7 +426,7 @@ void IRAM_ATTR loop() {
         }
         snap.aligned_start = aligned_start;
         snap.pll_freq = pll.freq;
-        snap.pll_mag  = pll.mag_smooth;
+        snap.pll_mag  = sqrtf(pow(Q16_TO_FLOAT(sogi_v.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v.v_beta), 2));
         snap.vdc = Q16_TO_FLOAT(v_dc_offset);
         snap.idc = Q16_TO_FLOAT(i_dc_offset);
         if (xQueueSend(visQueue, &snap, 0) != pdTRUE) { heap_caps_free(snap.v_copy); heap_caps_free(snap.i_copy); }

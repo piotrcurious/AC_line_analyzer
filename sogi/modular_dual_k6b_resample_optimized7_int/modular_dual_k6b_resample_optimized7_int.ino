@@ -1,4 +1,4 @@
-/* ESP32 SOGI-PLL – Optimized streaming resampler with integer math
+/* ESP32 SOGI-PLL – Optimized streaming resampler with Triple-SOGI Deterministic Analyzer
  */
 
 #include <Arduino.h>
@@ -21,15 +21,7 @@
 // ── Algorithm ───────────────────────────────────────────────────────────────
 #define NOMINAL_FREQ       50.0f
 #define SOGI_K             0.7071f
-#define PLL_KP             2.6f
-#define PLL_KI             0.0f
 #define SAMPLES_PER_CYCLE  128        // virtual samples per AC cycle
-
-// ── 3rd-harmonic detection knobs ─────────────────────────────────────────────
-#define SOGI3_K                         SOGI_K
-#define SOGI3_HARMONIC_THRESHOLD        0.2f
-#define SOGI3_DAMP_MIN                  0.01f
-#define HARMONIC_SMOOTH_ALPHA           0.99f
 
 // ── ADC / DMA ───────────────────────────────────────────────────────────────
 #define ADC_OVERSAMPLE_RATE   250000  // total samples/s across both channels
@@ -42,10 +34,8 @@
 #define SERIAL_EVERY_N_CYCLES   2
 
 // ── Global objects ──────────────────────────────────────────────────────────
-SOGIVisualizer vis;
-SOGI           sogi_v(SOGI_K);
-SOGI           sogi_v3(SOGI3_K);
-DeterministicPLL pll(NOMINAL_FREQ, PLL_KP, PLL_KI);
+SOGIVisualizer     vis;
+TripleSOGIAnalyzer analyzer(NOMINAL_FREQ, SOGI_K);
 
 // ── DMA frame ring ──────────────────────────────────────────────────────────
 struct TimestampedFrame {
@@ -93,20 +83,9 @@ uint32_t last_cycle_boundary_samples = 0;
 q16_t v_dc_offset = FLOAT_TO_Q16(1650.0f);
 q16_t i_dc_offset = FLOAT_TO_Q16(1650.0f);
 
-// ── Phase unwrap ─────────────────────────────────────────────────────────────
-struct PhaseTrack {
-    float prev_phase   = 0.0f;
-    float phase_offset = 0.0f;
-    bool  initialized  = false;
-} phase_track;
-
 // ── Diagnostics ──────────────────────────────────────────────────────────────
 uint32_t interp_ok_count   = 0;
 uint32_t interp_fail_count = 0;
-
-// ── Harmonic detection smoothing state ────────────────────────────────────────
-float harmonic_mag1_smooth = 1e-6f;
-float harmonic_mag3_smooth = 1e-6f;
 
 // ── FreeRTOS objects ────────────────────────────────────────────────────────
 TaskHandle_t visTaskHandle = NULL;
@@ -131,6 +110,7 @@ struct SerialMsg {
     uint32_t interp_ok;
     uint32_t interp_total;
     float vdc, idc;
+    float h3ratio;
 };
 
 static inline uint32_t IRAM_ATTR get_cycle_count() {
@@ -228,14 +208,14 @@ void logTask(void *pv) {
     for (;;) {
         if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
             Serial.printf(
-                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f  Ratio:%.3f\n",
+                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f  H3ratio:%.3f\n",
                 msg.pll_freq, msg.core_us,
                 (unsigned long)msg.isr_callback_count,
                 (unsigned long)msg.frames_dropped,
                 (unsigned long)msg.interp_ok,
                 (unsigned long)msg.interp_total,
                 msg.vdc, msg.idc,
-                (double)(harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f))
+                msg.h3ratio
             );
         }
     }
@@ -305,27 +285,9 @@ void IRAM_ATTR processIncomingDMA() {
                     i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
 
                     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
-                    // SOGI for fundamental is run at NOMINAL_FREQ for deterministic phase rotation rate
-                    sogi_v.step(v_val - v_dc_offset, 2.0f * PI * NOMINAL_FREQ, ts_virtual);
-                    sogi_v3.step(v_val - v_dc_offset, 6.0f * PI * NOMINAL_FREQ, ts_virtual);
 
-                    float mag1 = sqrtf(pow(Q16_TO_FLOAT(sogi_v.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v.v_beta), 2));
-                    float mag3 = sqrtf(pow(Q16_TO_FLOAT(sogi_v3.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v3.v_beta), 2));
-
-                    harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
-                    harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
-
-                    float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-                    float damp_factor = 1.0f;
-                    if (ratio > SOGI3_HARMONIC_THRESHOLD) {
-                        float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (SOGI3_HARMONIC_THRESHOLD * 2.0f);
-                        if (overshoot < 0.0f) overshoot = 0.0f;
-                        if (overshoot > 1.0f) overshoot = 1.0f;
-                        damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
-                    }
-
-                    // Update Deterministic PLL using nominal SOGI outputs
-                    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
+                    // Triple SOGI Analyzer handles frequency and phase tracking
+                    analyzer.process(v_val - v_dc_offset, ts_virtual);
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
@@ -359,9 +321,6 @@ void setup() {
         v_buf[i] = v_dc_offset;
         i_buf[i] = i_dc_offset;
     }
-
-    harmonic_mag1_smooth = 1e-6f;
-    harmonic_mag3_smooth = 1e-6f;
 
     vis.begin();
     initADCContinuous();
@@ -397,20 +356,18 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    // Use instantaneous SOGI phase for stable oscilloscope alignment
-    float phase_raw = atan2f(Q16_TO_FLOAT(sogi_v.v_alpha), -Q16_TO_FLOAT(sogi_v.v_beta));
-    // Project phase forward based on ACTUAL observed frequency to compensate for lag
-    float phase = phase_raw + pll.omega * lag_sec;
+    // Visualization phase projection
+    float phase = analyzer.grid_phase + (2.0f * PI * analyzer.grid_freq) * lag_sec;
     while (phase > 2.0f * PI) phase -= 2.0f * PI;
     while (phase < 0.0f) phase += 2.0f * PI;
 
-    float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
+    float samples_per_cycle_f = 1.0f / (analyzer.grid_freq * ts_virtual);
     float samples_back        = (phase / (2.0f * (float)PI)) * samples_per_cycle_f;
     int   curr_head_idx       = (int)(buf_wr % SAMPLES_PER_CYCLE);
     int   aligned_start       = (int)((curr_head_idx + SAMPLES_PER_CYCLE - (int)(samples_back + 0.5f)) % SAMPLES_PER_CYCLE);
 
     last_cycle_boundary_samples = buf_wr;
-    updateTimingParameters(pll.freq);
+    updateTimingParameters(analyzer.grid_freq);
 
     uint32_t proc_end = get_cycle_count();
     float    core_us  = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
@@ -424,8 +381,8 @@ void IRAM_ATTR loop() {
             snap.i_copy[k] = Q16_TO_FLOAT(i_buf[k]);
         }
         snap.aligned_start = aligned_start;
-        snap.pll_freq = pll.freq;
-        snap.pll_mag  = sqrtf(pow(Q16_TO_FLOAT(sogi_v.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v.v_beta), 2));
+        snap.pll_freq = analyzer.grid_freq;
+        snap.pll_mag  = analyzer.v_mag;
         snap.vdc = Q16_TO_FLOAT(v_dc_offset);
         snap.idc = Q16_TO_FLOAT(i_dc_offset);
         if (xQueueSend(visQueue, &snap, 0) != pdTRUE) { heap_caps_free(snap.v_copy); heap_caps_free(snap.i_copy); }
@@ -434,7 +391,7 @@ void IRAM_ATTR loop() {
     if (++serial_ctr >= SERIAL_EVERY_N_CYCLES) {
         serial_ctr = 0;
         SerialMsg sm;
-        sm.pll_freq = pll.freq;
+        sm.pll_freq = analyzer.grid_freq;
         sm.core_us  = core_us;
         sm.isr_callback_count = isr_callback_count;
         sm.frames_dropped     = frames_dropped;
@@ -442,6 +399,7 @@ void IRAM_ATTR loop() {
         sm.interp_total       = interp_ok_count + interp_fail_count;
         sm.vdc = Q16_TO_FLOAT(v_dc_offset);
         sm.idc = Q16_TO_FLOAT(i_dc_offset);
+        sm.h3ratio = analyzer.h3_ratio;
         interp_ok_count = 0; interp_fail_count = 0;
         xQueueSend(logQueue, &sm, 0);
     }

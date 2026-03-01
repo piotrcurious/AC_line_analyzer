@@ -12,21 +12,20 @@
 #endif
 
 // Fixed-point definitions
-// Q16.16 for signals (range +/- 32768, resolution 1/65536)
 typedef int32_t q16_t;
 #define Q16_SHIFT 16
 #define Q16_ONE (1 << Q16_SHIFT)
 #define FLOAT_TO_Q16(x) ((q16_t)((x) * Q16_ONE))
 #define Q16_TO_FLOAT(x) ((float)(x) / Q16_ONE)
 
-// Internal states in Q32.32 (int64_t) to prevent overflow and maintain high precision
+// High-precision states in Q32.32 (int64_t)
 typedef int64_t q32_t;
 #define Q32_SHIFT 32
 #define Q32_ONE (1LL << Q32_SHIFT)
 #define Q16_TO_Q32(x) (((int64_t)(x)) << (Q32_SHIFT - Q16_SHIFT))
 #define Q32_TO_Q16(x) ((int32_t)((x) >> (Q32_SHIFT - Q16_SHIFT)))
 
-// Q2.30 for coefficients
+// Coefficients in Q2.30
 typedef int32_t q30_t;
 #define Q30_SHIFT 30
 #define Q30_ONE (1 << Q30_SHIFT)
@@ -46,11 +45,9 @@ public:
     float k;
 
 private:
-    // Internal states (Q32.32)
     q32_t wz1_a, wz2_a;
     q32_t wz1_b, wz2_b;
 
-    // Cached coefficients (Q2.30)
     q30_t a_b0, a_b2;
     q30_t a_a1, a_a2;
     q30_t b_b0, b_b1, b_b2;

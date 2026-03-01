@@ -21,8 +21,8 @@
 // ── Algorithm ───────────────────────────────────────────────────────────────
 #define NOMINAL_FREQ       50.0f
 #define SOGI_K             0.7071f
-#define PLL_KP             5.0f      // Adjusted for new phase-tracking PLL
-#define PLL_KI             50.0f     // Adjusted for new phase-tracking PLL
+#define PLL_KP             5.0f
+#define PLL_KI             50.0f
 #define SAMPLES_PER_CYCLE  128        // virtual samples per AC cycle
 
 // ── 3rd-harmonic detection knobs ─────────────────────────────────────────────
@@ -70,7 +70,7 @@ uint32_t single_cycle_cycles   = 0;
 uint32_t ticks_per_sample      = 0;
 
 // ── Precomputed constant ─────────────────────────────────────────────────────
-// RAW_TO_Q16 = (3300.0 / 4095.0) * 65536
+// RAW_TO_Q16 = (3300.0 / 4095.0) * 65536 = 52827.4
 static const q16_t RAW_TO_Q16 = (q16_t)( (3300.0f / 4095.0f) * 65536.0f );
 
 // ── PATH A state – Decimating Resampler ─────────────────────────────────────
@@ -141,9 +141,9 @@ static inline uint32_t IRAM_ATTR get_cycle_count() {
 }
 
 static inline q16_t IRAM_ATTR adcRawToQ16(uint16_t raw) {
-    // raw is 12-bit (0-4095).
-    // result is millivolts in Q16.16
-    return (q16_t)(((int64_t)raw * RAW_TO_Q16) >> 0); // No additional shift needed as RAW_TO_Q16 already incorporates Q16
+    // result is millivolts in Q16.16. raw is 12-bit.
+    // (raw * 52827) >> 0 is correct for Q16 output.
+    return (q16_t)(((int64_t)raw * RAW_TO_Q16));
 }
 
 static inline void IRAM_ATTR updateTimingParameters(float frequency) {
@@ -330,7 +330,6 @@ void IRAM_ATTR processIncomingDMA() {
                     float learn_att = (ratio > SOGI3_HARMONIC_THRESHOLD) ? 0.0f : 1.0f;
                     pll.setDistortionDamping(damp_factor, learn_att);
 
-                    // SOGI outputs damping-ready
                     q16_t alpha_in = (q16_t)(sogi_v.v_alpha * damp_factor);
                     q16_t beta_in  = (q16_t)(sogi_v.v_beta  * damp_factor);
                     pll.update(alpha_in, beta_in, ts_virtual);
@@ -391,7 +390,6 @@ void IRAM_ATTR loop() {
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
-    // ROBUST INTEGER EMA for DC OFFSET
     int64_t v_sum = 0, i_sum = 0;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
@@ -405,8 +403,6 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    // The PLL internal phase already tracks the signal phase.
-    // We can use it directly for visualization alignment.
     float phase = pll.phase + pll.omega * lag_sec;
     while (phase > 2.0f * PI) phase -= 2.0f * PI;
     while (phase < 0.0f) phase += 2.0f * PI;

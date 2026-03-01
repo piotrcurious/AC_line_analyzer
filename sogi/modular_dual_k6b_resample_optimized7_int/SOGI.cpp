@@ -10,17 +10,13 @@
 static constexpr float TWO_PI_F = 2.0f * M_PI;
 static constexpr float OMEGA_MIN = TWO_PI_F * 5.0f;
 
-// State is Q32.32 (64-bit), Coeff is Q2.30 (32-bit).
-// Product is Q34.62 (96-bit effectively).
-// We want Q32.32 back, so shift by 30.
-// This requires __int128 if we want to be absolutely safe, but since SOGI states are bounded,
-// we can use a trick or just use double for intermediate.
-// Wait, the user asked for INTEGER math.
-// Let's use 64-bit with a smaller shift if needed, but Q30 is a large shift.
-// If state is 1000 (2^10) * 2^32 = 2^42. Coeff is 2^30. Product 2^72. Definitely overflows 64-bit.
-// BUT, on ESP32, we don't have __int128.
-// We can split the multiplication: (A_hi*2^32 + A_lo) * B = A_hi*B*2^32 + A_lo*B.
-#define Q32_30_MUL(a, b) ((((a) >> 30) * (b)) + ((((a) & 0x3FFFFFFF) * (b)) >> 30))
+// High-precision multiplication: Q32.32 * Q2.30 -> Q32.32
+// (A_hi * 2^30 + A_lo) * B / 2^30 = A_hi * B + (A_lo * B) / 2^30
+static inline int64_t q32_30_mul(int64_t a, int32_t b) {
+    int64_t a_hi = a >> 30;
+    uint64_t a_lo = (uint64_t)a & 0x3FFFFFFF;
+    return (a_hi * b) + ((int64_t)(a_lo * b) >> 30);
+}
 
 // ==============================
 // ========  SOGI  ==============
@@ -77,15 +73,16 @@ void IRAM_ATTR SOGI::step(q16_t u, float omega, float ts)
 
     q32_t u_32 = Q16_TO_Q32(u);
 
-    // Direct Form II
-    q32_t in_a = u_32 - Q32_30_MUL(wz1_a, a_a1) - Q32_30_MUL(wz2_a, a_a2);
-    q32_t va_32 = Q32_30_MUL(in_a, a_b0) + Q32_30_MUL(wz2_a, a_b2);
+    // Alpha filter
+    q32_t in_a = u_32 - q32_30_mul(wz1_a, a_a1) - q32_30_mul(wz2_a, a_a2);
+    q32_t va_32 = q32_30_mul(in_a, a_b0) + q32_30_mul(wz2_a, a_b2);
     v_alpha = Q32_TO_Q16(va_32);
     wz2_a = wz1_a;
     wz1_a = in_a;
 
-    q32_t in_b = u_32 - Q32_30_MUL(wz1_b, a_a1) - Q32_30_MUL(wz2_b, a_a2);
-    q32_t vb_32 = Q32_30_MUL(in_b, b_b0) + Q32_30_MUL(wz1_b, b_b1) + Q32_30_MUL(wz2_b, b_b2);
+    // Beta filter
+    q32_t in_b = u_32 - q32_30_mul(wz1_b, a_a1) - q32_30_mul(wz2_b, a_a2);
+    q32_t vb_32 = q32_30_mul(in_b, b_b0) + q32_30_mul(wz1_b, b_b1) + q32_30_mul(wz2_b, b_b2);
     v_beta = Q32_TO_Q16(vb_32);
     wz2_b = wz1_b;
     wz1_b = in_b;
@@ -115,11 +112,11 @@ void IRAM_ATTR SOGI::processWindow(
     auto process = [&](int i)
     {
         q32_t u = Q16_TO_Q32(buffer[i] - offset);
-        q32_t in_a = u - Q32_30_MUL(l_wz1_a, a_a1) - Q32_30_MUL(l_wz2_a, a_a2);
+        q32_t in_a = u - q32_30_mul(l_wz1_a, a_a1) - q32_30_mul(l_wz2_a, a_a2);
         l_wz2_a = l_wz1_a;
         l_wz1_a = in_a;
 
-        q32_t in_b = u - Q32_30_MUL(l_wz1_b, a_a1) - Q32_30_MUL(l_wz2_b, a_a2);
+        q32_t in_b = u - q32_30_mul(l_wz1_b, a_a1) - q32_30_mul(l_wz2_b, a_a2);
         l_wz2_b = l_wz1_b;
         l_wz1_b = in_b;
     };
@@ -135,8 +132,8 @@ void IRAM_ATTR SOGI::processWindow(
     wz1_a = l_wz1_a; wz2_a = l_wz2_a;
     wz1_b = l_wz1_b; wz2_b = l_wz2_b;
 
-    v_alpha = Q32_TO_Q16(Q32_30_MUL(wz1_a, a_b0) + Q32_30_MUL(wz2_a, a_b2));
-    v_beta = Q32_TO_Q16(Q32_30_MUL(wz1_b, b_b0) + Q32_30_MUL(wz1_b, b_b1) + Q32_30_MUL(wz2_b, b_b2));
+    v_alpha = Q32_TO_Q16(q32_30_mul(wz1_a, a_b0) + q32_30_mul(wz2_a, a_b2));
+    v_beta = Q32_TO_Q16(q32_30_mul(wz1_b, b_b0) + q32_30_mul(wz1_b, b_b1) + q32_30_mul(wz2_b, b_b2));
 }
 
 // ==============================

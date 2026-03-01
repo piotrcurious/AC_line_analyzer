@@ -40,10 +40,6 @@ void test_pll_frequency_tracking() {
         float val = 1000.0f * sin(phase);
         sogi.step(FLOAT_TO_Q16(val), pll.omega, ts);
         pll.update(sogi.v_alpha, sogi.v_beta, ts);
-
-        if (i % 2000 == 0) {
-            std::cout << "  i=" << i << " Freq=" << pll.freq << std::endl;
-        }
     }
 
     std::cout << "  Final Freq: " << pll.freq << std::endl;

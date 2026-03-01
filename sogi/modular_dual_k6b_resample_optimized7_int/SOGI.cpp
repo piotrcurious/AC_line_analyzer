@@ -67,7 +67,7 @@ void IRAM_ATTR SOGI::updateCoefficients(float omega, float ts)
 
 void IRAM_ATTR SOGI::step(q16_t u, float omega, float ts)
 {
-    if (!coeff_valid || fabsf(omega - last_omega) > 0.01f || fabsf(ts - last_ts) > 1e-9f) {
+    if (!coeff_valid || fabsf(omega - last_omega) > 0.1f || fabsf(ts - last_ts) > 1e-9f) {
         updateCoefficients(omega, ts);
     }
 
@@ -98,7 +98,7 @@ void IRAM_ATTR SOGI::processWindow(
     q16_t offset)
 {
     if (count <= 0) return;
-    if (!coeff_valid || fabsf(omega - last_omega) > 0.01f || fabsf(ts - last_ts) > 1e-9f) {
+    if (!coeff_valid || fabsf(omega - last_omega) > 0.1f || fabsf(ts - last_ts) > 1e-9f) {
         updateCoefficients(omega, ts);
     }
 

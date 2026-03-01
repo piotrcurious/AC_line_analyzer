@@ -21,13 +21,13 @@
 // ── Algorithm ───────────────────────────────────────────────────────────────
 #define NOMINAL_FREQ       50.0f
 #define SOGI_K             0.7071f
-#define PLL_KP             5.0f
-#define PLL_KI             50.0f
+#define PLL_KP             2.6f
+#define PLL_KI             0.0f
 #define SAMPLES_PER_CYCLE  128        // virtual samples per AC cycle
 
 // ── 3rd-harmonic detection knobs ─────────────────────────────────────────────
 #define SOGI3_K                         SOGI_K
-#define SOGI3_HARMONIC_THRESHOLD        0.1f
+#define SOGI3_HARMONIC_THRESHOLD        0.2f
 #define SOGI3_DAMP_MIN                  0.01f
 #define HARMONIC_SMOOTH_ALPHA           0.99f
 
@@ -141,8 +141,9 @@ static inline uint32_t IRAM_ATTR get_cycle_count() {
 }
 
 static inline q16_t IRAM_ATTR adcRawToQ16(uint16_t raw) {
-    // result is millivolts in Q16.16. raw is 12-bit.
-    // (raw * 52827) >> 0 is correct for Q16 output.
+    // raw is 12-bit (0-4095).
+    // RAW_TO_Q16 is (3300/4095) * 2^16.
+    // product is raw * (3300/4095) * 2^16, which is millivolts in Q16.16.
     return (q16_t)(((int64_t)raw * RAW_TO_Q16));
 }
 
@@ -390,6 +391,7 @@ void IRAM_ATTR loop() {
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
+    // ROBUST INTEGER EMA for DC OFFSET
     int64_t v_sum = 0, i_sum = 0;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
@@ -403,7 +405,9 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    float phase = pll.phase + pll.omega * lag_sec;
+    // Fix visualization alignment: use instantaneous SOGI phase + projection
+    float phase_raw = atan2f(Q16_TO_FLOAT(sogi_v.v_alpha), -Q16_TO_FLOAT(sogi_v.v_beta));
+    float phase = phase_raw + pll.omega * lag_sec;
     while (phase > 2.0f * PI) phase -= 2.0f * PI;
     while (phase < 0.0f) phase += 2.0f * PI;
 

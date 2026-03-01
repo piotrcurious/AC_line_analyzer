@@ -19,7 +19,14 @@ typedef int32_t q16_t;
 #define FLOAT_TO_Q16(x) ((q16_t)((x) * Q16_ONE))
 #define Q16_TO_FLOAT(x) ((float)(x) / Q16_ONE)
 
-// Q2.30 for coefficients (range +/- 2, resolution 1/2^30)
+// Internal states in Q32.32 (int64_t) to prevent overflow and maintain high precision
+typedef int64_t q32_t;
+#define Q32_SHIFT 32
+#define Q32_ONE (1LL << Q32_SHIFT)
+#define Q16_TO_Q32(x) (((int64_t)(x)) << (Q32_SHIFT - Q16_SHIFT))
+#define Q32_TO_Q16(x) ((int32_t)((x) >> (Q32_SHIFT - Q16_SHIFT)))
+
+// Q2.30 for coefficients
 typedef int32_t q30_t;
 #define Q30_SHIFT 30
 #define Q30_ONE (1 << Q30_SHIFT)
@@ -31,10 +38,7 @@ public:
     void init();
     void reset();
 
-    // Process a single sample (Fixed point)
     void IRAM_ATTR step(q16_t input, float omega, float ts);
-
-    // Process a window of samples (Fixed point)
     void IRAM_ATTR processWindow(const q16_t* buffer, int bufLen, int startIdx, int count, float omega, float ts, q16_t offset = 0);
 
     q16_t v_alpha;
@@ -42,9 +46,9 @@ public:
     float k;
 
 private:
-    // States (Q16.16)
-    q16_t wz1_a, wz2_a;
-    q16_t wz1_b, wz2_b;
+    // Internal states (Q32.32)
+    q32_t wz1_a, wz2_a;
+    q32_t wz1_b, wz2_b;
 
     // Cached coefficients (Q2.30)
     q30_t a_b0, a_b2;
@@ -52,6 +56,9 @@ private:
     q30_t b_b0, b_b1, b_b2;
 
     bool coeff_valid;
+    float last_omega;
+    float last_ts;
+
     void IRAM_ATTR updateCoefficients(float omega, float ts);
 };
 
@@ -64,10 +71,8 @@ public:
     float freq;
     float omega;
     float mag_smooth;
-
-    // Integrator uses Q32.32 for high precision
+    float phase;
     int64_t integral_q32;
-
     float kp, ki;
     float nominal_freq;
 
@@ -84,7 +89,7 @@ public:
     void init();
     void IRAM_ATTR update(q16_t v_alpha, q16_t v_beta, float ts);
 
-    float integral_state; // Maybe also convert this to fixed point later if needed
+    float integral_state;
     float i_term;
     float last_control_action;
     float gain_est;

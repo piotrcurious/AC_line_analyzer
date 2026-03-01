@@ -21,8 +21,8 @@
 // ── Algorithm ───────────────────────────────────────────────────────────────
 #define NOMINAL_FREQ       50.0f
 #define SOGI_K             0.7071f
-#define PLL_KP             2.55f
-#define PLL_KI             0.000000f
+#define PLL_KP             5.0f      // Adjusted for new phase-tracking PLL
+#define PLL_KI             50.0f     // Adjusted for new phase-tracking PLL
 #define SAMPLES_PER_CYCLE  128        // virtual samples per AC cycle
 
 // ── 3rd-harmonic detection knobs ─────────────────────────────────────────────
@@ -330,7 +330,7 @@ void IRAM_ATTR processIncomingDMA() {
                     float learn_att = (ratio > SOGI3_HARMONIC_THRESHOLD) ? 0.0f : 1.0f;
                     pll.setDistortionDamping(damp_factor, learn_att);
 
-                    // SOGI outputs already damping-ready if we scale here
+                    // SOGI outputs damping-ready
                     q16_t alpha_in = (q16_t)(sogi_v.v_alpha * damp_factor);
                     q16_t beta_in  = (q16_t)(sogi_v.v_beta  * damp_factor);
                     pll.update(alpha_in, beta_in, ts_virtual);
@@ -399,33 +399,20 @@ void IRAM_ATTR loop() {
     }
     q16_t v_avg = (q16_t)(v_sum / SAMPLES_PER_CYCLE);
     q16_t i_avg = (q16_t)(i_sum / SAMPLES_PER_CYCLE);
-
-    // Smooth estimate: y[n] = 0.98 * y[n-1] + 0.02 * x[n]
-    // approximately: y[n] = y[n-1] + (x[n] - y[n-1]) / 50
     v_dc_offset += (v_avg - v_dc_offset) / 50;
     i_dc_offset += (i_avg - i_dc_offset) / 50;
 
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    float phase_corr = pll.omega * lag_sec;
-    float phase = atan2f(Q16_TO_FLOAT(sogi_v.v_alpha), -Q16_TO_FLOAT(sogi_v.v_beta)) + phase_corr;
-    if (phase < 0.0f) phase += 2.0f * (float)PI;
-    else if (phase > 2.0f * (float)PI) phase -= 2.0f * (float)PI;
-
-    if (phase_track.initialized) {
-        float delta = phase - phase_track.prev_phase;
-        if      (delta < -(float)PI) phase_track.phase_offset += 2.0f * (float)PI;
-        else if (delta >  (float)PI) phase_track.phase_offset -= 2.0f * (float)PI;
-    } else { phase_track.initialized = true; }
-    phase_track.prev_phase = phase;
-
-    float unwrapped  = phase + phase_track.phase_offset;
-    float phase_norm = fmodf(unwrapped, 2.0f * (float)PI);
-    if (phase_norm < 0.0f) phase_norm += 2.0f * (float)PI;
+    // The PLL internal phase already tracks the signal phase.
+    // We can use it directly for visualization alignment.
+    float phase = pll.phase + pll.omega * lag_sec;
+    while (phase > 2.0f * PI) phase -= 2.0f * PI;
+    while (phase < 0.0f) phase += 2.0f * PI;
 
     float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
-    float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
+    float samples_back        = (phase / (2.0f * (float)PI)) * samples_per_cycle_f;
     int   curr_head_idx       = (int)(buf_wr % SAMPLES_PER_CYCLE);
     int   aligned_start       = (int)((curr_head_idx + SAMPLES_PER_CYCLE - (int)(samples_back + 0.5f)) % SAMPLES_PER_CYCLE);
 

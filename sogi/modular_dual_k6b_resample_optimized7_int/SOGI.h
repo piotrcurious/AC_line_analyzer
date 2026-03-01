@@ -76,7 +76,7 @@ private:
     float prev_nom_phase;
 
     // Sliding window for deterministic frequency solver
-    static constexpr int BUF_LEN = 128;
+    static constexpr int BUF_LEN = 256; // Increased for stability across frame sizes
     float rate_buf[BUF_LEN];
     int buf_idx;
     float rate_sum;

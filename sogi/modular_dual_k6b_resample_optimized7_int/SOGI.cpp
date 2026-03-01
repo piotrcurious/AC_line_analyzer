@@ -95,7 +95,6 @@ void IRAM_ATTR TripleSOGIAnalyzer::process(q16_t input, float ts) {
     prev_nom_phase = current_nom_phase;
 
     float freq_inst = dp / (TWO_PI_F * ts);
-
     rate_sum -= rate_buf[buf_idx];
     rate_buf[buf_idx] = freq_inst;
     rate_sum += freq_inst;

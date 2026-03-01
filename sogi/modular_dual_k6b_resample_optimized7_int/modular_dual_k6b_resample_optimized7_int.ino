@@ -208,7 +208,7 @@ void logTask(void *pv) {
     for (;;) {
         if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
             Serial.printf(
-                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f  H3ratio:%.3f\n",
+                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Interp:%lu/%lu  Vdc:%.1f Idc:%.1f  Ratio:%.3f\n",
                 msg.pll_freq, msg.core_us,
                 (unsigned long)msg.isr_callback_count,
                 (unsigned long)msg.frames_dropped,
@@ -236,16 +236,16 @@ void IRAM_ATTR processIncomingDMA() {
         if (n <= 0) { rd = (rd + 1) % FRAME_BUFFER_SIZE; continue; }
 
         int total_pairs = n / 2;
-        uint32_t elapsed = 0;
-        if (resamp.initialized) {
-            elapsed = (uint32_t)(frame_end_ts - resamp.last_frame_end_ts);
-        } else {
-            elapsed = (uint32_t)cycles_per_adc_sample * (uint32_t)total_pairs;
-        }
-        uint32_t frame_start_ts = resamp.last_frame_end_ts;
 
-        const int max_emit_per_frame = SAMPLES_PER_CYCLE * 2;
-        int emitted_in_frame = 0;
+        // Re-anchor resampler time model to frame timestamps to handle CONV_FRAME_SIZE jitter
+        uint32_t frame_duration = total_pairs * cycles_per_adc_sample;
+        uint32_t frame_start_ts = frame_end_ts - frame_duration;
+
+        if (!resamp.initialized) {
+            resamp.last_frame_end_ts = frame_end_ts;
+            next_sample_time = frame_end_ts;
+            resamp.initialized = true;
+        }
 
         for (int pair = 0; pair < total_pairs; ++pair) {
             int i = pair * 2;
@@ -260,17 +260,7 @@ void IRAM_ATTR processIncomingDMA() {
             q16_t qv = adcRawToQ16(rv);
             q16_t qi = adcRawToQ16(ri);
 
-            uint32_t ts = frame_start_ts + (uint32_t)(((uint64_t)(pair + 1) * (uint64_t)elapsed) / (uint64_t)total_pairs);
-
-            if (!resamp.initialized) {
-                resamp.last_frame_end_ts = frame_end_ts;
-                resamp.initialized = true;
-                if (next_sample_time == 0) next_sample_time = frame_end_ts;
-                resamp.acc_v += qv;
-                resamp.acc_i += qi;
-                resamp.acc_count++;
-                continue;
-            }
+            uint32_t ts = frame_start_ts + (uint32_t)(((uint64_t)(pair + 1) * (uint64_t)frame_duration) / (uint64_t)total_pairs);
 
             resamp.acc_v += qv;
             resamp.acc_i += qi;
@@ -285,23 +275,16 @@ void IRAM_ATTR processIncomingDMA() {
                     i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
 
                     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
-
-                    // Triple SOGI Analyzer handles frequency and phase tracking
                     analyzer.process(v_val - v_dc_offset, ts_virtual);
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
                     interp_ok_count++;
                     resamp.acc_v = 0; resamp.acc_i = 0; resamp.acc_count = 0;
-                    emitted_in_frame++;
-                    if (emitted_in_frame > max_emit_per_frame) break;
                 } else {
                     next_sample_time += ticks_per_sample;
-                    emitted_in_frame++;
-                    if (emitted_in_frame > max_emit_per_frame) break;
                 }
             }
-            if (emitted_in_frame > max_emit_per_frame) break;
         }
         resamp.last_frame_end_ts = frame_end_ts;
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
@@ -342,7 +325,6 @@ void IRAM_ATTR loop() {
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
-    // ROBUST INTEGER EMA for DC OFFSET
     int64_t v_sum = 0, i_sum = 0;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
@@ -356,8 +338,13 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    // Visualization phase projection
+    // Use instantaneous phase from the adaptive analyzer
     float phase = analyzer.grid_phase + (2.0f * PI * analyzer.grid_freq) * lag_sec;
+
+    // Correct for inherent 90-degree delay in SOGI quadrature output
+    // At resonance, alpha = sin(theta), -beta = cos(theta).
+    // atan2(alpha, -beta) = theta. Correct.
+
     while (phase > 2.0f * PI) phase -= 2.0f * PI;
     while (phase < 0.0f) phase += 2.0f * PI;
 

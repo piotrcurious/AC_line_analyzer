@@ -391,13 +391,19 @@ void IRAM_ATTR loop() {
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
+    // ROBUST INTEGER EMA for DC OFFSET
     int64_t v_sum = 0, i_sum = 0;
     for (int k = 0; k < SAMPLES_PER_CYCLE; ++k) {
         v_sum += v_buf[k];
         i_sum += i_buf[k];
     }
-    v_dc_offset = (q16_t)(0.98f * Q16_TO_FLOAT(v_dc_offset) + 0.02f * (float)(v_sum / SAMPLES_PER_CYCLE));
-    i_dc_offset = (q16_t)(0.98f * Q16_TO_FLOAT(i_dc_offset) + 0.02f * (float)(i_sum / SAMPLES_PER_CYCLE));
+    q16_t v_avg = (q16_t)(v_sum / SAMPLES_PER_CYCLE);
+    q16_t i_avg = (q16_t)(i_sum / SAMPLES_PER_CYCLE);
+
+    // Smooth estimate: y[n] = 0.98 * y[n-1] + 0.02 * x[n]
+    // approximately: y[n] = y[n-1] + (x[n] - y[n-1]) / 50
+    v_dc_offset += (v_avg - v_dc_offset) / 50;
+    i_dc_offset += (i_avg - i_dc_offset) / 50;
 
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();

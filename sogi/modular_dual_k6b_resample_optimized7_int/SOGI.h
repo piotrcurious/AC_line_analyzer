@@ -1,8 +1,15 @@
 #ifndef SOGI_H
 #define SOGI_H
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#else
 #include <stdint.h>
+#include <cmath>
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
+#endif
 
 // Fixed-point definitions
 // Q16.16 for signals (range +/- 32768, resolution 1/65536)

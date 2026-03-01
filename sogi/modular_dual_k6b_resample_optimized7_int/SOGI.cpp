@@ -190,6 +190,50 @@ void IRAM_ATTR FrequencyAdaptivePLL::update(q16_t v_alpha, q16_t v_beta, float t
 }
 
 // ==============================
+// ==== Deterministic PLL =======
+// ==============================
+
+DeterministicPLL::DeterministicPLL(float nf, float kp_, float ki_)
+    : FrequencyAdaptivePLL(nf, kp_, ki_) { init(); }
+
+void DeterministicPLL::init() {
+    FrequencyAdaptivePLL::init();
+    prev_phase = 0.0f;
+    freq_filtered = 0.0f;
+    buf_idx = 0;
+    rate_sum = 0.0f;
+    for (int i = 0; i < BUF_LEN; i++) rate_buf[i] = 0.0f;
+}
+
+void IRAM_ATTR DeterministicPLL::update(q16_t v_alpha, q16_t v_beta, float ts)
+{
+    float va_f = Q16_TO_FLOAT(v_alpha);
+    float vb_f = Q16_TO_FLOAT(v_beta);
+
+    float current_phase = atan2f(va_f, -vb_f);
+
+    float dp = current_phase - prev_phase;
+    while (dp > M_PI) dp -= TWO_PI_F;
+    while (dp < -M_PI) dp += TWO_PI_F;
+
+    float freq_inst = dp / (TWO_PI_F * ts);
+
+    rate_sum -= rate_buf[buf_idx];
+    rate_buf[buf_idx] = freq_inst;
+    rate_sum += freq_inst;
+    buf_idx = (buf_idx + 1) % BUF_LEN;
+
+    freq_filtered = rate_sum / BUF_LEN;
+
+    // Grid Frequency is exactly the observed phase rotation speed
+    freq = freq_filtered;
+    omega = TWO_PI_F * freq;
+
+    phase = current_phase;
+    prev_phase = current_phase;
+}
+
+// ==============================
 // ===== Adaptive PLL ===========
 // ==============================
 

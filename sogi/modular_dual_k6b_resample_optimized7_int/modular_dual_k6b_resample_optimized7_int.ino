@@ -45,7 +45,7 @@
 SOGIVisualizer vis;
 SOGI           sogi_v(SOGI_K);
 SOGI           sogi_v3(SOGI3_K);
-AdaptivePLL    pll(NOMINAL_FREQ, PLL_KP, PLL_KI, 0.1001f);
+DeterministicPLL pll(NOMINAL_FREQ, PLL_KP, PLL_KI);
 
 // ── DMA frame ring ──────────────────────────────────────────────────────────
 struct TimestampedFrame {
@@ -305,8 +305,9 @@ void IRAM_ATTR processIncomingDMA() {
                     i_buf[buf_wr % SAMPLES_PER_CYCLE] = i_val;
 
                     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
-                    sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-                    sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
+                    // SOGI for fundamental is run at NOMINAL_FREQ for deterministic phase rotation rate
+                    sogi_v.step(v_val - v_dc_offset, 2.0f * PI * NOMINAL_FREQ, ts_virtual);
+                    sogi_v3.step(v_val - v_dc_offset, 6.0f * PI * NOMINAL_FREQ, ts_virtual);
 
                     float mag1 = sqrtf(pow(Q16_TO_FLOAT(sogi_v.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v.v_beta), 2));
                     float mag3 = sqrtf(pow(Q16_TO_FLOAT(sogi_v3.v_alpha), 2) + pow(Q16_TO_FLOAT(sogi_v3.v_beta), 2));
@@ -322,12 +323,9 @@ void IRAM_ATTR processIncomingDMA() {
                         if (overshoot > 1.0f) overshoot = 1.0f;
                         damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
                     }
-                    float learn_att = (ratio > SOGI3_HARMONIC_THRESHOLD) ? 0.0f : 1.0f;
-                    pll.setDistortionDamping(damp_factor, learn_att);
 
-                    q16_t alpha_in = (q16_t)(sogi_v.v_alpha * damp_factor);
-                    q16_t beta_in  = (q16_t)(sogi_v.v_beta  * damp_factor);
-                    pll.update(alpha_in, beta_in, ts_virtual);
+                    // Update Deterministic PLL using nominal SOGI outputs
+                    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
@@ -399,8 +397,9 @@ void IRAM_ATTR loop() {
     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
-    // Use instantaneous phase for display alignment
+    // Use instantaneous SOGI phase for stable oscilloscope alignment
     float phase_raw = atan2f(Q16_TO_FLOAT(sogi_v.v_alpha), -Q16_TO_FLOAT(sogi_v.v_beta));
+    // Project phase forward based on ACTUAL observed frequency to compensate for lag
     float phase = phase_raw + pll.omega * lag_sec;
     while (phase > 2.0f * PI) phase -= 2.0f * PI;
     while (phase < 0.0f) phase += 2.0f * PI;

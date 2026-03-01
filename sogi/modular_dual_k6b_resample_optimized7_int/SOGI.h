@@ -12,21 +12,18 @@
 #endif
 
 // Fixed-point definitions
-// Q16.16 for signals (range +/- 32768, resolution 1/65536)
 typedef int32_t q16_t;
 #define Q16_SHIFT 16
 #define Q16_ONE (1 << Q16_SHIFT)
 #define FLOAT_TO_Q16(x) ((q16_t)((x) * Q16_ONE))
 #define Q16_TO_FLOAT(x) ((float)(x) / Q16_ONE)
 
-// High-precision states in Q24.40 (int64_t) to prevent resonant magnitude attenuation
 typedef int64_t q40_t;
 #define Q40_SHIFT 40
 #define Q40_ONE (1LL << Q40_SHIFT)
 #define Q16_TO_Q40(x) (((int64_t)(x)) << (Q40_SHIFT - Q16_SHIFT))
 #define Q40_TO_Q16(x) ((int32_t)((x) >> (Q40_SHIFT - Q16_SHIFT)))
 
-// Coefficients in Q2.30 (range +/- 2, resolution 1/2^30)
 typedef int32_t q30_t;
 #define Q30_SHIFT 30
 #define Q30_ONE (1 << Q30_SHIFT)
@@ -46,7 +43,6 @@ public:
     float k;
 
 private:
-    // Internal states (Q40)
     q40_t wz1_a, wz2_a;
     q40_t wz1_b, wz2_b;
 
@@ -78,6 +74,23 @@ public:
 
 protected:
     static constexpr float MAG_ALPHA = 1.0f;
+};
+
+// New Deterministic PLL using phase rotation rate
+class DeterministicPLL : public FrequencyAdaptivePLL {
+public:
+    DeterministicPLL(float nominal_freq, float kp, float ki);
+    void init() override;
+    void IRAM_ATTR update(q16_t v_alpha, q16_t v_beta, float ts) override;
+
+    float prev_phase;
+    float freq_filtered;
+
+    // Cycle-averaging buffer
+    static constexpr int BUF_LEN = 128;
+    float rate_buf[BUF_LEN];
+    int buf_idx;
+    float rate_sum;
 };
 
 #define SOGI_HIST_LEN 8

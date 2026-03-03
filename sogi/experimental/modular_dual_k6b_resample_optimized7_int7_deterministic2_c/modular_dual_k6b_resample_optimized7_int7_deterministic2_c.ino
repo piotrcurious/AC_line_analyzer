@@ -36,6 +36,7 @@
 // ── Global objects ──────────────────────────────────────────────────────────
 SOGIVisualizer     vis;
 TripleSOGIAnalyzer analyzer(NOMINAL_FREQ, SOGI_K);
+SlidingGNAnalyzer  gn_analyzer(NOMINAL_FREQ, 3, 128);
 
 // ── DMA frame ring ──────────────────────────────────────────────────────────
 struct TimestampedFrame {
@@ -276,6 +277,7 @@ void IRAM_ATTR processIncomingDMA() {
 
                     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
                     analyzer.process(v_val - v_dc_offset, ts_virtual);
+                    gn_analyzer.addSample(v_val, ts_virtual);
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
@@ -365,6 +367,7 @@ void IRAM_ATTR loop() {
     int   curr_head_idx       = (int)(buf_wr % SAMPLES_PER_CYCLE);
     int   aligned_start       = (int)((curr_head_idx + SAMPLES_PER_CYCLE - (int)(samples_back + 0.5f)) % SAMPLES_PER_CYCLE);
 
+    gn_analyzer.solve(6); // Run GN solver once per cycle
     last_cycle_boundary_samples = buf_wr;
     updateTimingParameters(analyzer.grid_freq);
 
@@ -398,7 +401,12 @@ void IRAM_ATTR loop() {
         sm.interp_total       = interp_ok_count + interp_fail_count;
         sm.vdc = Q16_TO_FLOAT(v_dc_offset);
         sm.idc = Q16_TO_FLOAT(i_dc_offset);
-        sm.h3ratio = analyzer.h3_ratio;
+
+        // Use GN analyzer for H3 ratio estimation
+        float gn_m1 = sqrtf(gn_analyzer.ReC()[0]*gn_analyzer.ReC()[0] + gn_analyzer.ImC()[0]*gn_analyzer.ImC()[0] + 1e-9f);
+        float gn_m3 = sqrtf(gn_analyzer.ReC()[2]*gn_analyzer.ReC()[2] + gn_analyzer.ImC()[2]*gn_analyzer.ImC()[2]);
+        sm.h3ratio = gn_m3 / gn_m1;
+
         interp_ok_count = 0; interp_fail_count = 0;
         xQueueSend(logQueue, &sm, 0);
     }

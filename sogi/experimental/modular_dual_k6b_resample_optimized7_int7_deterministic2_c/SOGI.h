@@ -84,4 +84,77 @@ private:
        float rate_err;
 };
 
+class SlidingGNAnalyzer {
+public:
+    // Constructor: nominal frequency (Hz), number of harmonics K, window length N
+    SlidingGNAnalyzer(float nominal_freq_hz, int K, int N);
+    ~SlidingGNAnalyzer();
+
+    // Add one sample (q16 fixed point) with sample time delta ts (seconds) since previous sample.
+    void IRAM_ATTR addSample(q16_t sample, float ts);
+
+    // Run GN solver using the current window. Returns true if solver converged.
+    bool solve(int max_iters = 6, int max_harmonics = -1);
+
+    // Combined helper: add sample then run solver
+    bool processSampleAndSolve(q16_t sample, float ts, int max_iters = 6);
+
+    // Outputs after solve:
+    float grid_freq = 50.0f;    // estimated fundamental frequency (Hz)
+    float grid_phase = 0.0f;    // estimated fundamental phase (radians)
+    float offset = 0.0f;        // estimated DC offset
+
+    float *ReC() { return reC; }
+    float *ImC() { return imC; }
+    int K() const { return Kharm; }
+    int N() const { return Nwin; }
+
+    // Tuning knobs:
+    float quant_lsb = 1.0f / 65536.0f; // Adjusted for Q16
+    float lambda_init = 1e-3f;
+    float lambda_scale_up = 10.0f;
+    float lambda_scale_down = 0.1f;
+    float min_delta_norm = 1e-6f;
+
+private:
+    int Nwin;
+    int idx_head;
+    int samples_ready;
+    float *tbuf;   // absolute timestamps in seconds
+    float *sbuf;   // floating samples
+    float cur_time;
+
+    int Kharm;
+    int P;          // number of parameters: [f, ReC1, ImC1, ..., ReCK, ImCK, offset]
+    float *p;       // parameter vector
+    float *delta_p; // update vector
+
+    float *reC;
+    float *imC;
+
+    float *JtJ;     // P x P normal matrix
+    float *Jtr;     // P vector
+    float *work;    // workspace
+
+    // Member workspace to avoid stack overflow on ESP32
+    float *JtJ_work;
+    float *Jtr_work;
+    float *p_work;
+    float *A_solver;
+    float *B_solver;
+    float *Ji_local;
+
+    float lambda;
+
+    void alloc_mem();
+    void free_mem();
+    void init_params_from_data(float init_f);
+    void buildResidualsAndJacobian(float *JtJ_out, float *Jtr_out, float sigma);
+    bool solve_normal_equations_and_apply(float *JtJ_in, float *Jtr_in, float *out_delta);
+
+    static void mat_zero(float *m, int rows, int cols);
+    static void vec_zero(float *v, int n);
+    static float hypot2_vec(float *v, int n);
+};
+
 #endif // SOGI_H

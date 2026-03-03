@@ -276,6 +276,7 @@ void IRAM_ATTR processIncomingDMA() {
 
                     float ts_virtual = (float)ticks_per_sample * inv_cpu_freq;
                     analyzer.process(v_val - v_dc_offset, ts_virtual);
+                    gn_analyzer.addSample(v_val, ts_virtual);
 
                     buf_wr++;
                     next_sample_time += ticks_per_sample;
@@ -365,6 +366,7 @@ void IRAM_ATTR loop() {
     int   curr_head_idx       = (int)(buf_wr % SAMPLES_PER_CYCLE);
     int   aligned_start       = (int)((curr_head_idx + SAMPLES_PER_CYCLE - (int)(samples_back + 0.5f)) % SAMPLES_PER_CYCLE);
 
+    gn_analyzer.solve(6); // Run GN solver once per cycle
     last_cycle_boundary_samples = buf_wr;
     updateTimingParameters(analyzer.grid_freq);
 

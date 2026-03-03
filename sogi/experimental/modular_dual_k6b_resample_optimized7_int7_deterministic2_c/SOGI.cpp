@@ -12,6 +12,9 @@
 static constexpr float TWO_PI_F = 2.0f * M_PI;
 static constexpr float OMEGA_MIN = TWO_PI_F * 5.0f;
 
+/**
+ * @brief High-precision fixed-point multiplication (Q40.30)
+ */
 static inline int64_t q40_30_mul(int64_t a, int32_t b) {
     int64_t a_hi = a >> 30;
     int64_t a_lo = a & 0x3FFFFFFF;
@@ -31,6 +34,8 @@ void IRAM_ATTR SOGI::updateCoefficients(float omega, float ts) {
     float wts  = omega * ts;
     float wts2 = wts * wts;
     float k_wts = k * wts;
+
+    // Guard against division by zero if ts is 0
     float den = 4.0f + 2.0f * k_wts + wts2;
     float det = (den > 1e-12f) ? (1.0f / den) : 0.25f; 
 
@@ -51,13 +56,20 @@ void IRAM_ATTR SOGI::step(q16_t u, float omega, float ts) {
     if (!coeff_valid || fabsf(omega - last_omega) > 0.1f || fabsf(ts - last_ts) > 1e-9f) {
         updateCoefficients(omega, ts);
     }
+
     q40_t u_40 = Q16_TO_Q40(u);
+
+    // Filter A (Bandpass - Alpha)
     q40_t in_a = u_40 - q40_30_mul(wz1_a, a_a1) - q40_30_mul(wz2_a, a_a2);
     q40_t va_40 = q40_30_mul(in_a, a_b0) + q40_30_mul(wz2_a, a_b2);
+
     v_alpha = Q40_TO_Q16(va_40);
     wz2_a = wz1_a; wz1_a = in_a;
+
+    // Filter B (Lowpass - Beta)
     q40_t in_b = u_40 - q40_30_mul(wz1_b, a_a1) - q40_30_mul(wz2_b, a_a2);
     q40_t vb_40 = q40_30_mul(in_b, b_b0) + q40_30_mul(wz1_b, b_b1) + q40_30_mul(wz2_b, b_b2);
+
     v_beta = Q40_TO_Q16(vb_40);
     wz2_b = wz1_b; wz1_b = in_b;
 }
@@ -73,41 +85,60 @@ void TripleSOGIAnalyzer::init() {
     sogi_nom.init(); sogi_pll.init(); sogi_3pll.init();
     grid_freq = nominal_freq; grid_phase = 0.0f;
     prev_nom_phase = 0.0f; buf_idx = 0; 
+
+    // Kahan/High-precision Init
     rate_sum = 0.0f;
     rate_err = 0.0f; 
     for (int i=0; i<BUF_LEN; i++) rate_buf[i] = 0.0f;
 }
 
 void IRAM_ATTR TripleSOGIAnalyzer::process(q16_t input, float ts) {
+    // 1. Reject 3rd harmonic to isolate fundamental
     sogi_3pll.step(input, 3.0f * TWO_PI_F * grid_freq, ts);
     q16_t clean_input = input - sogi_3pll.v_alpha;
+
+    // 2. Filter fundamental
     sogi_nom.step(clean_input, TWO_PI_F * nominal_freq, ts);
     sogi_pll.step(clean_input, TWO_PI_F * grid_freq, ts);
+
     float nom_alpha = Q16_TO_FLOAT(sogi_nom.v_alpha);
     float nom_beta = Q16_TO_FLOAT(sogi_nom.v_beta);
     float current_nom_phase = atan2f(nom_alpha, -nom_beta);
+
+    // Robust Phase Unwrapping for frequency estimation
     float dp = current_nom_phase - prev_nom_phase;
     if (dp > M_PI)  dp -= TWO_PI_F;
     if (dp < -M_PI) dp += TWO_PI_F;
     prev_nom_phase = current_nom_phase;
+
     float freq_inst = dp / (TWO_PI_F * fmaxf(ts, 1e-9f));
+
+    // --- Kahan Summation for rate_sum (sliding window frequency solver) ---
+    // Subtract old value with error compensation
     float y_sub = -rate_buf[buf_idx] - rate_err;
     float t_sub = rate_sum + y_sub;
     rate_err = (t_sub - rate_sum) - y_sub;
     rate_sum = t_sub;
+
+    // Add new value with error compensation
     rate_buf[buf_idx] = freq_inst;
     float y_add = freq_inst - rate_err;
     float t_add = rate_sum + y_add;
     rate_err = (t_add - rate_sum) - y_add;
     rate_sum = t_add;
+
     buf_idx = (buf_idx + 1) % BUF_LEN;
     grid_freq = rate_sum / (float)BUF_LEN;
+
+    // Output Updates
     v_alpha = sogi_pll.v_alpha;
     v_beta  = sogi_pll.v_beta;
+
     float va_f = Q16_TO_FLOAT(v_alpha);
     float vb_f = Q16_TO_FLOAT(v_beta);
     float v3a_f = Q16_TO_FLOAT(sogi_3pll.v_alpha);
     float v3b_f = Q16_TO_FLOAT(sogi_3pll.v_beta);
+
     grid_phase = atan2f(va_f, -vb_f);
     v_mag = sqrtf(va_f * va_f + vb_f * vb_f + 1e-12f);
     v_mag_3rd = sqrtf(v3a_f * v3a_f + v3b_f * v3b_f);
@@ -119,8 +150,8 @@ void IRAM_ATTR TripleSOGIAnalyzer::process(q16_t input, float ts) {
 // ==============================
 
 SlidingGNAnalyzer::SlidingGNAnalyzer(float nominal_freq_hz, int K, int N)
-    : Nwin(N), idx_head(0), samples_ready(0), cur_time(0.0f),
-      Kharm(K), P(1 + 2 * K + 1), lambda(1e-3f) {
+    : Nwin(N), idx_head(0), samples_ready(0), cur_time(0.0),
+      Kharm(K), P(1 + 2 * K + 1), lambda(1e-3f), last_solve_time(0.0) {
     alloc_mem();
     for (int i = 0; i < P; i++) p[i] = 0.0f;
     p[0] = nominal_freq_hz;
@@ -134,7 +165,7 @@ SlidingGNAnalyzer::~SlidingGNAnalyzer() {
 }
 
 void SlidingGNAnalyzer::alloc_mem() {
-    tbuf = (float*)calloc(Nwin, sizeof(float));
+    tbuf = (double*)calloc(Nwin, sizeof(double));
     sbuf = (float*)calloc(Nwin, sizeof(float));
     p = (float*)calloc(P, sizeof(float));
     delta_p = (float*)calloc(P, sizeof(float));
@@ -150,6 +181,8 @@ void SlidingGNAnalyzer::alloc_mem() {
     A_solver = (float*)calloc(P * P, sizeof(float));
     B_solver = (float*)calloc(P, sizeof(float));
     Ji_local = (float*)calloc(P, sizeof(float));
+    re_acc   = (float*)calloc(Kharm, sizeof(float));
+    im_acc   = (float*)calloc(Kharm, sizeof(float));
 }
 
 void SlidingGNAnalyzer::free_mem() {
@@ -169,10 +202,12 @@ void SlidingGNAnalyzer::free_mem() {
     if (A_solver) free(A_solver);
     if (B_solver) free(B_solver);
     if (Ji_local) free(Ji_local);
+    if (re_acc)   free(re_acc);
+    if (im_acc)   free(im_acc);
 }
 
 void IRAM_ATTR SlidingGNAnalyzer::addSample(q16_t sample, float ts) {
-    cur_time += ts;
+    cur_time += (double)ts;
     float s = Q16_TO_FLOAT(sample);
     tbuf[idx_head] = cur_time;
     sbuf[idx_head] = s;
@@ -190,13 +225,12 @@ void SlidingGNAnalyzer::init_params_from_data(float init_f) {
     if (samples_ready == 0) return;
 
     // Simple DFT-like projection to initialize amplitudes
-    float re_acc[Kharm], im_acc[Kharm];
     for (int k = 0; k < Kharm; k++) { re_acc[k] = 0.0f; im_acc[k] = 0.0f; }
     float offs = 0.0f;
 
     for (int i = 0; i < samples_ready; i++) {
         int idx = (idx_head + (Nwin - samples_ready) + i) % Nwin;
-        float t = tbuf[idx] - cur_time;
+        float t = (float)(tbuf[idx] - cur_time);
         float s = sbuf[idx];
         offs += s;
         for (int k = 1; k <= Kharm; k++) {
@@ -236,12 +270,12 @@ float SlidingGNAnalyzer::hypot2_vec(float *v, int n) {
 }
 
 // Internal cost function: sum of squared residuals
-static float calculateCost(int nSamples, int Nwin, int idx_head, float* tbuf, float* sbuf, float* p, int Kharm, int P, float cur_time) {
+static float calculateCost(int nSamples, int Nwin, int idx_head, double* tbuf, float* sbuf, float* p, int Kharm, int P, double cur_time) {
     float f = p[0];
     float cost = 0.0f;
     for (int i = 0; i < nSamples; i++) {
         int b_idx = (idx_head + (Nwin - nSamples) + i) % Nwin;
-        float t = tbuf[b_idx] - cur_time;
+        float t = (float)(tbuf[b_idx] - cur_time);
         float s = sbuf[b_idx];
         float m = p[P - 1];
         for (int k = 1; k <= Kharm; k++) {
@@ -260,12 +294,12 @@ void SlidingGNAnalyzer::buildResidualsAndJacobian(float *JtJ_out, float *Jtr_out
     float f = p[0];
     int nSamples = samples_ready;
     if (nSamples == 0) return;
-    float t_ref = cur_time;
+    double t_ref = cur_time;
     float inv_var = 1.0f / (sigma * sigma);
 
     for (int i = 0; i < nSamples; i++) {
         int b_idx = (idx_head + (Nwin - nSamples) + i) % Nwin;
-        float t = tbuf[b_idx] - t_ref;
+        float t = (float)(tbuf[b_idx] - t_ref);
         float s = sbuf[b_idx];
         float m = p[P - 1];
 
@@ -339,12 +373,27 @@ bool SlidingGNAnalyzer::solve_normal_equations_and_apply(float *JtJ_in, float *J
     return true;
 }
 
-bool SlidingGNAnalyzer::solve(int max_iters, int max_harmonics) {
+bool SlidingGNAnalyzer::solve(int max_iters) {
     if (samples_ready < 16) return false;
-    int old_Kharm = Kharm;
-    if (max_harmonics > 0 && max_harmonics < Kharm) Kharm = max_harmonics;
 
-    // Check if amplitudes are zero - if so, we need to initialize
+    // Relativistic phase adjustment: if time has advanced since last solve,
+    // shift phasors to latest time reference to keep phase estimate current.
+    float dt = (float)(cur_time - last_solve_time);
+    if (dt > 0 && dt < 1.0) {
+        float f = p[0];
+        for (int k = 1; k <= Kharm; k++) {
+            float ang = TWO_PI_F * k * f * dt;
+            float cos_a = cosf(ang);
+            float sin_a = sinf(ang);
+            float re_old = p[1 + 2 * (k - 1)];
+            float im_old = p[1 + 2 * (k - 1) + 1];
+            // New = Old * exp(j*ang)
+            p[1 + 2 * (k - 1)]     = re_old * cos_a - im_old * sin_a;
+            p[1 + 2 * (k - 1) + 1] = re_old * sin_a + im_old * cos_a;
+        }
+    }
+    last_solve_time = cur_time;
+
     bool all_zero = true;
     for (int k=0; k<Kharm; k++) {
         if (fabsf(p[1+2*k]) > 1e-6f || fabsf(p[1+2*k+1]) > 1e-6f) { all_zero = false; break; }
@@ -370,6 +419,7 @@ bool SlidingGNAnalyzer::solve(int max_iters, int max_harmonics) {
 
         for (int i = 0; i < P; i++) {
             for (int j = 0; j < P; j++) JtJ_work[i * P + j] = JtJ[i * P + j];
+            // Levenberg-Marquardt Damping
             JtJ_work[i * P + i] = JtJ_work[i * P + i] * (1.0f + lambda) + lambda;
         }
 
@@ -377,6 +427,10 @@ bool SlidingGNAnalyzer::solve(int max_iters, int max_harmonics) {
             lambda *= lambda_scale_up;
             continue;
         }
+
+        // Limit frequency step per iteration to 0.2Hz to avoid wild transients
+        if (delta_p[0] > 0.2f) delta_p[0] = 0.2f;
+        if (delta_p[0] < -0.2f) delta_p[0] = -0.2f;
 
         for (int i = 0; i < P; i++) { p_work[i] = p[i] + delta_p[i]; }
 
@@ -393,6 +447,10 @@ bool SlidingGNAnalyzer::solve(int max_iters, int max_harmonics) {
         }
     }
 
+    // Clamp estimated frequency to reasonable grid limits
+    if (p[0] < 40.0f) p[0] = 40.0f;
+    if (p[0] > 70.0f) p[0] = 70.0f;
+
     grid_freq = p[0];
     for (int k = 0; k < Kharm; k++) {
         reC[k] = p[1 + 2 * k];
@@ -401,9 +459,6 @@ bool SlidingGNAnalyzer::solve(int max_iters, int max_harmonics) {
     offset = p[P - 1];
     if (Kharm >= 1) {
         grid_phase = atan2f(imC[0], reC[0]);
-        while (grid_phase > M_PI) grid_phase -= TWO_PI_F;
-        while (grid_phase <= -M_PI) grid_phase += TWO_PI_F;
     }
-    Kharm = old_Kharm;
     return converged;
 }

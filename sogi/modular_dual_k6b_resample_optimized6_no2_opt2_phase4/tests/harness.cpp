@@ -24,7 +24,7 @@ typedef struct {
 #define MAX_SAMPLES_PER_CYCLE 256
 #define NOMINAL_FREQ 50.0f
 #define SOGI_K 0.7071f
-#define FLL_GAMMA 2000.0f
+#define FLL_GAMMA 200000.0f
 #define ADC_OVERSAMPLE_RATE 250000
 #define HARMONIC_SMOOTH_ALPHA 0.05f
 #define SOGI3_HARMONIC_THRESHOLD 0.1f
@@ -35,8 +35,10 @@ uint32_t samples_per_cycle = 128;
 uint32_t cpu_freq_hz = 240000000;
 float inv_cpu_freq = 1.0f / 240000000.0f;
 uint32_t cycles_per_adc_sample = 240000000 / (ADC_OVERSAMPLE_RATE / 2);
-double ticks_per_sample_d = 0;
-double next_sample_time_d = 0;
+uint32_t ticks_per_sample_int = 0;
+double ticks_per_sample_frac = 0;
+uint32_t next_sample_int = 0;
+double next_sample_frac = 0;
 float v_dc_offset = 1650.0f;
 float i_dc_offset = 1650.0f;
 bool dc_bootstrap_done = false;
@@ -56,10 +58,11 @@ SOGIFLL pll(NOMINAL_FREQ, FLL_GAMMA);
 
 struct ResamplerState {
     uint32_t last_frame_end_ts = 0;
-    double   acc_v = 0.0;
-    double   acc_i = 0.0;
-    double   acc_weight = 0.0;
-    uint32_t last_hw_ts = 0;
+    float    acc_v = 0.0f;
+    float    acc_i = 0.0f;
+    float    acc_weight = 0.0f;
+    uint32_t prev_hw_ts = 0;
+    float    prev_hw_frac = 0.0f;
     bool     initialized = false;
 } resamp;
 
@@ -76,7 +79,9 @@ static inline float adcRawToMillivolts(uint16_t raw) {
 static inline void updateTimingParameters(float frequency) {
     float fc = (frequency < 40.0f) ? 40.0f : (frequency > 90.0f ? 90.0f : frequency);
     double cycle_duration_ticks = (double)cpu_freq_hz / (double)fc;
-    ticks_per_sample_d = cycle_duration_ticks / (double)samples_per_cycle;
+    double tps_d = cycle_duration_ticks / (double)samples_per_cycle;
+    ticks_per_sample_int = (uint32_t)tps_d;
+    ticks_per_sample_frac = tps_d - (double)ticks_per_sample_int;
 }
 
 static inline int32_t signed_time_diff(uint32_t a, uint32_t b) {
@@ -126,62 +131,70 @@ void processFrame(const std::vector<adc_digi_output_data_t>& frame_data, uint32_
 
         if (!resamp.initialized) {
             resamp.last_frame_end_ts = frame_end_ts;
-            resamp.last_hw_ts = ts;
+            resamp.prev_hw_ts = ts;
+            resamp.prev_hw_frac = 0.0f;
             resamp.initialized = true;
-            if (next_sample_time_d == 0) next_sample_time_d = (double)ts;
+            next_sample_int = ts;
+            next_sample_frac = 0;
             continue;
         }
 
-        double dt = (double)signed_time_diff(ts, resamp.last_hw_ts);
-        if (dt < 0) dt = 0;
+        while (signed_time_diff(ts, next_sample_int) >= 0) {
+            float d_win = (float)signed_time_diff(next_sample_int, resamp.prev_hw_ts) + (float)next_sample_frac - resamp.prev_hw_frac;
+            if (d_win < 0.0f) d_win = 0.0f;
 
-        while (signed_time_diff(ts, (uint32_t)next_sample_time_d) >= 0) {
-            double d_win = next_sample_time_d - (double)resamp.last_hw_ts;
-            if (d_win < 0) d_win = 0;
-
-            resamp.acc_v += (double)fv * d_win;
-            resamp.acc_i += (double)fi * d_win;
+            resamp.acc_v += fv * d_win;
+            resamp.acc_i += fi * d_win;
             resamp.acc_weight += d_win;
 
-            if (resamp.acc_weight > 0) {
-                float v_val = (float)(resamp.acc_v / resamp.acc_weight);
-                float i_val = (float)(resamp.acc_i / resamp.acc_weight);
+            float v_val, i_val;
+            float ts_virtual = (float)(ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
 
-                v_buf[buf_wr % spc] = v_val;
-                i_buf[buf_wr % spc] = i_val;
-
-                float ts_virtual = (float)ticks_per_sample_d * inv_cpu_freq;
-                sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-                sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
-
-                float mag1 = sqrt(sogi_v.v_alpha * sogi_v.v_alpha + sogi_v.v_beta * sogi_v.v_beta);
-                float mag3 = sqrt(sogi_v3.v_alpha * sogi_v3.v_alpha + sogi_v3.v_beta * sogi_v3.v_beta);
-                harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
-                harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
-
-                float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-
-                pll.update(v_val - v_dc_offset, sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
-
-                buf_wr++;
+            if (resamp.acc_weight > 0.0f) {
+                v_val = resamp.acc_v / resamp.acc_weight;
+                i_val = resamp.acc_i / resamp.acc_weight;
                 interp_ok_count++;
-
-                std::cout << std::fixed << std::setprecision(6)
-                          << "V_SAMPLE," << v_val << "," << pll.freq << "," << mag1 << "," << ratio << "," << 0.0 << std::endl;
             } else {
+                v_val = v_dc_offset;
+                i_val = i_dc_offset;
                 interp_fail_count++;
             }
 
+            v_buf[buf_wr % spc] = v_val;
+            i_buf[buf_wr % spc] = i_val;
+
+            sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
+            sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
+
+            float mag1 = sqrt(sogi_v.v_alpha * sogi_v.v_alpha + sogi_v.v_beta * sogi_v.v_beta);
+            float mag3 = sqrt(sogi_v3.v_alpha * sogi_v3.v_alpha + sogi_v3.v_beta * sogi_v3.v_beta);
+            harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
+            harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
+
+            float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
+
+            pll.update(v_val - v_dc_offset, sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
+
+            buf_wr++;
+            std::cout << std::fixed << std::setprecision(6)
+                      << "V_SAMPLE," << v_val << "," << pll.freq << "," << mag1 << "," << ratio << "," << 0.0 << std::endl;
+
             resamp.acc_v = 0; resamp.acc_i = 0; resamp.acc_weight = 0;
-            resamp.last_hw_ts = (uint32_t)next_sample_time_d;
-            next_sample_time_d += ticks_per_sample_d;
-            dt = (double)signed_time_diff(ts, resamp.last_hw_ts);
-            if (dt < 0) dt = 0;
+            resamp.prev_hw_ts = next_sample_int;
+            resamp.prev_hw_frac = (float)next_sample_frac;
+
+            next_sample_frac += ticks_per_sample_frac;
+            next_sample_int  += ticks_per_sample_int + (uint32_t)next_sample_frac;
+            next_sample_frac -= (uint32_t)next_sample_frac;
         }
-        resamp.acc_v += (double)fv * dt;
-        resamp.acc_i += (double)fi * dt;
-        resamp.acc_weight += dt;
-        resamp.last_hw_ts = ts;
+
+        float d_rem = (float)signed_time_diff(ts, resamp.prev_hw_ts) - resamp.prev_hw_frac;
+        if (d_rem < 0.0f) d_rem = 0.0f;
+        resamp.acc_v += fv * d_rem;
+        resamp.acc_i += fi * d_rem;
+        resamp.acc_weight += d_rem;
+        resamp.prev_hw_ts = ts;
+        resamp.prev_hw_frac = 0.0f;
     }
     resamp.last_frame_end_ts = frame_end_ts;
 }

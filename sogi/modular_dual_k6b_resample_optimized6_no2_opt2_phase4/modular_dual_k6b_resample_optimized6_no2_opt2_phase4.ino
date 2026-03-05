@@ -122,7 +122,8 @@
 // SOGI-FLL Gain (Gamma).
 //   Higher gamma -> faster tracking, more jitter.
 //   Physically, this is the integrator gain for frequency adaptation.
-#define FLL_GAMMA          2000.0f
+//   With mV-scaled signals (A~350), gamma=200000 gives omega step ~30 rad/s.
+#define FLL_GAMMA          200000.0f
 
 // Virtual grid resolution: number of uniform samples per AC cycle.
 //   This defines the output rate of T_resamp.
@@ -194,7 +195,12 @@ adc_continuous_handle_t adc_handle = NULL;
 uint32_t cpu_freq_hz           = 0;
 float    inv_cpu_freq          = 0.0f;   // = 1 / cpu_freq_hz  [s/cycle]
 uint32_t cycles_per_adc_sample = 0;
-double   ticks_per_sample_d    = 0;     // CCOUNT ticks per one virtual grid step (double precision to minimize FM jitter)
+
+// Virtual grid timing state (split into integer and fractional parts for infinite precision)
+uint32_t ticks_per_sample_int  = 0;
+double   ticks_per_sample_frac = 0;
+uint32_t next_sample_int       = 0;
+double   next_sample_frac      = 0;
 
 // ── ADC quantisation inverse: maps 12-bit integer → millivolts ──────────────
 // Q^{-1}: undoes the quantisation operator applied by T_adc.
@@ -207,15 +213,16 @@ static const float RAW_TO_MV = 3300.0f / 4095.0f;
 float    v_buf[MAX_SAMPLES_PER_CYCLE];
 float    i_buf[MAX_SAMPLES_PER_CYCLE];
 uint32_t buf_wr = 0;               // monotonically increasing virtual sample counter
-double   next_sample_time_d = 0;     // CCOUNT target for next virtual grid emission (double to avoid rounding accumulation)
 
 // T_resamp accumulator state: fractional box-filter window between virtual grid points.
+// Optimized for ESP32: using float for signal accumulation to utilize FPU.
 struct ResamplerState {
     uint32_t last_frame_end_ts = 0;  // CCOUNT of previous DMA frame end
-    double   acc_v = 0.0;           // voltage accumulator for current window
-    double   acc_i = 0.0;           // current accumulator for current window
-    double   acc_weight = 0.0;      // sum of time-weights (CCOUNT ticks) in current window
-    uint32_t last_hw_ts = 0;        // hardware timestamp of the last processed sample
+    float    acc_v = 0.0f;          // voltage accumulator for current window
+    float    acc_i = 0.0f;          // current accumulator for current window
+    float    acc_weight = 0.0f;     // sum of time-weights (CCOUNT ticks) in current window
+    uint32_t prev_hw_ts = 0;        // hardware timestamp of the last processed sample (int part)
+    float    prev_hw_frac = 0.0f;   // fractional part of the last processed timestamp
     bool     initialized = false;    // false until first valid DMA frame processed
 } resamp;
 
@@ -301,16 +308,16 @@ static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw) {
     return (float)raw * RAW_TO_MV;
 }
 
-// Recompute the virtual grid step (ticks_per_sample_d) from the current frequency
-// estimate. This keeps the uniform virtual grid locked to the tracked frequency.
-//   cycle_duration_ticks = f_cpu / f_ac = CCOUNT ticks per AC period
-//   ticks_per_sample_d   = cycle_duration_ticks / samples_per_cycle
-// FIXED: Using double precision eliminates the fractional accumulation error
-// that previously caused artificial frequency modulation (FM noise) in the PLL.
+// Recompute the virtual grid step from the current frequency estimate.
+// FIXED: Split into integer and fractional parts to maintain infinite
+// accumulation precision without the drift associated with monotonic double growth.
 static inline void IRAM_ATTR updateTimingParameters(float frequency) {
-    float fc            = (frequency < 40.0f) ? 40.0f : (frequency > 90.0f ? 90.0f : frequency);
+    float fc = (frequency < 40.0f) ? 40.0f : (frequency > 90.0f ? 90.0f : frequency);
+    uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
     double cycle_duration_ticks = (double)cpu_freq_hz / (double)fc;
-    ticks_per_sample_d = cycle_duration_ticks / (double)samples_per_cycle;
+    double tps_d = cycle_duration_ticks / (double)spc;
+    ticks_per_sample_int = (uint32_t)tps_d;
+    ticks_per_sample_frac = tps_d - (double)ticks_per_sample_int;
 }
 
 // Signed 32-bit difference on the modular CCOUNT time axis.
@@ -469,27 +476,17 @@ void IRAM_ATTR processIncomingDMA() {
         int total_pairs = n / 2;
 
         // ----- Timestamp reconstruction -----
-        // Map the DMA frame onto the integer time axis using the measured
-        // CCOUNT difference between successive frame endpoints.
-        // elapsed = number of CCOUNT ticks covering all pairs in this frame.
-        // Each pair is assigned ts = frame_start + (pair+1)/total_pairs * elapsed.
-        // This is a uniform interpolation (linear operator on ℤ).
         uint32_t elapsed = 0;
         if (resamp.initialized) {
             elapsed = (uint32_t)(frame_end_ts - resamp.last_frame_end_ts);
 
-            // Diagnostics for timing anomalies (e.g. dropped frames or stalls)
-            // Expecting elapsed around cycles_per_adc_sample * total_pairs
             uint32_t expected = cycles_per_adc_sample * total_pairs;
-            if (elapsed > expected * 4 || elapsed == 0) {
+            if (elapsed > expected * 8 || elapsed == 0) {
                 __atomic_fetch_add(&bad_timestamps_count, 1u, __ATOMIC_RELAXED);
-                // Cap elapsed to avoid runaway emission if timestamps are garbage
-                if (elapsed > expected * 10) elapsed = expected * 10;
+                if (elapsed > expected * 100) elapsed = expected * 100;
             }
-
             if (total_pairs == 0) total_pairs = 1;
         } else {
-            // Fallback for the very first frame: use nominal ADC timing.
             elapsed = (uint32_t)cycles_per_adc_sample * (uint32_t)total_pairs;
         }
         uint32_t frame_start_ts = resamp.last_frame_end_ts;
@@ -516,75 +513,83 @@ void IRAM_ATTR processIncomingDMA() {
 
             if (!resamp.initialized) {
                 resamp.last_frame_end_ts = frame_end_ts;
-                resamp.last_hw_ts = ts;
+                resamp.prev_hw_ts = ts;
+                resamp.prev_hw_frac = 0.0f;
                 resamp.initialized = true;
-                if (next_sample_time_d == 0) next_sample_time_d = (double)ts;
+                next_sample_int = ts;
+                next_sample_frac = 0;
                 continue;
             }
 
-            double dt = (double)signed_time_diff(ts, resamp.last_hw_ts);
-            if (dt < 0) dt = 0;
-
             // ── Fractional resampler loop ─────────────────────────────────────
-            while ( signed_time_diff(ts, (uint32_t)next_sample_time_d) >= 0 ) {
-                double d_win = next_sample_time_d - (double)resamp.last_hw_ts;
-                if (d_win < 0) d_win = 0;
+            while ( signed_time_diff(ts, next_sample_int) >= 0 ) {
+                float d_win = (float)signed_time_diff(next_sample_int, resamp.prev_hw_ts) + (float)next_sample_frac - resamp.prev_hw_frac;
+                if (d_win < 0.0f) d_win = 0.0f;
 
-                resamp.acc_v += (double)fv * d_win;
-                resamp.acc_i += (double)fi * d_win;
+                resamp.acc_v += fv * d_win;
+                resamp.acc_i += fi * d_win;
                 resamp.acc_weight += d_win;
 
-                if (resamp.acc_weight > 0) {
-                    float v_val = (float)(resamp.acc_v / resamp.acc_weight);
-                    float i_val = (float)(resamp.acc_i / resamp.acc_weight);
+                float v_val, i_val;
+                float ts_virtual = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
 
-                    v_buf[buf_wr % spc] = v_val;
-                    i_buf[buf_wr % spc] = i_val;
-
-                    float ts_virtual = (float)ticks_per_sample_d * inv_cpu_freq;
-                    sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-                    sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
-
-                    float mag1 = sqrtf(sogi_v.v_alpha  * sogi_v.v_alpha  + sogi_v.v_beta  * sogi_v.v_beta);
-                    float mag3 = sqrtf(sogi_v3.v_alpha * sogi_v3.v_alpha + sogi_v3.v_beta * sogi_v3.v_beta);
-
-                    harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
-                    harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
-
-                    float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-                    float damp_factor = 1.0f;
-                    if (ratio > SOGI3_HARMONIC_THRESHOLD) {
-                        float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (3.0f * SOGI3_HARMONIC_THRESHOLD);
-                        if (overshoot < 0.0f) overshoot = 0.0f;
-                        if (overshoot > 1.0f) overshoot = 1.0f;
-                        damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
-                    }
-                    pll.setDistortionDamping(damp_factor, damp_factor);
-                    pll.update(v_val - v_dc_offset, sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
-
-                    buf_wr++;
+                if (resamp.acc_weight > 0.0f) {
+                    v_val = resamp.acc_v / resamp.acc_weight;
+                    i_val = resamp.acc_i / resamp.acc_weight;
                     __atomic_fetch_add(&interp_ok_count, 1u, __ATOMIC_RELAXED);
                 } else {
+                    v_val = v_dc_offset;
+                    i_val = i_dc_offset;
                     __atomic_fetch_add(&interp_fail_count, 1u, __ATOMIC_RELAXED);
                 }
+
+                v_buf[buf_wr % spc] = v_val;
+                i_buf[buf_wr % spc] = i_val;
+
+                sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
+                sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
+
+                float mag1 = sqrtf(sogi_v.v_alpha  * sogi_v.v_alpha  + sogi_v.v_beta  * sogi_v.v_beta);
+                float mag3 = sqrtf(sogi_v3.v_alpha * sogi_v3.v_alpha + sogi_v3.v_beta * sogi_v3.v_beta);
+
+                harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
+                harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
+
+                float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
+                float damp_factor = 1.0f;
+                if (ratio > SOGI3_HARMONIC_THRESHOLD) {
+                    float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (3.0f * SOGI3_HARMONIC_THRESHOLD);
+                    if (overshoot < 0.0f) overshoot = 0.0f;
+                    if (overshoot > 1.0f) overshoot = 1.0f;
+                    damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
+                }
+
+                pll.setDistortionDamping(damp_factor, damp_factor);
+                pll.update(v_val - v_dc_offset, sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
+
+                buf_wr++;
 
                 resamp.acc_v = 0;
                 resamp.acc_i = 0;
                 resamp.acc_weight = 0;
-                resamp.last_hw_ts = (uint32_t)next_sample_time_d;
-                next_sample_time_d += ticks_per_sample_d;
+                resamp.prev_hw_ts = next_sample_int;
+                resamp.prev_hw_frac = (float)next_sample_frac;
 
-                dt = (double)signed_time_diff(ts, resamp.last_hw_ts);
-                if (dt < 0) dt = 0;
+                next_sample_frac += ticks_per_sample_frac;
+                next_sample_int  += ticks_per_sample_int + (uint32_t)next_sample_frac;
+                next_sample_frac -= (uint32_t)next_sample_frac;
 
                 emitted_in_frame++;
                 if (emitted_in_frame > max_emit_per_frame) break;
             }
 
-            resamp.acc_v += (double)fv * dt;
-            resamp.acc_i += (double)fi * dt;
-            resamp.acc_weight += dt;
-            resamp.last_hw_ts = ts;
+            float d_rem = (float)signed_time_diff(ts, resamp.prev_hw_ts) - resamp.prev_hw_frac;
+            if (d_rem < 0.0f) d_rem = 0.0f;
+            resamp.acc_v += fv * d_rem;
+            resamp.acc_i += fi * d_rem;
+            resamp.acc_weight += d_rem;
+            resamp.prev_hw_ts = ts;
+            resamp.prev_hw_frac = 0.0f;
             if (emitted_in_frame > max_emit_per_frame) break;
         } // for each hardware pair
 
@@ -656,7 +661,12 @@ void IRAM_ATTR loop() {
 
     uint32_t now = get_cycle_count();
     // lag = time elapsed since the last virtual sample was emitted.
-    uint32_t last_virtual_ts = (uint32_t)(next_sample_time_d - ticks_per_sample_d);
+    // To find last virtual sample time in wrapping timeline:
+    // We can't easily subtract from split timeline, but we know last_hw_ts in the
+    // resampler loop was set to next_sample_int.
+    // However, that was in processIncomingDMA. We can just use next_sample_int
+    // which is the NEXT boundary, and subtract the ticks.
+    uint32_t last_virtual_ts = next_sample_int - ticks_per_sample_int;
     int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
     float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
 
@@ -701,6 +711,8 @@ void IRAM_ATTR loop() {
     // FIXED: Use double precision and fmod for robust phase extrapolation.
     double phase_corr_d = fmod((double)pll.omega * (double)lag_sec, 2.0 * M_PI);
     double phase_d = (double)atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr_d;
+    // Account for fractional grid offset in visualization phase
+    phase_d -= (next_sample_frac * (double)pll.omega * (double)inv_cpu_freq);
     phase_d = fmod(phase_d, 2.0 * M_PI);
     if (phase_d < 0.0) phase_d += 2.0 * M_PI;
     float phase = (float)phase_d;

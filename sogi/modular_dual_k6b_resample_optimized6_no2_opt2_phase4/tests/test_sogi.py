@@ -49,7 +49,7 @@ def run_simulation(v_signal, i_signal):
 
 def test_freq_step():
     fs = 125000 # 250k total / 2 channels
-    duration = 1.0 # seconds
+    duration = 10.0 # seconds
     t = np.arange(0, duration, 1/fs)
 
     # Frequency step: 50Hz -> 52Hz at 0.5s

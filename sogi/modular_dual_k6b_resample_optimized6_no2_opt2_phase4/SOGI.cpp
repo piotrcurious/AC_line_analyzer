@@ -21,7 +21,8 @@ static constexpr float TWO_PI_F = 6.2831853071795864769f;
 static constexpr float OMEGA_MIN = TWO_PI_F * 5.0f;
 
 // MAG_EPS: regularisation addend in the magnitude computation.
-static constexpr float MAG_EPS = 1e-6f;
+// Using 100.0f (10mV RMS threshold) to prevent runaway updates on noise.
+static constexpr float MAG_EPS = 100.0f;
 
 // =============================================================================
 //  P_sogi — Bandpass Projection Operator
@@ -72,7 +73,9 @@ void IRAM_ATTR SOGI::updateCoefficients(float omega, float ts)
 
 void IRAM_ATTR SOGI::step(float input, float omega, float ts)
 {
-    if (!coeff_valid || fabsf(omega - last_omega) > 0.01f || fabsf(ts - last_ts) > 1e-9f) {
+    // Increased deadband to 1.0 rad/s (~0.16Hz) to prevent excessive
+    // coefficient recalculation (and tanf calls) when omega is jittery.
+    if (!coeff_valid || fabsf(omega - last_omega) > 1.0f || fabsf(ts - last_ts) > 1e-9f) {
         updateCoefficients(omega, ts);
     }
 

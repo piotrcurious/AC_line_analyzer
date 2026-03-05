@@ -1,7 +1,14 @@
 #ifndef SOGI_H
 #define SOGI_H
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#else
+#include <cmath>
+#include <cstring>
+#include <cstdint>
+#define IRAM_ATTR
+#endif
 
 class SOGI {
 public:
@@ -10,10 +17,10 @@ public:
     void reset();
 
     // Process a single sample
-    void IRAM_ATTR step(float input, float omega, float ts);
+    void step(float input, float omega, float ts);
 
     // Process a window of samples (for batch processing)
-    void IRAM_ATTR processWindow(const float* buffer, int bufLen, int startIdx, int count, float omega, float ts, float offset = 0.0f);
+    void processWindow(const float* buffer, int bufLen, int startIdx, int count, float omega, float ts, float offset = 0.0f);
 
     float v_alpha;
     float v_beta;
@@ -34,56 +41,26 @@ private:
     void IRAM_ATTR updateCoefficients(float omega, float ts);
 };
 
-class FrequencyAdaptivePLL {
+class SOGIFLL {
 public:
-    FrequencyAdaptivePLL(float nominal_freq, float kp, float ki);
+    SOGIFLL(float nominal_freq, float gamma);
     void init();
-    void IRAM_ATTR update(float v_alpha, float v_beta, float ts);
+    void update(float u, float v_alpha, float v_beta, float ts);
 
     float freq;
     float omega;
-    float mag_smooth;
-    float integral;
-    float integral_err_c; // Kahan summation correction
-    float kp, ki;
     float nominal_freq;
+    float gamma;
+    float mag_smooth;
 
-protected:
-    static constexpr float MAG_ALPHA = 1.0f;
-};
-
-#define SOGI_HIST_LEN 8
-const float PHASE_DEADBAND = 0.001f;  // Adjust based on your noise level
-
-class AdaptivePLL : public FrequencyAdaptivePLL {
-public:
-    AdaptivePLL(float nominal_freq, float kp, float ki, float learn_rate = 0.1001f);
-    void init();
-    void IRAM_ATTR update(float v_alpha, float v_beta, float ts);
-
-    float integral_state;
-    float i_term;
-    float last_control_action;
-    float gain_est;
-    float learn_rate;
-
-    float control_hist[SOGI_HIST_LEN];
-    float phase_hist[SOGI_HIST_LEN];
-    uint8_t hist_idx;
-// --- new members (public or protected as you prefer)
-float p_scale = 1.0f;        // multiplies kp inside update()
-float learn_scale = 1.0f;    // multiplies effective learn_rate inside update()
-
-inline void setDistortionDamping(float new_p_scale, float new_learn_scale) {
-    // clamp sensible ranges
-    if (new_p_scale < 0.0f) new_p_scale = 0.0f;
-    if (new_p_scale > 1.0f) new_p_scale = 1.0f;
-    if (new_learn_scale < 0.0f) new_learn_scale = 0.0f;
-    if (new_learn_scale > 1.0f) new_learn_scale = 1.0f;
-    p_scale = new_p_scale;
-    learn_scale = new_learn_scale;
-}
-
+    // Compatibility for main loop
+    float gamma_scale = 1.0f;
+    inline void setDistortionDamping(float new_p_scale, float new_learn_scale) {
+        (void)new_learn_scale;
+        if (new_p_scale < 0.0f) new_p_scale = 0.0f;
+        if (new_p_scale > 1.0f) new_p_scale = 1.0f;
+        gamma_scale = new_p_scale;
+    }
 };
 
 #endif // SOGI_H

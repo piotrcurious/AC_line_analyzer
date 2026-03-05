@@ -119,12 +119,10 @@
 //   K = 1/√2 ≈ 0.7071 gives a Butterworth-like (maximally flat) bandpass profile.
 #define SOGI_K             0.7071f
 
-// PLL loop filter gains.
-//   KP sets the proportional gain of Φ_pll.
-//   FIXED: KI > 0 means this is a Type-2 loop, which tracks a constant
-//   frequency offset with zero steady-state phase error.
-#define PLL_KP             2.55f
-#define PLL_KI             50.0f
+// SOGI-FLL Gain (Gamma).
+//   Higher gamma -> faster tracking, more jitter.
+//   Physically, this is the integrator gain for frequency adaptation.
+#define FLL_GAMMA          2000.0f
 
 // Virtual grid resolution: number of uniform samples per AC cycle.
 //   This defines the output rate of T_resamp.
@@ -170,7 +168,7 @@ uint32_t samples_per_cycle = 128;
 SOGIVisualizer vis;
 SOGI           sogi_v(SOGI_K);          // P_sogi:  fundamental projection
 SOGI           sogi_v3(SOGI3_K);        // P_sogi3: 3rd-harmonic projection
-AdaptivePLL    pll(NOMINAL_FREQ, PLL_KP, PLL_KI, 0.1001f);  // Φ_pll
+SOGIFLL        pll(NOMINAL_FREQ, FLL_GAMMA); // Φ_fll (using 'pll' name for minimal code churn)
 
 // ── T_adc output ring: timestamped DMA frames ───────────────────────────────
 // Each frame is a raw snapshot from the ADC DMA engine with a hardware
@@ -211,12 +209,13 @@ float    i_buf[MAX_SAMPLES_PER_CYCLE];
 uint32_t buf_wr = 0;               // monotonically increasing virtual sample counter
 double   next_sample_time_d = 0;     // CCOUNT target for next virtual grid emission (double to avoid rounding accumulation)
 
-// T_resamp accumulator state: box-filter window between virtual grid points.
+// T_resamp accumulator state: fractional box-filter window between virtual grid points.
 struct ResamplerState {
     uint32_t last_frame_end_ts = 0;  // CCOUNT of previous DMA frame end
-    float    acc_v = 0.0f;           // voltage accumulator for current window
-    float    acc_i = 0.0f;           // current accumulator for current window
-    int      acc_count = 0;          // number of hardware samples in window
+    double   acc_v = 0.0;           // voltage accumulator for current window
+    double   acc_i = 0.0;           // current accumulator for current window
+    double   acc_weight = 0.0;      // sum of time-weights (CCOUNT ticks) in current window
+    uint32_t last_hw_ts = 0;        // hardware timestamp of the last processed sample
     bool     initialized = false;    // false until first valid DMA frame processed
 } resamp;
 
@@ -463,6 +462,7 @@ void IRAM_ATTR processIncomingDMA() {
         int n = sz / sizeof(adc_digi_output_data_t);
         if (n <= 0) {
             rd = (rd + 1) % FRAME_BUFFER_SIZE;
+            __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
             continue;
         }
 
@@ -498,7 +498,6 @@ void IRAM_ATTR processIncomingDMA() {
         int emitted_in_frame = 0;
 
         for (int pair = 0; pair < total_pairs; ++pair) {
-            // Demultiplex interleaved V/I channels.
             int i = pair * 2;
             uint16_t rv = 0, ri = 0;
             if (p[i].type1.channel == V_CHANNEL) rv = p[i].type1.data;
@@ -508,77 +507,51 @@ void IRAM_ATTR processIncomingDMA() {
                 else if (p[i+1].type1.channel == I_CHANNEL) ri = p[i+1].type1.data;
             }
 
-            // Apply Q^{-1}: integer code → millivolts
             float fv = adcRawToMillivolts(rv);
             float fi = adcRawToMillivolts(ri);
 
-            // Integer-interpolated timestamp for this pair (wrap-safe uint64 multiply).
             uint32_t ts = frame_start_ts + (uint32_t)(
                 ((uint64_t)(pair + 1) * (uint64_t)elapsed) / (uint64_t)total_pairs
             );
 
             if (!resamp.initialized) {
-                // Seed the timestamp state on the first valid pair.
                 resamp.last_frame_end_ts = frame_end_ts;
+                resamp.last_hw_ts = ts;
                 resamp.initialized = true;
-                if (next_sample_time_d == 0) next_sample_time_d = (double)frame_end_ts;
-                resamp.acc_v += fv;
-                resamp.acc_i += fi;
-                resamp.acc_count++;
+                if (next_sample_time_d == 0) next_sample_time_d = (double)ts;
                 continue;
             }
 
-            // Accumulate into box-filter window (T_resamp numerator).
-            resamp.acc_v += fv;
-            resamp.acc_i += fi;
-            resamp.acc_count++;
+            double dt = (double)signed_time_diff(ts, resamp.last_hw_ts);
+            if (dt < 0) dt = 0;
 
-            // ── Virtual grid emission ─────────────────────────────────────────
-            // Fire whenever this pair's timestamp reaches or passes the next
-            // virtual grid point. Multiple emissions can occur if the ADC
-            // ran faster than expected (e.g. after a dropped frame).
+            // ── Fractional resampler loop ─────────────────────────────────────
             while ( signed_time_diff(ts, (uint32_t)next_sample_time_d) >= 0 ) {
+                double d_win = next_sample_time_d - (double)resamp.last_hw_ts;
+                if (d_win < 0) d_win = 0;
 
-                if (resamp.acc_count > 0) {
-                    // ── T_resamp: box-filter average → virtual sample ─────────
-                    float inv_count = 1.0f / (float)resamp.acc_count;
-                    float v_val = resamp.acc_v * inv_count;
-                    float i_val = resamp.acc_i * inv_count;
+                resamp.acc_v += (double)fv * d_win;
+                resamp.acc_i += (double)fi * d_win;
+                resamp.acc_weight += d_win;
+
+                if (resamp.acc_weight > 0) {
+                    float v_val = (float)(resamp.acc_v / resamp.acc_weight);
+                    float i_val = (float)(resamp.acc_i / resamp.acc_weight);
 
                     v_buf[buf_wr % spc] = v_val;
                     i_buf[buf_wr % spc] = i_val;
 
-                    // Virtual time step in seconds (used as Δt by all operators below).
                     float ts_virtual = (float)ticks_per_sample_d * inv_cpu_freq;
-
-                    // ── P_sogi: advance the fundamental bandpass projection ───
-                    // Input: DC-removed voltage sample.
-                    // Output: sogi_v.v_alpha (in-phase), sogi_v.v_beta (quadrature)
-                    // at the fundamental frequency ω̂.
                     sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-
-                    // ── P_sogi3: advance the 3rd-harmonic projection ──────────
-                    // Input: same DC-removed signal.
-                    // Output: sogi_v3.v_alpha, sogi_v3.v_beta at 3·ω̂.
                     sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
 
-                    // ── Harmonic magnitude: Euclidean norm in projection space ─
-                    // |P_sogi(x)|  = √(α² + β²) at ω̂
-                    // |P_sogi3(x)| = √(α3² + β3²) at 3ω̂
                     float mag1 = sqrtf(sogi_v.v_alpha  * sogi_v.v_alpha  + sogi_v.v_beta  * sogi_v.v_beta);
                     float mag3 = sqrtf(sogi_v3.v_alpha * sogi_v3.v_alpha + sogi_v3.v_beta * sogi_v3.v_beta);
 
-                    // ── EMA smoothing of projection norms ─────────────────────
                     harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
                     harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
 
-                    // ── Distortion gate: gain-scheduled attenuation ───────────
-                    // ratio = |P_sogi3| / |P_sogi| ≈ 3rd harmonic fraction (THD proxy)
                     float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-
-                    // damp_factor: maps ratio ∈ [threshold, threshold×4] → gain ∈ [1, DAMP_MIN]
-                    // Linear interpolation (describing-function approximation of
-                    // the nonlinear gate).
                     float damp_factor = 1.0f;
                     if (ratio > SOGI3_HARMONIC_THRESHOLD) {
                         float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (3.0f * SOGI3_HARMONIC_THRESHOLD);
@@ -586,54 +559,32 @@ void IRAM_ATTR processIncomingDMA() {
                         if (overshoot > 1.0f) overshoot = 1.0f;
                         damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
                     }
+                    pll.setDistortionDamping(damp_factor, damp_factor);
+                    pll.update(v_val - v_dc_offset, sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
 
-                    // learn_att: smooth gate on the PLL integrator.
-                    // FIXED: replaced binary switching with a smooth function (damp_factor)
-                    // to avoid step discontinuities in loop gain.
-                    float learn_att = damp_factor;
-
-                    pll.setDistortionDamping(damp_factor, learn_att);
-
-                    // ── Φ_pll: feed quadrature pair into the loop ─────────────
-                    // Distortion damping is applied internally to the loop filter
-                    // via setDistortionDamping().
-                    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
-
-                    // Advance virtual write pointer and grid clock.
                     buf_wr++;
-                    next_sample_time_d += ticks_per_sample_d;
                     __atomic_fetch_add(&interp_ok_count, 1u, __ATOMIC_RELAXED);
-
                 } else {
-                    // Empty window: no hardware samples arrived before this virtual
-                    // grid point.
-                    // FIXED: fill buffer with DC offset to avoid stale data.
-                    v_buf[buf_wr % spc] = v_dc_offset;
-                    i_buf[buf_wr % spc] = i_dc_offset;
-
-                    buf_wr++;
-                    next_sample_time_d += ticks_per_sample_d;
                     __atomic_fetch_add(&interp_fail_count, 1u, __ATOMIC_RELAXED);
-                    emitted_in_frame++;
-                    if (emitted_in_frame > max_emit_per_frame) {
-                        // indicates a run of missed frames or timing mismatch
-                        __atomic_fetch_add(&bad_timestamps_count, 1u, __ATOMIC_RELAXED);
-                        break;
-                    }
-                    continue;
                 }
 
-                // ── Emission safety limiter ───────────────────────────────────
-                // Prevents a runaway emission loop if timestamps are inconsistent
-                // (e.g. after a dropped frame gives a large elapsed value).
-                resamp.acc_v = 0.0f;
-                resamp.acc_i = 0.0f;
-                resamp.acc_count = 0;
+                resamp.acc_v = 0;
+                resamp.acc_i = 0;
+                resamp.acc_weight = 0;
+                resamp.last_hw_ts = (uint32_t)next_sample_time_d;
+                next_sample_time_d += ticks_per_sample_d;
+
+                dt = (double)signed_time_diff(ts, resamp.last_hw_ts);
+                if (dt < 0) dt = 0;
 
                 emitted_in_frame++;
                 if (emitted_in_frame > max_emit_per_frame) break;
+            }
 
-            } // while virtual grid fires
+            resamp.acc_v += (double)fv * dt;
+            resamp.acc_i += (double)fi * dt;
+            resamp.acc_weight += dt;
+            resamp.last_hw_ts = ts;
             if (emitted_in_frame > max_emit_per_frame) break;
         } // for each hardware pair
 

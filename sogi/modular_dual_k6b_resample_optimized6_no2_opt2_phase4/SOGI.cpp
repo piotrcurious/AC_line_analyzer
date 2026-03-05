@@ -385,11 +385,10 @@ void FrequencyAdaptivePLL::init()
 //   The clamp prevents the loop from pulling ω to zero or diverging.
 //   Range ±50% around nominal handles most grid frequency deviations.
 //
-// SHORTCOMING: the anti-windup is applied after the frequency clamp, not
-// before. If f_new is clamped, the integral continues to accumulate beyond
-// the useful range, causing integrator windup. The integral should be
-// conditionally frozen when the frequency clamp is active (back-calculation
-// anti-windup).
+// FIXED: Tracking Anti-Windup (Back-Calculation) is implemented.
+// If the frequency output is saturated, the integrator state is forced to
+// the value it would need to exactly hit the clamp. This prevents
+// integrator windup and ensures immediate recovery.
 void IRAM_ATTR FrequencyAdaptivePLL::update(
     float v_alpha,
     float v_beta,
@@ -400,28 +399,43 @@ void IRAM_ATTR FrequencyAdaptivePLL::update(
     float inv_mag   = fast_rsqrt(mag_sq);
     float raw_p_err = v_beta * inv_mag;   // ε ≈ sin(Δφ) ≈ Δφ
 
+    // Proportional term
+    float p_term = kp * raw_p_err;
+
     // Kahan-compensated integral accumulation: ∫ε·dt ≈ Σ ε(k)·Ts
-    float y = (ki * raw_p_err * ts) - integral_err_c;
+    // Integration is performed on raw_p_err; Ki is applied afterward.
+    float y = (raw_p_err * ts) - integral_err_c;
     float t = integral + y;
     integral_err_c = (t - integral) - y;
     integral = t;
 
-    // Hard clamp on integral term (basic anti-windup).
-    // SHORTCOMING: does not freeze integral when frequency is saturated.
-    const float I_MAX = 5.0f;
-    if      (integral >  I_MAX) integral =  I_MAX;
-    else if (integral < -I_MAX) integral = -I_MAX;
+    float i_term = ki * integral;
 
-    float control = kp * raw_p_err + integral;
+    // Map control output to frequency estimate
+    float control_unclamped = p_term + i_term;
+    float f_new = nominal_freq + control_unclamped;
 
-    // Map control output to frequency estimate, clamp to ±50% of nominal.
-    float f_new = nominal_freq + control;
+    // Clamp the output to ±50% of nominal.
     float f_max = nominal_freq * 1.5f;
     float f_min = nominal_freq * 0.6f;
-    if      (f_new > f_max) f_new = f_max;
-    else if (f_new < f_min) f_new = f_min;
+    float f_clamped = f_new;
+    if      (f_new > f_max) f_clamped = f_max;
+    else if (f_new < f_min) f_clamped = f_min;
 
-    freq  = f_new;
+    // Tracking Anti-Windup (Back-Calculation)
+    // If the frequency output is saturated, we force the integrator state to
+    // the value it would need to exactly hit the clamp. This prevents
+    // integrator windup and ensures immediate recovery when the error reverses.
+    if (f_new != f_clamped) {
+        float control_clamped = f_clamped - nominal_freq;
+        i_term = control_clamped - p_term;
+        if (fabsf(ki) > 1e-9f) {
+            integral = i_term / ki;
+        }
+        integral_err_c = 0.0f; // Reset Kahan compensator on saturation
+    }
+
+    freq  = f_clamped;
     omega = TWO_PI_F * freq;
 }
 
@@ -471,11 +485,13 @@ void AdaptivePLL::init()
 //
 // The adaptive layer adds two mechanisms on top of Φ_pll_base (Type-2):
 //
-//  1. Online loop-gain identification (NLMS update):
+//  1. Online loop-gain identification (NLMS update) and Adaptive Gain Control:
 //       model:       Δε(k) = gain_est · u(k−1)
 //       error:       e_g   = Δε(k) − gain_est · u(k−1)
 //       NLMS update: gain_est += η · u(k−1) · e_g / (u(k−1)² + ε)
 //     where η = learn_rate × learn_scale (gate from harmonic detector).
+//     Adaptive scaling: adapt_kp/ki = kp/ki / gain_est. This maintains a
+//     consistent open-loop crossover frequency despite signal gain variations.
 //
 //  2. Phase deadband (PHASE_DEADBAND): proportional and integral terms are
 //     frozen when |ε| < PHASE_DEADBAND, reducing jitter when the PLL is
@@ -525,54 +541,55 @@ void IRAM_ATTR AdaptivePLL::update(
         if (gain_est > 5.0f)  gain_est = 5.0f;
     }
 
+    // PI gains are adaptively scaled by the inverse of the estimated loop gain
+    // to maintain a consistent open-loop crossover frequency.
+    // This closes the loop on the online system identification.
+    float inv_gain = 1.0f / (gain_est + 1e-6f);
+    float adapt_kp = kp * inv_gain;
+    float adapt_ki = ki * inv_gain;
+
     // ── PI loop filter with phase deadband ────────────────────────────────────
     float p_term = 0.0f;
     if (fabsf(raw_p_err) > PHASE_DEADBAND) {
-        // FIXED: Apply p_scale to the error entering the PI filter.
-        // In a normalised PLL, scaling the input alpha/beta is ineffective;
-        // we must scale the loop gains or the discriminator output.
-        // This transforms the loop into a gain-scheduled Type-2 system.
+        // Apply p_scale (distortion gate) to the phase error.
         float gated_p_err = raw_p_err * p_scale;
 
         // Proportional term
-        p_term = (kp * gated_p_err);
+        p_term = adapt_kp * gated_p_err;
 
         // Kahan-compensated integral accumulation.
-        // Integration rate is scaled by p_scale (distortion gate).
         float y = (gated_p_err * ts) - integral_err_c;
         float t = integral_state + y;
         integral_err_c = (t - integral_state) - y;
         integral_state = t;
-
-        i_term = ki * integral_state;
     }
-    // Outside deadband: p_term = 0, i_term unchanged (hold last value).
+    // Outside deadband: p_term = 0, integral_state is held.
 
-    // ── Integrator anti-windup (back-calculation) ─────────────────────────────
-    // FIXED: ki == 0 handled to avoid divide-by-zero.
-    const float I_MAX = 5.0f;
-    if (i_term > I_MAX) {
-        i_term = I_MAX;
-        if (fabsf(ki) > 1e-9f) integral_state = i_term / ki;
-        else integral_state = 0.0f;
-        integral_err_c = 0.0f;
-    } else if (i_term < -I_MAX) {
-        i_term = -I_MAX;
-        if (fabsf(ki) > 1e-9f) integral_state = i_term / ki;
-        else integral_state = 0.0f;
-        integral_err_c = 0.0f;
-    }
+    i_term = adapt_ki * integral_state;
 
-    // ── Frequency update ──────────────────────────────────────────────────────
-    // FIXED: added frequency clamp (same as Φ_pll_base).
-    float control = p_term + i_term;
-    float f_new = nominal_freq + control;
+    // ── Frequency update and Tracking Anti-Windup ─────────────────────────────
+    float control_unclamped = p_term + i_term;
+    float f_new = nominal_freq + control_unclamped;
+
+    // Clamp to ±50% of nominal.
     float f_max = nominal_freq * 1.5f;
     float f_min = nominal_freq * 0.6f;
-    if      (f_new > f_max) f_new = f_max;
-    else if (f_new < f_min) f_new = f_min;
+    float f_clamped = f_new;
+    if      (f_new > f_max) f_clamped = f_max;
+    else if (f_new < f_min) f_clamped = f_min;
 
-    freq  = f_new;
+    // Back-calculate the integrator if saturation occurred.
+    // This prevents integrator windup and ensures immediate recovery.
+    if (f_new != f_clamped) {
+        float control_clamped = f_clamped - nominal_freq;
+        i_term = control_clamped - p_term;
+        if (fabsf(adapt_ki) > 1e-9f) {
+            integral_state = i_term / adapt_ki;
+        }
+        integral_err_c = 0.0f; // Reset Kahan compensator on saturation
+    }
+
+    freq  = f_clamped;
     omega = TWO_PI_F * freq;
 
     // ── History update ────────────────────────────────────────────────────────

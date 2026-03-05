@@ -41,7 +41,7 @@
  *             Extracts the 3rd harmonic component of the input.
  *             Ratio |P_sogi3| / |P_sogi| = THD proxy for 3rd harmonic.
  *
- *  Φ_pll    : Phase-frequency estimator. A nonlinear feedback operator.
+ *  Φ_pll    : Type-2 phase-frequency estimator. A nonlinear feedback operator.
  *             Input: quadrature pair {α, β} from P_sogi.
  *             Output: instantaneous frequency estimate ω̂ and phase φ̂.
  *             The error signal is the cross-product (α·cos(φ̂) − β·sin(φ̂)),
@@ -56,8 +56,8 @@
  *             To track continuous phase we lift from S¹ to its covering space ℝ
  *             by accumulating the winding number. This is the standard covering-map
  *             construction: φ_unwrapped = φ_wrapped + 2π·k, k ∈ ℤ.
- *             FIXED: the winding counter (phase_track.phase_offset) is periodically
- *             normalized to maintain float32 precision and prevent overflow.
+ *             FIXED: the winding counter is maintained as an integer (winding)
+ *             to prevent long-run floating point truncation drift.
  *
  * HARMONIC DAMPING (distortion gate)
  * ────────────────────────────────────
@@ -78,8 +78,8 @@
  *
  * OPTIMIZATIONS APPLIED
  * ────────────────────────────────────────────────────────────────
- *  1. FIXED: PLL_KI = 50.0f transforms loop into Type-1, giving zero
- *     steady-state frequency error.
+ *  1. FIXED: PLL_KI = 50.0f transforms loop into Type-2, giving zero
+ *     steady-state phase error when tracking frequency offsets.
  *  2. FIXED: HARMONIC_SMOOTH_ALPHA = 0.05 provides proper EMA smoothing
  *     for distortion metrics.
  *  3. FIXED: logTask reads harmonic ratio via snapshot queue to prevent
@@ -121,8 +121,8 @@
 
 // PLL loop filter gains.
 //   KP sets the proportional gain of Φ_pll.
-//   FIXED: KI > 0 means this is a Type-1 loop, which tracks a constant
-//   frequency offset with zero steady-state error.
+//   FIXED: KI > 0 means this is a Type-2 loop, which tracks a constant
+//   frequency offset with zero steady-state phase error.
 #define PLL_KP             2.55f
 #define PLL_KI             50.0f
 
@@ -233,13 +233,12 @@ bool  dc_bootstrap_done = false;
 // ── Phase covering-map state (S¹ → ℝ lifting) ───────────────────────────────
 // atan2 returns phase on S¹ ≅ [−π, π). To make the phase observable as a
 // monotonically increasing quantity we lift to the universal cover ℝ by
-// tracking the integer winding number (phase_track.phase_offset accumulates ±2π).
-// BUG: phase_offset grows without bound. Normalise periodically to avoid
-// float32 precision loss at large accumulated values (~10^7 rad after ~30 h).
+// tracking the integer winding number.
+// FIXED: maintain winding count as int32_t to avoid floating-point drift.
 struct PhaseTrack {
-    float prev_phase   = 0.0f;
-    float phase_offset = 0.0f;   // accumulated 2π winding correction
-    bool  initialized  = false;
+    float   prev_phase  = 0.0f;
+    int32_t winding     = 0;      // accumulated 2π winding number
+    bool    initialized = false;
 } phase_track;
 
 // ── Resampler quality counters ───────────────────────────────────────────────
@@ -595,13 +594,10 @@ void IRAM_ATTR processIncomingDMA() {
 
                     pll.setDistortionDamping(damp_factor, learn_att);
 
-                    // ── Φ_pll: feed gate-weighted quadrature pair into the loop ─
-                    // The gate multiplies {α, β} by damp_factor before the phase
-                    // discriminator, reducing the effective loop gain under distortion.
-                    float alpha_in = sogi_v.v_alpha * damp_factor;
-                    float beta_in  = sogi_v.v_beta  * damp_factor;
-
-                    pll.update(alpha_in, beta_in, ts_virtual);
+                    // ── Φ_pll: feed quadrature pair into the loop ─────────────
+                    // Distortion damping is applied internally to the loop filter
+                    // via setDistortionDamping().
+                    pll.update(sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
 
                     // Advance virtual write pointer and grid clock.
                     buf_wr++;
@@ -760,29 +756,22 @@ void IRAM_ATTR loop() {
 
     // ── S¹ → ℝ covering map (phase unwrap) ───────────────────────────────────
     // Detect a jump of magnitude > π between successive wrapped phases and
-    // correct by adding ±2π to the accumulated offset.
-    // FIXED: phase_offset is periodically normalized to maintain float32 precision.
+    // correct by updating the winding number.
     if (phase_track.initialized) {
         float delta = phase - phase_track.prev_phase;
-        if      (delta < -(float)PI) phase_track.phase_offset += 2.0f * (float)PI;
-        else if (delta >  (float)PI) phase_track.phase_offset -= 2.0f * (float)PI;
-
-        // Periodic normalization (every 500 periods) to maintain float32 precision.
-        const float NORM_STEP = 500.0f * 2.0f * (float)PI;
-        if (phase_track.phase_offset > NORM_STEP) {
-            phase_track.phase_offset -= NORM_STEP;
-        } else if (phase_track.phase_offset < -NORM_STEP) {
-            phase_track.phase_offset += NORM_STEP;
-        }
+        if      (delta < -(float)PI) phase_track.winding++;
+        else if (delta >  (float)PI) phase_track.winding--;
     } else {
         phase_track.initialized = true;
     }
     phase_track.prev_phase = phase;
 
-    float unwrapped  = phase + phase_track.phase_offset;
-    // Normalise back to [0, 2π) for the cycle-alignment computation.
-    float phase_norm = fmodf(unwrapped, 2.0f * (float)PI);
-    if (phase_norm < 0.0f) phase_norm += 2.0f * (float)PI;
+    // Use double precision to compute unwrapped phase and normalization to
+    // prevent truncation errors.
+    double unwrapped_d = (double)phase + (double)phase_track.winding * 2.0 * M_PI;
+    double phase_norm_d = fmod(unwrapped_d, 2.0 * M_PI);
+    if (phase_norm_d < 0.0) phase_norm_d += 2.0 * M_PI;
+    float phase_norm = (float)phase_norm_d;
 
     // ── Cycle-aligned buffer start index ─────────────────────────────────────
     // Compute how many virtual samples back the last zero-crossing was, then

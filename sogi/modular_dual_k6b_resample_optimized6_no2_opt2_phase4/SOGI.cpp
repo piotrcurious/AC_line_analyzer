@@ -5,8 +5,8 @@
  * This file implements three operators from the signal processing chain:
  *
  *   P_sogi          — Bandpass projection onto the quadrature subspace {α, β}
- *   Φ_pll_base      — Type-1 phase-frequency estimator (FrequencyAdaptivePLL)
- *   Φ_pll_adaptive  — Type-1 estimator with online loop-gain identification (AdaptivePLL)
+ *   Φ_pll_base      — Type-2 phase-frequency estimator (FrequencyAdaptivePLL)
+ *   Φ_pll_adaptive  — Type-2 estimator with online loop-gain identification (AdaptivePLL)
  *
  * ── P_sogi: Second-Order Generalised Integrator ──────────────────────────────
  *
@@ -55,8 +55,9 @@
  *     f̂ = f_nominal + u
  *     ω̂ = 2π·f̂
  *
- *   This is a Type-1 loop (one integrator in the forward path). It tracks
- *   a constant frequency offset with zero steady-state error (when Ki > 0).
+ *   This is a Type-2 loop (two integrators in the open-loop path: one from the
+ *   loop filter and one from the frequency-to-phase conversion). It tracks
+ *   a constant frequency offset with zero steady-state phase error (when Ki > 0).
  *
  *   SHORTCOMING: the discriminator uses v_β alone, which is the small-angle
  *   approximation to sin(Δφ). For large phase errors (|Δφ| > ~30°) the
@@ -334,7 +335,7 @@ void IRAM_ATTR SOGI::processWindow(
 }
 
 // =============================================================================
-//  Φ_pll_base — Type-1 Phase-Frequency Estimator
+//  Φ_pll_base — Type-2 Phase-Frequency Estimator
 // =============================================================================
 
 FrequencyAdaptivePLL::FrequencyAdaptivePLL(
@@ -356,6 +357,8 @@ void FrequencyAdaptivePLL::init()
 }
 
 // Advance Φ_pll_base by one virtual time step.
+//
+// This is a Type-2 loop (one integrator from the VCO, one from the PI loop filter).
 //
 // Phase discriminator:
 //   ε = v_β / |{v_α, v_β}|
@@ -423,7 +426,7 @@ void IRAM_ATTR FrequencyAdaptivePLL::update(
 }
 
 // =============================================================================
-//  Φ_pll_adaptive — Type-1 Estimator with Online Loop-Gain Identification
+//  Φ_pll_adaptive — Type-2 Estimator with Online Loop-Gain Identification
 // =============================================================================
 
 // SOGI_HIST_LEN must be a power of two so that the modular index wrap
@@ -466,7 +469,7 @@ void AdaptivePLL::init()
 
 // Advance Φ_pll_adaptive by one virtual time step.
 //
-// The adaptive layer adds two mechanisms on top of Φ_pll_base:
+// The adaptive layer adds two mechanisms on top of Φ_pll_base (Type-2):
 //
 //  1. Online loop-gain identification (NLMS update):
 //       model:       Δε(k) = gain_est · u(k−1)
@@ -525,11 +528,18 @@ void IRAM_ATTR AdaptivePLL::update(
     // ── PI loop filter with phase deadband ────────────────────────────────────
     float p_term = 0.0f;
     if (fabsf(raw_p_err) > PHASE_DEADBAND) {
-        // Proportional term: Kp is scaled by p_scale (harmonic distortion gate).
-        p_term = (kp * p_scale) * raw_p_err;
+        // FIXED: Apply p_scale to the error entering the PI filter.
+        // In a normalised PLL, scaling the input alpha/beta is ineffective;
+        // we must scale the loop gains or the discriminator output.
+        // This transforms the loop into a gain-scheduled Type-2 system.
+        float gated_p_err = raw_p_err * p_scale;
+
+        // Proportional term
+        p_term = (kp * gated_p_err);
 
         // Kahan-compensated integral accumulation.
-        float y = (raw_p_err * ts) - integral_err_c;
+        // Integration rate is scaled by p_scale (distortion gate).
+        float y = (gated_p_err * ts) - integral_err_c;
         float t = integral_state + y;
         integral_err_c = (t - integral_state) - y;
         integral_state = t;

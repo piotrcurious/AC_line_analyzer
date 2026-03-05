@@ -186,6 +186,8 @@ volatile uint32_t frame_write_idx    = 0;
 volatile uint32_t frame_read_idx     = 0;
 volatile uint32_t isr_callback_count = 0;
 volatile uint32_t frames_dropped     = 0;
+volatile uint32_t bad_timestamps_count = 0;
+volatile uint32_t dropped_snapshots_count = 0;
 
 adc_continuous_handle_t adc_handle = NULL;
 
@@ -223,10 +225,10 @@ uint32_t last_cycle_boundary_samples = 0;
 
 // ── DC component estimate (subtracted before P_sogi to remove offset) ────────
 // Tracked as a slow single-pole IIR over the virtual sample buffer.
-// SHORTCOMING: initialised at mid-rail (1650 mV). On a real signal that is
-// DC-biased differently the initial transient will be large.
+// FIXED: Bootstrap mechanism seeds initial DC offset from the first cycle of data.
 float v_dc_offset = 1650.0f;
 float i_dc_offset = 1650.0f;
+bool  dc_bootstrap_done = false;
 
 // ── Phase covering-map state (S¹ → ℝ lifting) ───────────────────────────────
 // atan2 returns phase on S¹ ≅ [−π, π). To make the phase observable as a
@@ -257,15 +259,19 @@ QueueHandle_t visQueue = NULL;
 QueueHandle_t logQueue = NULL;
 
 // Snapshot passed to the visualiser task: one complete virtual cycle snapshot.
+#define VIS_SNAPSHOT_COUNT 4
 struct VisSnapshot {
-    float *v_copy;
-    float *i_copy;
+    float v_copy[MAX_SAMPLES_PER_CYCLE];
+    float i_copy[MAX_SAMPLES_PER_CYCLE];
     int    aligned_start;   // index into circular buffer where the cycle starts
     int    count;           // number of samples in this snapshot
     float  pll_freq;
     float  pll_mag;
     float  vdc, idc;
+    bool   in_use;
 };
+
+VisSnapshot vis_snapshots[VIS_SNAPSHOT_COUNT];
 
 // Snapshot passed to the serial log task.
 // FIXED: harmonic ratio is included in the message to prevent data races.
@@ -274,6 +280,8 @@ struct SerialMsg {
     float core_us;
     uint32_t isr_callback_count;
     uint32_t frames_dropped;
+    uint32_t bad_timestamps;
+    uint32_t dropped_snapshots;
     uint32_t interp_ok;
     uint32_t interp_total;
     float vdc, idc;
@@ -336,7 +344,7 @@ static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
         // Ring full: evict oldest frame to make space (destructive overwrite).
         rd = (rd + 1) % FRAME_BUFFER_SIZE;
         __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
-        ++frames_dropped;
+        __atomic_fetch_add(&frames_dropped, 1u, __ATOMIC_RELAXED);
     }
 
     uint32_t sz = edata->size;
@@ -347,7 +355,7 @@ static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
     frame_buffer[wr].data_size     = (uint16_t)sz;
 
     __atomic_store_n(&frame_write_idx, next_wr, __ATOMIC_RELEASE);
-    ++isr_callback_count;
+    __atomic_fetch_add(&isr_callback_count, 1u, __ATOMIC_RELAXED);
     return false;
 }
 
@@ -384,15 +392,15 @@ bool initADCContinuous() {
 //  Visualiser task — receives one VisSnapshot per virtual cycle
 // =============================================================================
 void visTask(void *pv) {
-    VisSnapshot snap;
+    int snap_idx;
     for (;;) {
-        if (xQueueReceive(visQueue, &snap, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(visQueue, &snap_idx, portMAX_DELAY) == pdTRUE) {
+            VisSnapshot &snap = vis_snapshots[snap_idx];
             vis.update(snap.v_copy, snap.i_copy, snap.count,
                        snap.aligned_start, snap.count,
                        snap.pll_freq, snap.pll_mag,
                        snap.vdc, snap.idc);
-            heap_caps_free(snap.v_copy);
-            heap_caps_free(snap.i_copy);
+            __atomic_store_n(&snap.in_use, false, __ATOMIC_RELEASE);
         }
     }
 }
@@ -409,11 +417,13 @@ void logTask(void *pv) {
     for (;;) {
         if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
             Serial.printf(
-                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  Ok/Total:%lu/%lu  Vdc:%.1f Idc:%.1f  H3ratio:%.3f\n",
+                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  BadTS:%lu  DropSnap:%lu  Ok/Total:%lu/%lu  Vdc:%.1f Idc:%.1f  H3ratio:%.3f\n",
                 msg.pll_freq,
                 msg.core_us,
                 (unsigned long)msg.isr_callback_count,
                 (unsigned long)msg.frames_dropped,
+                (unsigned long)msg.bad_timestamps,
+                (unsigned long)msg.dropped_snapshots,
                 (unsigned long)msg.interp_ok,
                 (unsigned long)msg.interp_total,
                 msg.vdc, msg.idc,
@@ -443,6 +453,8 @@ void IRAM_ATTR processIncomingDMA() {
 
     if (rd == wr) return;
 
+    uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
+
     while (rd != wr) {
         volatile TimestampedFrame *f_ptr = &frame_buffer[rd];
         uint32_t frame_end_ts = f_ptr->end_timestamp;
@@ -466,12 +478,16 @@ void IRAM_ATTR processIncomingDMA() {
         uint32_t elapsed = 0;
         if (resamp.initialized) {
             elapsed = (uint32_t)(frame_end_ts - resamp.last_frame_end_ts);
-            // SHORTCOMING: if a frame was dropped (frames_dropped incremented),
-            // frame_end_ts - last_frame_end_ts spans 2 or more DMA periods.
-            // The interpolation below still distributes the pairs uniformly
-            // within this larger window, which is correct if the ADC ran
-            // continuously, but the virtual grid may emit multiple samples
-            // in one go, draining the accumulator prematurely.
+
+            // Diagnostics for timing anomalies (e.g. dropped frames or stalls)
+            // Expecting elapsed around cycles_per_adc_sample * total_pairs
+            uint32_t expected = cycles_per_adc_sample * total_pairs;
+            if (elapsed > expected * 4 || elapsed == 0) {
+                __atomic_fetch_add(&bad_timestamps_count, 1u, __ATOMIC_RELAXED);
+                // Cap elapsed to avoid runaway emission if timestamps are garbage
+                if (elapsed > expected * 10) elapsed = expected * 10;
+            }
+
             if (total_pairs == 0) total_pairs = 1;
         } else {
             // Fallback for the very first frame: use nominal ADC timing.
@@ -530,8 +546,8 @@ void IRAM_ATTR processIncomingDMA() {
                     float v_val = resamp.acc_v * inv_count;
                     float i_val = resamp.acc_i * inv_count;
 
-                    v_buf[buf_wr % samples_per_cycle] = v_val;
-                    i_buf[buf_wr % samples_per_cycle] = i_val;
+                    v_buf[buf_wr % spc] = v_val;
+                    i_buf[buf_wr % spc] = i_val;
 
                     // Virtual time step in seconds (used as Δt by all operators below).
                     float ts_virtual = (float)ticks_per_sample_d * inv_cpu_freq;
@@ -590,20 +606,24 @@ void IRAM_ATTR processIncomingDMA() {
                     // Advance virtual write pointer and grid clock.
                     buf_wr++;
                     next_sample_time_d += ticks_per_sample_d;
-                    interp_ok_count++;
+                    __atomic_fetch_add(&interp_ok_count, 1u, __ATOMIC_RELAXED);
 
                 } else {
                     // Empty window: no hardware samples arrived before this virtual
                     // grid point.
                     // FIXED: fill buffer with DC offset to avoid stale data.
-                    v_buf[buf_wr % samples_per_cycle] = v_dc_offset;
-                    i_buf[buf_wr % samples_per_cycle] = i_dc_offset;
+                    v_buf[buf_wr % spc] = v_dc_offset;
+                    i_buf[buf_wr % spc] = i_dc_offset;
 
                     buf_wr++;
                     next_sample_time_d += ticks_per_sample_d;
-                    interp_fail_count++;
+                    __atomic_fetch_add(&interp_fail_count, 1u, __ATOMIC_RELAXED);
                     emitted_in_frame++;
-                    if (emitted_in_frame > max_emit_per_frame) break;
+                    if (emitted_in_frame > max_emit_per_frame) {
+                        // indicates a run of missed frames or timing mismatch
+                        __atomic_fetch_add(&bad_timestamps_count, 1u, __ATOMIC_RELAXED);
+                        break;
+                    }
                     continue;
                 }
 
@@ -654,7 +674,8 @@ void setup() {
     vis.begin();
     initADCContinuous();
 
-    visQueue = xQueueCreate(4, sizeof(VisSnapshot));
+    visQueue = xQueueCreate(VIS_SNAPSHOT_COUNT, sizeof(int));
+    for (int i = 0; i < VIS_SNAPSHOT_COUNT; i++) vis_snapshots[i].in_use = false;
     logQueue = xQueueCreate(8, sizeof(SerialMsg));
     // Visualiser task on core 0, signal processing in loop() on core 1.
     xTaskCreatePinnedToCore(visTask, "visTask", 8192, NULL, tskIDLE_PRIORITY + 2, &visTaskHandle, 0);
@@ -681,8 +702,10 @@ void IRAM_ATTR loop() {
 
     processIncomingDMA();
 
+    uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
+
     // Gate: wait until a full virtual cycle's worth of new samples has been emitted.
-    if (buf_wr - last_cycle_boundary_samples < samples_per_cycle) return;
+    if (buf_wr - last_cycle_boundary_samples < spc) return;
 
     uint32_t now = get_cycle_count();
     // lag = time elapsed since the last virtual sample was emitted.
@@ -695,13 +718,22 @@ void IRAM_ATTR loop() {
     // Time constant = 1/(0.02 × 50 Hz) ≈ 1 second. Sufficient to reject mains
     // AC but responds slowly to amplifier offset drift.
     float v_sum = 0.0f, i_sum = 0.0f;
-    for (uint32_t k = 0; k < samples_per_cycle; ++k) {
+    for (uint32_t k = 0; k < spc; ++k) {
         v_sum += v_buf[k];
         i_sum += i_buf[k];
     }
-    float inv_n = 1.0f / (float)samples_per_cycle;
-    v_dc_offset = 0.98f * v_dc_offset + 0.02f * (v_sum * inv_n);
-    i_dc_offset = 0.98f * i_dc_offset + 0.02f * (i_sum * inv_n);
+    float inv_n = 1.0f / (float)spc;
+    float v_avg = v_sum * inv_n;
+    float i_avg = i_sum * inv_n;
+
+    if (!dc_bootstrap_done) {
+        v_dc_offset = v_avg;
+        i_dc_offset = i_avg;
+        dc_bootstrap_done = true;
+    } else {
+        v_dc_offset = 0.98f * v_dc_offset + 0.02f * v_avg;
+        i_dc_offset = 0.98f * i_dc_offset + 0.02f * i_avg;
+    }
 
     // Nominal virtual sample period in seconds (used as Δt below).
     float ts_virtual = (float)ticks_per_sample_d * inv_cpu_freq;
@@ -719,10 +751,12 @@ void IRAM_ATTR loop() {
     // of the signal (not the internal SOGI oscillator phase). The sign on
     // v_beta follows from the SOGI state convention: v_alpha leads v_beta by
     // π/2 at steady state, so atan2(α, −β) = atan2(sin φ, cos φ) = φ.
-    float phase_corr = pll.omega * lag_sec;
-    float phase = atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr;
-    if (phase < 0.0f) phase += 2.0f * (float)PI;
-    else if (phase > 2.0f * (float)PI) phase -= 2.0f * (float)PI;
+    // FIXED: Use double precision and fmod for robust phase extrapolation.
+    double phase_corr_d = fmod((double)pll.omega * (double)lag_sec, 2.0 * M_PI);
+    double phase_d = (double)atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr_d;
+    phase_d = fmod(phase_d, 2.0 * M_PI);
+    if (phase_d < 0.0) phase_d += 2.0 * M_PI;
+    float phase = (float)phase_d;
 
     // ── S¹ → ℝ covering map (phase unwrap) ───────────────────────────────────
     // Detect a jump of magnitude > π between successive wrapped phases and
@@ -733,11 +767,12 @@ void IRAM_ATTR loop() {
         if      (delta < -(float)PI) phase_track.phase_offset += 2.0f * (float)PI;
         else if (delta >  (float)PI) phase_track.phase_offset -= 2.0f * (float)PI;
 
-        // Periodic normalization
-        if (phase_track.phase_offset > 1000.0f * (float)PI) {
-            phase_track.phase_offset -= 1000.0f * (float)PI;
-        } else if (phase_track.phase_offset < -1000.0f * (float)PI) {
-            phase_track.phase_offset += 1000.0f * (float)PI;
+        // Periodic normalization (every 500 periods) to maintain float32 precision.
+        const float NORM_STEP = 500.0f * 2.0f * (float)PI;
+        if (phase_track.phase_offset > NORM_STEP) {
+            phase_track.phase_offset -= NORM_STEP;
+        } else if (phase_track.phase_offset < -NORM_STEP) {
+            phase_track.phase_offset += NORM_STEP;
         }
     } else {
         phase_track.initialized = true;
@@ -756,52 +791,46 @@ void IRAM_ATTR loop() {
     // samples_back        = fractional sample count corresponding to current phase.
     float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
     float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
-    int   curr_head_idx       = (int)(buf_wr % samples_per_cycle);
+    int   curr_head_idx       = (int)(buf_wr % spc);
     int   aligned_start       = (int)((curr_head_idx
-                                       + samples_per_cycle
+                                       + spc
                                        - (int)(samples_back + 0.5f))
-                                      % samples_per_cycle);
+                                      % spc);
 
     last_cycle_boundary_samples = buf_wr;
-
-    // --- OPTIMIZATION: Choose samples_per_cycle to minimize numerical errors ---
-    // We want samples_per_cycle to be an integer such that ticks_per_sample_d
-    // is large enough for good averaging but small enough for Nyquist.
-    // Targeting a virtual sampling rate of ~6400 Hz (128 samples @ 50Hz).
-    uint32_t target_spc = (uint32_t)lrintf(6400.0f / pll.freq);
-    if (target_spc < 100) target_spc = 100;
-    if (target_spc > 256) target_spc = 256;
-    samples_per_cycle = target_spc;
-
-    // Update virtual grid step for next cycle using the latest frequency estimate.
-    updateTimingParameters(pll.freq);
 
     uint32_t proc_end = get_cycle_count();
     float    core_us  = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
 
     // ── Dispatch visualiser snapshot ──────────────────────────────────────────
-    // Allocate and copy the circular buffer contents for the visualiser task.
-    // The allocation is in the main heap; if it fails the frame is silently skipped.
-    VisSnapshot snap;
-    snap.v_copy = (float*)heap_caps_malloc(sizeof(float) * samples_per_cycle, MALLOC_CAP_DEFAULT);
-    snap.i_copy = (float*)heap_caps_malloc(sizeof(float) * samples_per_cycle, MALLOC_CAP_DEFAULT);
-    if (snap.v_copy && snap.i_copy) {
-        memcpy(snap.v_copy, v_buf, sizeof(float) * samples_per_cycle);
-        memcpy(snap.i_copy, i_buf, sizeof(float) * samples_per_cycle);
+    // Use pre-allocated buffer pool to avoid per-cycle heap allocation.
+    int free_idx = -1;
+    for (int i = 0; i < VIS_SNAPSHOT_COUNT; i++) {
+        if (!__atomic_load_n(&vis_snapshots[i].in_use, __ATOMIC_ACQUIRE)) {
+            free_idx = i;
+            break;
+        }
+    }
+
+    if (free_idx != -1) {
+        VisSnapshot &snap = vis_snapshots[free_idx];
+        __atomic_store_n(&snap.in_use, true, __ATOMIC_RELEASE);
+
+        memcpy(snap.v_copy, v_buf, sizeof(float) * spc);
+        memcpy(snap.i_copy, i_buf, sizeof(float) * spc);
         snap.aligned_start = aligned_start;
-        snap.count = (int)samples_per_cycle;
+        snap.count = (int)spc;
         snap.pll_freq = pll.freq;
         snap.pll_mag  = pll.mag_smooth;
         snap.vdc = v_dc_offset;
         snap.idc = i_dc_offset;
 
-        if (xQueueSend(visQueue, &snap, 0) != pdTRUE) {
-            heap_caps_free(snap.v_copy);
-            heap_caps_free(snap.i_copy);
+        if (xQueueSend(visQueue, &free_idx, 0) != pdTRUE) {
+            __atomic_store_n(&snap.in_use, false, __ATOMIC_RELEASE);
+            __atomic_fetch_add(&dropped_snapshots_count, 1u, __ATOMIC_RELAXED);
         }
     } else {
-        if (snap.v_copy) heap_caps_free(snap.v_copy);
-        if (snap.i_copy) heap_caps_free(snap.i_copy);
+        __atomic_fetch_add(&dropped_snapshots_count, 1u, __ATOMIC_RELAXED);
     }
 
     // ── Dispatch serial log snapshot ─────────────────────────────────────────
@@ -810,18 +839,32 @@ void IRAM_ATTR loop() {
         SerialMsg sm;
         sm.pll_freq = pll.freq;
         sm.core_us  = core_us;
-        sm.isr_callback_count = isr_callback_count;
-        sm.frames_dropped     = frames_dropped;
-        sm.interp_ok          = interp_ok_count;
-        sm.interp_total       = interp_ok_count + interp_fail_count;
+        sm.isr_callback_count = __atomic_load_n(&isr_callback_count, __ATOMIC_RELAXED);
+        sm.frames_dropped     = __atomic_load_n(&frames_dropped, __ATOMIC_RELAXED);
+        sm.bad_timestamps     = __atomic_exchange_n(&bad_timestamps_count, 0u, __ATOMIC_ACQ_REL);
+
+        uint32_t snap_ok = __atomic_exchange_n(&interp_ok_count, 0u, __ATOMIC_ACQ_REL);
+        uint32_t snap_fail = __atomic_exchange_n(&interp_fail_count, 0u, __ATOMIC_ACQ_REL);
+        sm.interp_ok = snap_ok;
+        sm.interp_total = snap_ok + snap_fail;
+
         sm.vdc = v_dc_offset;
         sm.idc = i_dc_offset;
         sm.harmonic_ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-        // Reset per-cycle counters after snapshot.
-        interp_ok_count = 0;
-        interp_fail_count = 0;
-        xQueueSend(logQueue, &sm, 0);
+
+        if (xQueueSend(logQueue, &sm, 0) != pdTRUE) {
+            __atomic_fetch_add(&dropped_snapshots_count, 1u, __ATOMIC_RELAXED);
+        }
     }
+
+    // --- OPTIMIZATION: Choose samples_per_cycle to minimize numerical errors ---
+    // Update samples_per_cycle between cycles to avoid race while resampling.
+    uint32_t target_spc = (uint32_t)lrintf(6400.0f / pll.freq);
+    if (target_spc < 100) target_spc = 100;
+    if (target_spc > MAX_SAMPLES_PER_CYCLE) target_spc = MAX_SAMPLES_PER_CYCLE;
+
+    __atomic_store_n(&samples_per_cycle, target_spc, __ATOMIC_RELEASE);
+    updateTimingParameters(pll.freq);
 
     yield();
 }

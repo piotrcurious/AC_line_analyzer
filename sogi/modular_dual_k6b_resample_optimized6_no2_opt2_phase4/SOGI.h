@@ -8,7 +8,15 @@
 #include <cstring>
 #include <cstdint>
 #define IRAM_ATTR
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
+#endif
+
+/* =============================================================================
+ * UNIFIED TRANSFORM FRAMEWORK — Phase 4 Refined
+ * =============================================================================
+ */
 
 class SOGI {
 public:
@@ -16,21 +24,21 @@ public:
     void init();
     void reset();
 
-    // Process a single sample
-    void step(float input, float omega, float ts);
-
-    // Process a window of samples (for batch processing)
-    void processWindow(const float* buffer, int bufLen, int startIdx, int count, float omega, float ts, float offset = 0.0f);
+    void IRAM_ATTR step(float input, float omega, float ts);
 
     float v_alpha;
     float v_beta;
     float k;
 
-private:
-    // States
-    float wz1, wz2; // Shared states for alpha and beta filters
+    float getRotationRate() const { return w_rot; }
+    float getFllError(float input) const;
 
-    // Cached coefficients (computed when omega/ts change)
+private:
+    float wz1, wz2;
+    float v_alpha_prev, v_beta_prev;
+    float w_rot;
+    bool  has_prev_phi;
+
     float a_b0, a_b2;
     float a_a1, a_a2;
     float b_b0, b_b1, b_b2;
@@ -38,29 +46,33 @@ private:
     bool coeff_valid;
     float last_omega;
     float last_ts;
+
     void IRAM_ATTR updateCoefficients(float omega, float ts);
 };
 
-class SOGIFLL {
+class AdaptiveFLL {
 public:
-    SOGIFLL(float nominal_freq, float gamma);
+    AdaptiveFLL(float nominal_freq, float gamma, float learn_rate = 0.1f);
     void init();
-    void update(float u, float v_alpha, float v_beta, float ts);
+
+    void update(float fll_err, float rot_err, float ts);
+    void setDistortionDamping(float p_scale, float learn_scale);
 
     float freq;
     float omega;
     float nominal_freq;
     float gamma;
-    float mag_smooth;
+    float gain_est;
 
-    // Compatibility for main loop
-    float gamma_scale = 1.0f;
-    inline void setDistortionDamping(float new_p_scale, float new_learn_scale) {
-        (void)new_learn_scale;
-        if (new_p_scale < 0.0f) new_p_scale = 0.0f;
-        if (new_p_scale > 1.0f) new_p_scale = 1.0f;
-        gamma_scale = new_p_scale;
-    }
+private:
+    float integral_err_c;
+    float p_scale_factor;
+    float learn_scale_factor;
+    float learn_rate;
+
+    static constexpr int HIST_LEN = 16;
+    float phase_hist[HIST_LEN];
+    uint8_t hist_idx;
 };
 
 #endif // SOGI_H

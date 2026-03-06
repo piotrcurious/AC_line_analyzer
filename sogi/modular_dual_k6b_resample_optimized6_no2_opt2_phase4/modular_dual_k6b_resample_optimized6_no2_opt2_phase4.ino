@@ -1,180 +1,47 @@
-/* =============================================================================
- * UNIFIED TRANSFORM FRAMEWORK — AC Signal Tracking System
- * =============================================================================
- *
- * SYSTEM OVERVIEW
- * ───────────────
- * This system is a composition of linear and nonlinear operators that together
- * track the instantaneous frequency, phase, and harmonic content of an AC signal.
- *
- * The full operator chain is:
- *
- *   x(t) ──[T_adc]──► x[n_hw] ──[T_resamp]──► x[n_v] ──[P_sogi]──► {α,β}
- *                                                                        │
- *                                                          [P_sogi3]──► {α3,β3}
- *                                                                        │
- *                                                           ║            │
- *                                                    [Φ_pll]◄────────────┘
- *                                                           ║
- *                                                          {ω, φ}
- *
- *  T_adc    : Sampling operator. Maps continuous signal x(t) → x[n_hw].
- *             Hardware-timed, non-uniform timestamps. Two interleaved channels.
- *             ADC quantisation is an additive stochastic transform Q(x) = x + ε
- *             where ε is bounded by ½ LSB. Modelled here as white noise (ignored).
- *
- *  T_resamp : Decimating projection onto a uniform virtual grid.
- *             Maps irregular hardware timestamps → evenly-spaced virtual samples.
- *             Implemented as a box-filter accumulator (nearest-neighbour window).
- *             The window is Haar-wavelet-like: rectangular, length = decimation ratio.
- *             OPTIMIZED: Using a split integer/fractional virtual timeline avoids
- *             the rounding accumulation jitter and handles 32-bit wrap-around.
- *
- *  P_sogi   : Bandpass projection operator onto the 2D quadrature subspace {sin(ωt), cos(ωt)}.
- *             Implemented as a Second-Order Generalised Integrator (SOGI).
- *             SOGI is a resonant IIR whose steady-state output is the orthogonal
- *             pair (α = in-phase, β = quadrature) of the input at frequency ω.
- *             Mathematically: P_sogi(x, ω) = ⟨x, e^{jωt}⟩ decomposed into ℝ² .
- *             The gain-bandwidth is set by SOGI_K (= 1/Q of the resonator).
- *
- *  P_sogi3  : Same operator as P_sogi but tuned to 3ω.
- *             Extracts the 3rd harmonic component of the input.
- *             Ratio |P_sogi3| / |P_sogi| = THD proxy for 3rd harmonic.
- *
- *  Φ_pll    : Type-2 phase-frequency estimator. A nonlinear feedback operator.
- *             Input: quadrature pair {α, β} from P_sogi.
- *             Output: instantaneous frequency estimate ω̂ and phase φ̂.
- *             The error signal is the cross-product (α·cos(φ̂) − β·sin(φ̂)),
- *             which is the first-order linearisation of the phase error sin(Δφ) ≈ Δφ.
- *             This linearisation is valid when the PLL is locked (|Δφ| << π).
- *             Outside lock range the system is nonlinear; acquisition is not
- *             guaranteed for large initial frequency offsets.
- *
- * PHASE LIFTING (unwrap)
- * ──────────────────────
- *             atan2 returns phase on S¹ (the circle, range [−π, π]).
- *             To track continuous phase we lift from S¹ to its covering space ℝ
- *             by accumulating the winding number. This is the standard covering-map
- *             construction: φ_unwrapped = φ_wrapped + 2π·k, k ∈ ℤ.
- *             FIXED: the winding counter is maintained as an integer (winding)
- *             to prevent long-run floating point truncation drift.
- *
- * HARMONIC DAMPING (distortion gate)
- * ────────────────────────────────────
- *             When |P_sogi3| / |P_sogi| > threshold, the PLL input is attenuated.
- *             This is a gain-scheduled nonlinearity: the loop gain is modulated
- *             by the harmonic content of the input.
- *             FIXED: learn_att is now a smooth function of the harmonic ratio,
- *             providing better transient behaviour near the threshold.
- *
- * DC REMOVAL
- * ──────────
- *             v_dc_offset is a single-pole IIR estimate of the signal mean,
- *             computed over the virtual sample buffer once per cycle.
- *             Time constant ≈ 50 cycles @ 50 Hz ≈ 1 second.
- *             NOTE: the DC estimate is applied to the SOGI input (x − v_dc) but
- *             is computed from the raw buffer. This is intentional for absolute
- *             offset tracking.
- *
- * OPTIMIZATIONS APPLIED
- * ────────────────────────────────────────────────────────────────
- *  1. FIXED: PLL_KI = 50.0f transforms loop into Type-2, giving zero
- *     steady-state phase error when tracking frequency offsets.
- *  2. FIXED: HARMONIC_SMOOTH_ALPHA = 0.05 provides proper EMA smoothing
- *     for distortion metrics.
- *  3. FIXED: logTask reads harmonic ratio via snapshot queue to prevent
- *     data races on dual-core ESP32.
- *  4. FIXED: Using a split integer/fractional virtual timeline eliminates
- *     quantization-induced FM noise and ensures infinite-duration stability.
- *  5. FIXED: SOGI pre-warping ensures exact frequency domain matching at
- *     the tracked frequency.
- * =============================================================================
- */
-
 #include <Arduino.h>
 #include <math.h>
 #include "esp_adc/adc_continuous.h"
 #include "SOGI.h"
 #include "SOGIvisualizer.h"
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
 
-// ── Hardware pin / ADC channel mapping ──────────────────────────────────────
-// T_adc operator configuration: two interleaved channels on ADC1.
-#define ADC_PIN_V   36   // ADC1_CH0 — voltage channel
-#define ADC_PIN_I   39   // ADC1_CH3 — current channel
+/* =============================================================================
+ * UNIFIED TRANSFORM FRAMEWORK — Phase 4: Full Harmonic Decoupling & Variable N
+ * =============================================================================
+ */
+
+#define ADC_PIN_V   36
+#define ADC_PIN_I   39
 #define V_CHANNEL   0
 #define I_CHANNEL   3
-
-// ── Operator parameters ─────────────────────────────────────────────────────
-// NOMINAL_FREQ: initial ω̂ seed = 2π × 50 rad/s
-#define NOMINAL_FREQ       50.0f
-
-// SOGI_K: bandwidth parameter of the bandpass projection operator P_sogi.
-//   K = 1/Q. Larger K → wider passband → faster response, less harmonic rejection.
-//   K = 1/√2 ≈ 0.7071 gives a Butterworth-like (maximally flat) bandpass profile.
-#define SOGI_K             0.7071f
-
-// SOGI-FLL Gain (Gamma).
-//   Higher gamma -> faster tracking, more jitter.
-//   Physically, this is the integrator gain for frequency adaptation.
-//   With mV-scaled signals (A~350), gamma=200000 gives omega step ~30 rad/s.
-#define FLL_GAMMA          200000.0f
-
-// Virtual grid resolution: number of uniform samples per AC cycle.
-//   This defines the output rate of T_resamp.
-#define MAX_SAMPLES_PER_CYCLE  256
-uint32_t samples_per_cycle = 128;
-
-// ── 3rd-harmonic projection operator (P_sogi3) parameters ───────────────────
-// Same bandwidth parameter as P_sogi — could be tuned independently.
-#define SOGI3_K                    SOGI_K
-
-// Threshold on the spectral ratio |P_sogi3| / |P_sogi|.
-//   Above this value the harmonic distortion gate activates.
-#define SOGI3_HARMONIC_THRESHOLD   0.1f
-
-// Minimum gain of the distortion gate (applied to the PLL input).
-//   1.0 = gate fully open (no damping), 0.0 = gate fully closed (PLL frozen).
-#define SOGI3_DAMP_MIN             0.01f
-
-// EMA (exponential moving average) coefficient for smoothing |P_sogi| and |P_sogi3|.
-//   Formula: smooth = (1 − α) × smooth + α × new_value
-#define HARMONIC_SMOOTH_ALPHA      0.05f
-
-// ── T_adc operator: hardware sampling rate ──────────────────────────────────
-// Total hardware samples/s across both interleaved channels.
-// Effective per-channel rate = ADC_OVERSAMPLE_RATE / 2 = 125 kHz.
 #define ADC_OVERSAMPLE_RATE   250000
-
-// DMA frame size in bytes.
-// NOTE (not a bug — just undocumented): the ESP32-IDF requires conv_frame_size
-// to be a multiple of SOC_ADC_DIGI_DATA_BYTES_PER_CONV (4 bytes on ESP32).
-// Maximum usable value is constrained by max_store_buf_size / n_active_patterns.
-// 16 bytes = 4 ADC result structs = 2 V/I pairs per DMA interrupt.
 #define CONV_FRAME_SIZE       16
-
-// ── Virtual sample ring buffer ───────────────────────────────────────────────
-// Holds the output of T_resamp. Size must cover at least one full cycle.
 #define FRAME_BUFFER_SIZE     1024
 
-// ── Serial output decimation ─────────────────────────────────────────────────
-#define SERIAL_EVERY_N_CYCLES   2
+#define NOMINAL_FREQ       50.0f
+#define SOGI_K             0.7071f
+#define FLL_GAMMA          2500.0f
+#define FLL_LEARN_RATE     0.1f
 
-// ── Global operator instances ────────────────────────────────────────────────
+#define TARGET_VIRTUAL_RATE    6400.0f
+#define MIN_SAMPLES_PER_CYCLE  100
+#define MAX_SAMPLES_PER_CYCLE  256
+
+uint32_t samples_per_cycle = 128;
+
+// ── Global operators ─────────────────────────────────────────────────────────
 SOGIVisualizer vis;
-SOGI           sogi_v(SOGI_K);          // P_sogi:  fundamental projection
-SOGI           sogi_v3(SOGI3_K);        // P_sogi3: 3rd-harmonic projection
-SOGIFLL        pll(NOMINAL_FREQ, FLL_GAMMA); // Φ_fll (using 'pll' name for minimal code churn)
+SOGI           sogi_v1(SOGI_K);         // Fundamental
+SOGI           sogi_v3(SOGI_K);         // 3rd Harmonic
+SOGI           sogi_v5(SOGI_K);         // 5th Harmonic
+AdaptiveFLL    fll(NOMINAL_FREQ, FLL_GAMMA, FLL_LEARN_RATE);
 
-// ── T_adc output ring: timestamped DMA frames ───────────────────────────────
-// Each frame is a raw snapshot from the ADC DMA engine with a hardware
-// cycle-counter timestamp (ESP32 CCOUNT register, wraps at 2^32 cycles).
+// ── DMA frame ring ──────────────────────────────────────────────────────────
 struct TimestampedFrame {
-    uint32_t end_timestamp;          // CCOUNT at end of DMA conversion
+    uint32_t end_timestamp;
     uint8_t  raw_data[CONV_FRAME_SIZE];
     uint16_t data_size;
 };
@@ -184,638 +51,163 @@ volatile uint32_t frame_write_idx    = 0;
 volatile uint32_t frame_read_idx     = 0;
 volatile uint32_t isr_callback_count = 0;
 volatile uint32_t frames_dropped     = 0;
-volatile uint32_t bad_timestamps_count = 0;
-volatile uint32_t dropped_snapshots_count = 0;
 
 adc_continuous_handle_t adc_handle = NULL;
+uint32_t cpu_freq_hz = 0; float inv_cpu_freq = 0.0f; uint32_t cycles_per_adc_sample = 0;
+uint32_t ticks_per_sample_int = 0; double ticks_per_sample_frac = 0;
+uint32_t next_sample_int = 0; double next_sample_frac = 0;
 
-// ── Hardware timing parameters ───────────────────────────────────────────────
-// These scale the CCOUNT integer timestamps to physical seconds.
-uint32_t cpu_freq_hz           = 0;
-float    inv_cpu_freq          = 0.0f;   // = 1 / cpu_freq_hz  [s/cycle]
-uint32_t cycles_per_adc_sample = 0;
+float v_buf[MAX_SAMPLES_PER_CYCLE]; float i_buf[MAX_SAMPLES_PER_CYCLE]; uint32_t buf_wr = 0;
 
-// Virtual grid timing state (split into integer and fractional parts for infinite precision)
-uint32_t ticks_per_sample_int  = 0;
-double   ticks_per_sample_frac = 0;
-uint32_t next_sample_int       = 0;
-double   next_sample_frac      = 0;
-
-// ── ADC quantisation inverse: maps 12-bit integer → millivolts ──────────────
-// Q^{-1}: undoes the quantisation operator applied by T_adc.
-// Range: 0..4095 → 0..3300 mV.
-static const float RAW_TO_MV = 3300.0f / 4095.0f;
-
-// ── T_resamp output: virtual sample ring ────────────────────────────────────
-// v_buf / i_buf hold the output of T_resamp on the uniform virtual grid.
-// Indexed modulo samples_per_cycle as a circular buffer.
-float    v_buf[MAX_SAMPLES_PER_CYCLE];
-float    i_buf[MAX_SAMPLES_PER_CYCLE];
-uint32_t buf_wr = 0;               // monotonically increasing virtual sample counter
-
-// T_resamp accumulator state: fractional box-filter window between virtual grid points.
-// Optimized for ESP32: using float for signal accumulation to utilize FPU.
 struct ResamplerState {
-    uint32_t last_frame_end_ts = 0;  // CCOUNT of previous DMA frame end
-    float    acc_v = 0.0f;          // voltage accumulator for current window
-    float    acc_i = 0.0f;          // current accumulator for current window
-    float    acc_weight = 0.0f;     // sum of time-weights (CCOUNT ticks) in current window
-    uint32_t prev_hw_ts = 0;        // hardware timestamp of the last processed sample (int part)
-    float    prev_hw_frac = 0.0f;   // fractional part of the last processed timestamp
-    bool     initialized = false;    // false until first valid DMA frame processed
+    uint32_t last_frame_end_ts = 0;
+    double   acc_v = 0.0; double acc_i = 0.0; double acc_weight = 0.0;
+    uint32_t prev_hw_ts = 0; float prev_hw_frac = 0.0f;
+    bool     initialized = false;
 } resamp;
 
-// ── Cycle boundary counter (used to gate the per-cycle processing in loop()) ─
-uint32_t last_cycle_boundary_samples = 0;
+float v_dc_offset = 1650.0f; float i_dc_offset = 1650.0f; bool dc_bootstrap_done = false;
 
-// ── DC component estimate (subtracted before P_sogi to remove offset) ────────
-// Tracked as a slow single-pole IIR over the virtual sample buffer.
-// FIXED: Bootstrap mechanism seeds initial DC offset from the first cycle of data.
-float v_dc_offset = 1650.0f;
-float i_dc_offset = 1650.0f;
-bool  dc_bootstrap_done = false;
+struct PhaseTrack { float prev_phase = 0.0f; int32_t winding = 0; bool initialized = false; } phase_track;
+#define HARMONIC_SMOOTH_ALPHA 0.02f
+float harmonic_mag1_smooth = 1e-6f; float harmonic_mag3_smooth = 1e-6f; float harmonic_mag5_smooth = 1e-6f;
 
-// ── Phase covering-map state (S¹ → ℝ lifting) ───────────────────────────────
-// atan2 returns phase on S¹ ≅ [−π, π). To make the phase observable as a
-// monotonically increasing quantity we lift to the universal cover ℝ by
-// tracking the integer winding number.
-// FIXED: maintain winding count as int32_t to avoid floating-point drift.
-struct PhaseTrack {
-    float   prev_phase  = 0.0f;
-    int32_t winding     = 0;      // accumulated 2π winding number
-    bool    initialized = false;
-} phase_track;
+TaskHandle_t visTaskHandle = NULL; TaskHandle_t logTaskHandle = NULL;
+QueueHandle_t visQueue = NULL; QueueHandle_t logQueue = NULL;
 
-// ── Resampler quality counters ───────────────────────────────────────────────
-uint32_t interp_ok_count   = 0;   // virtual samples emitted with valid window data
-uint32_t interp_fail_count = 0;   // virtual samples emitted with empty window (zero-order hold)
-
-// ── Harmonic ratio smoothing state for the distortion gate ──────────────────
-// EMA of |P_sogi| and |P_sogi3|. Initialised to a small non-zero value to
-// prevent division by zero on startup.
-float harmonic_mag1_smooth = 1e-6f;
-float harmonic_mag3_smooth = 1e-6f;
-
-// ── FreeRTOS task handles ────────────────────────────────────────────────────
-TaskHandle_t visTaskHandle = NULL;
-TaskHandle_t logTaskHandle = NULL;
-QueueHandle_t visQueue = NULL;
-QueueHandle_t logQueue = NULL;
-
-// Snapshot passed to the visualiser task: one complete virtual cycle snapshot.
+struct VisSnapshot { float v_copy[MAX_SAMPLES_PER_CYCLE]; float i_copy[MAX_SAMPLES_PER_CYCLE]; int aligned_start; int count; float pll_freq; float vdc, idc; bool in_use; };
 #define VIS_SNAPSHOT_COUNT 4
-struct VisSnapshot {
-    float v_copy[MAX_SAMPLES_PER_CYCLE];
-    float i_copy[MAX_SAMPLES_PER_CYCLE];
-    int    aligned_start;   // index into circular buffer where the cycle starts
-    int    count;           // number of samples in this snapshot
-    float  pll_freq;
-    float  pll_mag;
-    float  vdc, idc;
-    bool   in_use;
-};
-
 VisSnapshot vis_snapshots[VIS_SNAPSHOT_COUNT];
 
-// Snapshot passed to the serial log task.
-// FIXED: harmonic ratio is included in the message to prevent data races.
-struct SerialMsg {
-    float pll_freq;
-    float core_us;
-    uint32_t isr_callback_count;
-    uint32_t frames_dropped;
-    uint32_t bad_timestamps;
-    uint32_t dropped_snapshots;
-    uint32_t interp_ok;
-    uint32_t interp_total;
-    float vdc, idc;
-    float harmonic_ratio;
-};
+struct SerialMsg { float pll_freq; float core_us; uint32_t isr_count; uint32_t dropped; float h3_ratio; float h5_ratio; };
 
-// ── Hardware cycle counter (CCOUNT register) ─────────────────────────────────
-// This is the integer time axis for all timestamp arithmetic.
-// Wraps at 2^32 cycles. All differences use uint32_t subtraction which is
-// wrap-safe by construction (modular arithmetic on ℤ/2^32ℤ).
-static inline uint32_t IRAM_ATTR get_cycle_count() {
-    uint32_t ccount;
-    asm volatile("rsr %0, ccount" : "=a"(ccount));
-    return ccount;
-}
+static inline uint32_t IRAM_ATTR get_cycle_count() { uint32_t ccount; asm volatile("rsr %0, ccount" : "=a"(ccount)); return ccount; }
+static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw) { return (float)raw * (3300.0f / 4095.0f); }
+static inline int32_t IRAM_ATTR signed_time_diff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 
-// Apply Q^{-1}: integer ADC code → millivolts.
-static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw) {
-    return (float)raw * RAW_TO_MV;
-}
-
-// Recompute the virtual grid step from the current frequency estimate.
-// FIXED: Split into integer and fractional parts to maintain infinite
-// accumulation precision without the drift associated with monotonic double growth.
-static inline void IRAM_ATTR updateTimingParameters(float frequency) {
-    float fc = (frequency < 40.0f) ? 40.0f : (frequency > 90.0f ? 90.0f : frequency);
+static void IRAM_ATTR updateTimingParameters(float frequency) {
     uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
-    double cycle_duration_ticks = (double)cpu_freq_hz / (double)fc;
-    double tps_d = cycle_duration_ticks / (double)spc;
-    ticks_per_sample_int = (uint32_t)tps_d;
-    ticks_per_sample_frac = tps_d - (double)ticks_per_sample_int;
+    double tps_d = (double)cpu_freq_hz / (double)frequency / (double)spc;
+    ticks_per_sample_int = (uint32_t)tps_d; ticks_per_sample_frac = tps_d - (double)ticks_per_sample_int;
 }
 
-// Signed 32-bit difference on the modular CCOUNT time axis.
-// Correct as long as the true difference is < 2^31 cycles (~8.9 s at 240 MHz).
-static inline int32_t IRAM_ATTR signed_time_diff(uint32_t a, uint32_t b) {
-    return (int32_t)(a - b);
-}
-
-// =============================================================================
-//  ISR: T_adc output → frame ring
-//  Runs in interrupt context. Only copies data and records timestamp.
-//  No floating-point, no blocking.
-//
-//  SHORTCOMING: when the ring is full the oldest frame is silently dropped
-//  (frames_dropped counter incremented). This is a hard-RT trade-off but
-//  means the resampler may see a gap in the hardware timestamp sequence,
-//  producing a spurious large elapsed value and therefore incorrect virtual
-//  sample spacing for one DMA frame.
-// =============================================================================
-static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle,
-                                              const adc_continuous_evt_data_t *edata,
-                                              void *user_data) {
-    uint32_t ts = get_cycle_count();
-    uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE);
-    uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED);
+static bool IRAM_ATTR adc_conv_done_callback(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data) {
+    uint32_t ts = get_cycle_count(); uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE); uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_RELAXED);
     uint32_t next_wr = (wr + 1) % FRAME_BUFFER_SIZE;
-
-    if (next_wr == rd) {
-        // Ring full: evict oldest frame to make space (destructive overwrite).
-        rd = (rd + 1) % FRAME_BUFFER_SIZE;
-        __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
-        __atomic_fetch_add(&frames_dropped, 1u, __ATOMIC_RELAXED);
-    }
-
-    uint32_t sz = edata->size;
-    if (sz > CONV_FRAME_SIZE) sz = CONV_FRAME_SIZE;
+    if (next_wr == rd) { rd = (rd + 1) % FRAME_BUFFER_SIZE; __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE); __atomic_fetch_add(&frames_dropped, 1u, __ATOMIC_RELAXED); }
+    uint32_t sz = edata->size; if (sz > CONV_FRAME_SIZE) sz = CONV_FRAME_SIZE;
     memcpy((void *)frame_buffer[wr].raw_data, edata->conv_frame_buffer, sz);
-
-    frame_buffer[wr].end_timestamp = ts;
-    frame_buffer[wr].data_size     = (uint16_t)sz;
-
-    __atomic_store_n(&frame_write_idx, next_wr, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&isr_callback_count, 1u, __ATOMIC_RELAXED);
+    frame_buffer[wr].end_timestamp = ts; frame_buffer[wr].data_size = (uint16_t)sz;
+    __atomic_store_n(&frame_write_idx, next_wr, __ATOMIC_RELEASE); __atomic_fetch_add(&isr_callback_count, 1u, __ATOMIC_RELAXED);
     return false;
 }
 
-// =============================================================================
-//  ADC hardware initialisation (T_adc operator setup)
-// =============================================================================
-bool initADCContinuous() {
-    adc_continuous_handle_cfg_t cfg = {
-        .max_store_buf_size = 4096,
-        .conv_frame_size    = CONV_FRAME_SIZE,
-    };
-    if (adc_continuous_new_handle(&cfg, &adc_handle) != ESP_OK) return false;
-
-    adc_digi_pattern_config_t pat[2];
-    pat[0] = { .atten = ADC_ATTEN_DB_12, .channel = V_CHANNEL, .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 };
-    pat[1] = { .atten = ADC_ATTEN_DB_12, .channel = I_CHANNEL, .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 };
-
-    adc_continuous_config_t dig = {
-        .pattern_num    = 2,
-        .adc_pattern    = pat,
-        .sample_freq_hz = ADC_OVERSAMPLE_RATE,
-        .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
-        .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
-    };
-    if (adc_continuous_config(adc_handle, &dig) != ESP_OK) return false;
-
-    adc_continuous_evt_cbs_t cbs = { .on_conv_done = adc_conv_done_callback };
-    adc_continuous_register_event_callbacks(adc_handle, &cbs, NULL);
-    adc_continuous_start(adc_handle);
-    return true;
-}
-
-// =============================================================================
-//  Visualiser task — receives one VisSnapshot per virtual cycle
-// =============================================================================
-void visTask(void *pv) {
-    int snap_idx;
-    for (;;) {
-        if (xQueueReceive(visQueue, &snap_idx, portMAX_DELAY) == pdTRUE) {
-            VisSnapshot &snap = vis_snapshots[snap_idx];
-            vis.update(snap.v_copy, snap.i_copy, snap.count,
-                       snap.aligned_start, snap.count,
-                       snap.pll_freq, snap.pll_mag,
-                       snap.vdc, snap.idc);
-            __atomic_store_n(&snap.in_use, false, __ATOMIC_RELEASE);
-        }
-    }
-}
-
-// =============================================================================
-//  Serial log task
-//  BUG: harmonic_mag3_smooth and harmonic_mag1_smooth are read here without
-//  synchronisation. On the dual-core ESP32 this is a true data race. Fix by
-//  including the ratio in SerialMsg (computed under the same lock as the rest
-//  of the message) instead of reading globals from another core.
-// =============================================================================
-void logTask(void *pv) {
-    SerialMsg msg;
-    for (;;) {
-        if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
-            Serial.printf(
-                "F:%.4fHz  Core:%.1fus  ISR:%lu  Drop:%lu  BadTS:%lu  DropSnap:%lu  Ok/Total:%lu/%lu  Vdc:%.1f Idc:%.1f  H3ratio:%.3f\n",
-                msg.pll_freq,
-                msg.core_us,
-                (unsigned long)msg.isr_callback_count,
-                (unsigned long)msg.frames_dropped,
-                (unsigned long)msg.bad_timestamps,
-                (unsigned long)msg.dropped_snapshots,
-                (unsigned long)msg.interp_ok,
-                (unsigned long)msg.interp_total,
-                msg.vdc, msg.idc,
-                (double)msg.harmonic_ratio
-            );
-        }
-    }
-}
-
-// =============================================================================
-//  processIncomingDMA()
-//  Implements T_resamp + P_sogi + P_sogi3 + harmonic gate + Φ_pll update.
-//
-//  For each DMA frame:
-//    1. Reconstruct per-sample timestamps by linear interpolation within
-//       the frame using measured CCOUNT elapsed time (integer arithmetic).
-//    2. Accumulate hardware samples into the box-filter window (T_resamp).
-//    3. When the virtual grid clock fires (ts >= next_sample_time):
-//       a. Emit the window average as one virtual sample.
-//       b. Advance P_sogi and P_sogi3 by one virtual time step.
-//       c. Compute harmonic ratio, update distortion gate gain.
-//       d. Feed gate-weighted {α, β} into Φ_pll.
-// =============================================================================
 void IRAM_ATTR processIncomingDMA() {
-    uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE);
-    uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_ACQUIRE);
-
-    if (rd == wr) return;
-
-    uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
-
+    uint32_t rd = __atomic_load_n(&frame_read_idx, __ATOMIC_ACQUIRE); uint32_t wr = __atomic_load_n(&frame_write_idx, __ATOMIC_ACQUIRE);
+    if (rd == wr) return; uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
     while (rd != wr) {
-        volatile TimestampedFrame *f_ptr = &frame_buffer[rd];
-        uint32_t frame_end_ts = f_ptr->end_timestamp;
-        uint16_t sz = f_ptr->data_size;
-
-        const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f_ptr->raw_data;
-        int n = sz / sizeof(adc_digi_output_data_t);
-        if (n <= 0) {
-            rd = (rd + 1) % FRAME_BUFFER_SIZE;
-            __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
-            continue;
-        }
-
-        int total_pairs = n / 2;
-
-        // ----- Timestamp reconstruction -----
-        uint32_t elapsed = 0;
-        if (resamp.initialized) {
-            elapsed = (uint32_t)(frame_end_ts - resamp.last_frame_end_ts);
-
-            uint32_t expected = cycles_per_adc_sample * total_pairs;
-            if (elapsed > expected * 8 || elapsed == 0) {
-                __atomic_fetch_add(&bad_timestamps_count, 1u, __ATOMIC_RELAXED);
-                if (elapsed > expected * 100) elapsed = expected * 100;
-            }
-            if (total_pairs == 0) total_pairs = 1;
-        } else {
-            elapsed = (uint32_t)cycles_per_adc_sample * (uint32_t)total_pairs;
-        }
-        uint32_t frame_start_ts = resamp.last_frame_end_ts;
-
-        const int max_emit_per_frame = MAX_SAMPLES_PER_CYCLE * 2;
-        int emitted_in_frame = 0;
-
+        volatile TimestampedFrame *f_ptr = &frame_buffer[rd]; uint32_t f_end = f_ptr->end_timestamp;
+        int n = f_ptr->data_size / sizeof(adc_digi_output_data_t); if (n <= 0) { rd = (rd + 1) % FRAME_BUFFER_SIZE; continue; }
+        int total_pairs = n / 2; uint32_t elapsed = (resamp.initialized) ? (uint32_t)(f_end - resamp.last_frame_end_ts) : (uint32_t)cycles_per_adc_sample * total_pairs;
+        uint32_t f_start = resamp.last_frame_end_ts; const adc_digi_output_data_t *p = (const adc_digi_output_data_t *)f_ptr->raw_data;
         for (int pair = 0; pair < total_pairs; ++pair) {
-            int i = pair * 2;
-            uint16_t rv = 0, ri = 0;
-            if (p[i].type1.channel == V_CHANNEL) rv = p[i].type1.data;
-            else if (p[i].type1.channel == I_CHANNEL) ri = p[i].type1.data;
-            if (i+1 < n) {
-                if (p[i+1].type1.channel == V_CHANNEL) rv = p[i+1].type1.data;
-                else if (p[i+1].type1.channel == I_CHANNEL) ri = p[i+1].type1.data;
-            }
-
-            float fv = adcRawToMillivolts(rv);
-            float fi = adcRawToMillivolts(ri);
-
-            uint32_t ts = frame_start_ts + (uint32_t)(
-                ((uint64_t)(pair + 1) * (uint64_t)elapsed) / (uint64_t)total_pairs
-            );
-
-            if (!resamp.initialized) {
-                resamp.last_frame_end_ts = frame_end_ts;
-                resamp.prev_hw_ts = ts;
-                resamp.prev_hw_frac = 0.0f;
-                resamp.initialized = true;
-                next_sample_int = ts;
-                next_sample_frac = 0;
-                continue;
-            }
-
-            // ── Fractional resampler loop ─────────────────────────────────────
-            while ( signed_time_diff(ts, next_sample_int) >= 0 ) {
-                float d_win = (float)signed_time_diff(next_sample_int, resamp.prev_hw_ts) + (float)next_sample_frac - resamp.prev_hw_frac;
-                if (d_win < 0.0f) d_win = 0.0f;
-
-                resamp.acc_v += fv * d_win;
-                resamp.acc_i += fi * d_win;
-                resamp.acc_weight += d_win;
-
-                float v_val, i_val;
-                float ts_virtual = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
-
-                if (resamp.acc_weight > 0.0f) {
-                    v_val = resamp.acc_v / resamp.acc_weight;
-                    i_val = resamp.acc_i / resamp.acc_weight;
-                    __atomic_fetch_add(&interp_ok_count, 1u, __ATOMIC_RELAXED);
-                } else {
-                    v_val = v_dc_offset;
-                    i_val = i_dc_offset;
-                    __atomic_fetch_add(&interp_fail_count, 1u, __ATOMIC_RELAXED);
+            uint16_t rv = 0, ri = 0; int base = pair * 2;
+            if (p[base].type1.channel == V_CHANNEL) rv = p[base].type1.data; else ri = p[base].type1.data;
+            if (p[base+1].type1.channel == V_CHANNEL) rv = p[base+1].type1.data; else ri = p[base+1].type1.data;
+            float fv = adcRawToMillivolts(rv); float fi = adcRawToMillivolts(ri);
+            uint32_t ts = f_start + (uint32_t)(((uint64_t)(pair + 1) * (uint64_t)elapsed) / total_pairs);
+            if (!resamp.initialized) { resamp.last_frame_end_ts = f_end; resamp.prev_hw_ts = ts; resamp.prev_hw_frac = 0.0f; resamp.initialized = true; next_sample_int = ts; next_sample_frac = 0; continue; }
+            while (signed_time_diff(ts, next_sample_int) >= 0) {
+                double d_win = (double)signed_time_diff(next_sample_int, resamp.prev_hw_ts) + next_sample_frac - (double)resamp.prev_hw_frac;
+                if (d_win < 0.0) d_win = 0.0; resamp.acc_v += (double)fv * d_win; resamp.acc_i += (double)fi * d_win; resamp.acc_weight += d_win;
+                if (resamp.acc_weight > 0.0) {
+                    float v_val = (float)(resamp.acc_v / resamp.acc_weight); float i_val = (float)(resamp.acc_i / resamp.acc_weight);
+                    v_buf[buf_wr % spc] = v_val; i_buf[buf_wr % spc] = i_val;
+                    float u = v_val - v_dc_offset;
+                    // Full Harmonic Decoupling: Fundamental - 3rd - 5th
+                    float u1 = u - sogi_v3.v_alpha - sogi_v5.v_alpha;
+                    float u3 = u - sogi_v1.v_alpha - sogi_v5.v_alpha;
+                    float u5 = u - sogi_v1.v_alpha - sogi_v3.v_alpha;
+                    float ts_v = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
+                    sogi_v1.step(u1, fll.omega, ts_v); sogi_v3.step(u3, 3.0f * fll.omega, ts_v); sogi_v5.step(u5, 5.0f * fll.omega, ts_v);
+                    float mag1 = sqrtf(sogi_v1.v_alpha*sogi_v1.v_alpha + sogi_v1.v_beta*sogi_v1.v_beta + 1e-3f);
+                    float mag3 = sqrtf(sogi_v3.v_alpha*sogi_v3.v_alpha + sogi_v3.v_beta*sogi_v3.v_beta + 1e-3f);
+                    float mag5 = sqrtf(sogi_v5.v_alpha*sogi_v5.v_alpha + sogi_v5.v_beta*sogi_v5.v_beta + 1e-3f);
+                    harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
+                    harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
+                    harmonic_mag5_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag5_smooth + HARMONIC_SMOOTH_ALPHA * mag5;
+                    float ratio = (harmonic_mag3_smooth + harmonic_mag5_smooth) / (harmonic_mag1_smooth + 1e-9f);
+                    float damp = 1.0f; if (ratio > 0.1f) damp = 1.0f - (ratio - 0.1f) * 2.5f; if (damp < 0.01f) damp = 0.01f;
+                    float fll_err = sogi_v1.getFllError(u1);
+                    float rot_err = (sogi_v1.getRotationRate() - fll.omega) / (fll.omega + 1.0f); // Normalized dimensionless rot_err
+                    fll.setDistortionDamping(damp, (ratio > 0.2f ? 0.0f : 1.0f));
+                    fll.update(fll_err, rot_err, ts_v);
+                    buf_wr++;
                 }
-
-                v_buf[buf_wr % spc] = v_val;
-                i_buf[buf_wr % spc] = i_val;
-
-                sogi_v.step(v_val - v_dc_offset, pll.omega, ts_virtual);
-                sogi_v3.step(v_val - v_dc_offset, 3.0f * pll.omega, ts_virtual);
-
-                float mag1 = sqrtf(sogi_v.v_alpha  * sogi_v.v_alpha  + sogi_v.v_beta  * sogi_v.v_beta);
-                float mag3 = sqrtf(sogi_v3.v_alpha * sogi_v3.v_alpha + sogi_v3.v_beta * sogi_v3.v_beta);
-
-                harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
-                harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
-
-                float ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-                float damp_factor = 1.0f;
-                if (ratio > SOGI3_HARMONIC_THRESHOLD) {
-                    float overshoot = (ratio - SOGI3_HARMONIC_THRESHOLD) / (3.0f * SOGI3_HARMONIC_THRESHOLD);
-                    if (overshoot < 0.0f) overshoot = 0.0f;
-                    if (overshoot > 1.0f) overshoot = 1.0f;
-                    damp_factor = 1.0f - overshoot * (1.0f - SOGI3_DAMP_MIN);
-                }
-
-                pll.setDistortionDamping(damp_factor, damp_factor);
-                pll.update(v_val - v_dc_offset, sogi_v.v_alpha, sogi_v.v_beta, ts_virtual);
-
-                buf_wr++;
-
-                resamp.acc_v = 0;
-                resamp.acc_i = 0;
-                resamp.acc_weight = 0;
-                resamp.prev_hw_ts = next_sample_int;
-                resamp.prev_hw_frac = (float)next_sample_frac;
-
-                next_sample_frac += ticks_per_sample_frac;
-                next_sample_int  += ticks_per_sample_int + (uint32_t)next_sample_frac;
-                next_sample_frac -= (uint32_t)next_sample_frac;
-
-                emitted_in_frame++;
-                if (emitted_in_frame > max_emit_per_frame) break;
+                resamp.acc_v = 0.0; resamp.acc_i = 0.0; resamp.acc_weight = 0.0;
+                resamp.prev_hw_ts = next_sample_int; resamp.prev_hw_frac = (float)next_sample_frac;
+                next_sample_frac += ticks_per_sample_frac; next_sample_int += ticks_per_sample_int + (uint32_t)next_sample_frac; next_sample_frac -= (uint32_t)next_sample_frac;
             }
-
-            float d_rem = (float)signed_time_diff(ts, resamp.prev_hw_ts) - resamp.prev_hw_frac;
-            if (d_rem < 0.0f) d_rem = 0.0f;
-            resamp.acc_v += fv * d_rem;
-            resamp.acc_i += fi * d_rem;
-            resamp.acc_weight += d_rem;
-            resamp.prev_hw_ts = ts;
-            resamp.prev_hw_frac = 0.0f;
-            if (emitted_in_frame > max_emit_per_frame) break;
-        } // for each hardware pair
-
-        resamp.last_frame_end_ts = frame_end_ts;
-
-        rd = (rd + 1) % FRAME_BUFFER_SIZE;
-        __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
+            double d_rem = (double)signed_time_diff(ts, resamp.prev_hw_ts) - (double)resamp.prev_hw_frac;
+            if (d_rem < 0.0) d_rem = 0.0; resamp.acc_v += (double)fv * d_rem; resamp.acc_i += (double)fi * d_rem; resamp.acc_weight += d_rem;
+            resamp.prev_hw_ts = ts; resamp.prev_hw_frac = 0.0f;
+        }
+        resamp.last_frame_end_ts = f_end; rd = (rd + 1) % FRAME_BUFFER_SIZE; __atomic_store_n(&frame_read_idx, rd, __ATOMIC_RELEASE);
     }
 }
 
-// =============================================================================
-//  setup()
-// =============================================================================
+void visTask(void *pv) {
+    int idx; for (;;) { if (xQueueReceive(visQueue, &idx, portMAX_DELAY) == pdTRUE) {
+        VisSnapshot &s = vis_snapshots[idx]; vis.update(s.v_copy, s.i_copy, s.count, s.aligned_start, s.count, s.pll_freq, 0.0f, s.vdc, s.idc);
+        __atomic_store_n(&s.in_use, false, __ATOMIC_RELEASE);
+    } }
+}
+
+void logTask(void *pv) {
+    SerialMsg msg; for (;;) { if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
+        Serial.printf("F:%.4fHz  H3:%.3f  H5:%.3f  Core:%.1fus  ISR:%lu  Drop:%lu\n",
+            msg.pll_freq, msg.h3_ratio, msg.h5_ratio, msg.core_us, (unsigned long)msg.isr_count, (unsigned long)msg.dropped);
+    } }
+}
+
 void setup() {
-    Serial.begin(115200);
-    delay(100);
-    cpu_freq_hz  = (uint32_t)ESP.getCpuFreqMHz() * 1000000U;
-    inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
-    // Effective per-channel hardware rate = total rate / 2 (two interleaved channels).
-    cycles_per_adc_sample = cpu_freq_hz / (ADC_OVERSAMPLE_RATE / 2);
-
-    updateTimingParameters(NOMINAL_FREQ);
-
-    // Initialise virtual sample ring to mid-rail (neutral DC value).
-    for (int i = 0; i < MAX_SAMPLES_PER_CYCLE; ++i) {
-        v_buf[i] = v_dc_offset;
-        i_buf[i] = i_dc_offset;
-    }
-
-    // Initialise EMA smoothers to small non-zero value to prevent divide-by-zero.
-    harmonic_mag1_smooth = 1e-6f;
-    harmonic_mag3_smooth = 1e-6f;
-
-    vis.begin();
-    initADCContinuous();
-
-    visQueue = xQueueCreate(VIS_SNAPSHOT_COUNT, sizeof(int));
-    for (int i = 0; i < VIS_SNAPSHOT_COUNT; i++) vis_snapshots[i].in_use = false;
-    logQueue = xQueueCreate(8, sizeof(SerialMsg));
-    // Visualiser task on core 0, signal processing in loop() on core 1.
-    xTaskCreatePinnedToCore(visTask, "visTask", 8192, NULL, tskIDLE_PRIORITY + 2, &visTaskHandle, 0);
-    xTaskCreatePinnedToCore(logTask, "logTask", 4096, NULL, tskIDLE_PRIORITY + 1, &logTaskHandle, 0);
-
-    gpio_set_drive_capability((gpio_num_t)18, GPIO_DRIVE_CAP_3);
-    gpio_set_drive_capability((gpio_num_t)23, GPIO_DRIVE_CAP_3);
+    Serial.begin(115200); delay(100); cpu_freq_hz = (uint32_t)ESP.getCpuFreqMHz() * 1000000U; inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
+    cycles_per_adc_sample = cpu_freq_hz / (ADC_OVERSAMPLE_RATE / 2); updateTimingParameters(NOMINAL_FREQ); vis.begin();
+    adc_continuous_handle_cfg_t cfg = { .max_store_buf_size = 4096, .conv_frame_size = CONV_FRAME_SIZE }; adc_continuous_new_handle(&cfg, &adc_handle);
+    adc_digi_pattern_config_t pat[2]; pat[0] = { .atten = ADC_ATTEN_DB_12, .channel = V_CHANNEL, .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 };
+    pat[1] = { .atten = ADC_ATTEN_DB_12, .channel = I_CHANNEL, .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 };
+    adc_continuous_config_t dig = { .pattern_num = 2, .adc_pattern = pat, .sample_freq_hz = ADC_OVERSAMPLE_RATE, .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1 };
+    adc_continuous_config(adc_handle, &dig);
+    adc_continuous_evt_cbs_t cbs = { .on_conv_done = adc_conv_done_callback }; adc_continuous_register_event_callbacks(adc_handle, &cbs, NULL); adc_continuous_start(adc_handle);
+    visQueue = xQueueCreate(VIS_SNAPSHOT_COUNT, sizeof(int)); logQueue = xQueueCreate(8, sizeof(SerialMsg));
+    for (int i=0; i<VIS_SNAPSHOT_COUNT; i++) vis_snapshots[i].in_use = false;
+    xTaskCreatePinnedToCore(visTask, "vis", 8192, NULL, 2, &visTaskHandle, 1); xTaskCreatePinnedToCore(logTask, "log", 4096, NULL, 1, &logTaskHandle, 0);
 }
 
-// =============================================================================
-//  loop()
-//  Runs on core 1. Processes one complete virtual cycle per call:
-//    1. Drain DMA ring via processIncomingDMA() (T_resamp + operators).
-//    2. Gate on SAMPLES_PER_CYCLE new virtual samples having been emitted.
-//    3. Estimate DC component (single-pole IIR over the virtual buffer).
-//    4. Extrapolate the P_sogi phase estimate to the present moment (first-order
-//       Taylor expansion: φ(t_now) ≈ φ(t_last) + ω̂ · Δt).
-//    5. Lift the wrapped phase from S¹ to ℝ (winding number accumulation).
-//    6. Compute the buffer-aligned start index for cycle-coherent display.
-//    7. Dispatch snapshot to visualiser and logger tasks.
-// =============================================================================
-void IRAM_ATTR loop() {
-    static uint32_t serial_ctr  = 0;
-
-    processIncomingDMA();
-
-    uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE);
-
-    // Gate: wait until a full virtual cycle's worth of new samples has been emitted.
-    if (buf_wr - last_cycle_boundary_samples < spc) return;
-
-    uint32_t now = get_cycle_count();
-    // lag = time elapsed since the last virtual sample was emitted.
-    // To find last virtual sample time in wrapping timeline:
-    // We can't easily subtract from split timeline, but we know last_hw_ts in the
-    // resampler loop was set to next_sample_int.
-    // However, that was in processIncomingDMA. We can just use next_sample_int
-    // which is the NEXT boundary, and subtract the ticks.
-    uint32_t last_virtual_ts = next_sample_int - ticks_per_sample_int;
-    int32_t  lag_ticks = signed_time_diff(now, last_virtual_ts);
-    float    lag_sec   = (float)lag_ticks * inv_cpu_freq;
-
-    // ── DC component estimation ───────────────────────────────────────────────
-    // Sum the current virtual cycle buffer and update the slow IIR tracker.
-    // Time constant = 1/(0.02 × 50 Hz) ≈ 1 second. Sufficient to reject mains
-    // AC but responds slowly to amplifier offset drift.
-    float v_sum = 0.0f, i_sum = 0.0f;
-    for (uint32_t k = 0; k < spc; ++k) {
-        v_sum += v_buf[k];
-        i_sum += i_buf[k];
+void loop() {
+    static uint32_t last_boundary = 0; processIncomingDMA();
+    uint32_t spc = __atomic_load_n(&samples_per_cycle, __ATOMIC_ACQUIRE); if (buf_wr - last_boundary < spc) return;
+    uint32_t t_start = get_cycle_count(); float v_sum = 0, i_sum = 0; for (uint32_t i=0; i<spc; i++) { v_sum += v_buf[i]; i_sum += i_buf[i]; }
+    float v_avg = v_sum / spc; float i_avg = i_sum / spc;
+    if (!dc_bootstrap_done) { v_dc_offset = v_avg; i_dc_offset = i_avg; dc_bootstrap_done = true; }
+    else { v_dc_offset = 0.95f * v_dc_offset + 0.05f * v_avg; i_dc_offset = 0.95f * i_dc_offset + 0.05f * i_avg; }
+    float phase = atan2f(sogi_v1.v_alpha, -sogi_v1.v_beta); if (phase < 0) phase += 2.0f * M_PI;
+    if (phase_track.initialized) { float d = phase - phase_track.prev_phase; if (d < -M_PI) phase_track.winding++; else if (d > M_PI) phase_track.winding--; } else phase_track.initialized = true;
+    phase_track.prev_phase = phase; float unwrapped = phase + phase_track.winding * 2.0f * M_PI; if (fabsf(unwrapped) > 1000.0f) phase_track.winding = 0;
+    float phase_norm = fmodf(unwrapped, 2.0f * M_PI); if (phase_norm < 0) phase_norm += 2.0f * M_PI;
+    int start = (int)((buf_wr % spc + spc - (int)( (phase_norm/(2.0f*M_PI)) * spc + 0.5f)) % spc);
+    int f_idx = -1; for (int i=0; i<VIS_SNAPSHOT_COUNT; i++) if (!__atomic_load_n(&vis_snapshots[i].in_use, __ATOMIC_ACQUIRE)) { f_idx = i; break; }
+    if (f_idx != -1) {
+        VisSnapshot &s = vis_snapshots[f_idx]; __atomic_store_n(&s.in_use, true, __ATOMIC_RELEASE);
+        memcpy(s.v_copy, v_buf, sizeof(float) * spc); memcpy(s.i_copy, i_buf, sizeof(float) * spc);
+        s.aligned_start = start; s.count = spc; s.pll_freq = fll.freq; s.vdc = v_dc_offset; s.idc = i_dc_offset;
+        xQueueSend(visQueue, &f_idx, 0);
     }
-    float inv_n = 1.0f / (float)spc;
-    float v_avg = v_sum * inv_n;
-    float i_avg = i_sum * inv_n;
-
-    if (!dc_bootstrap_done) {
-        v_dc_offset = v_avg;
-        i_dc_offset = i_avg;
-        dc_bootstrap_done = true;
-    } else {
-        v_dc_offset = 0.98f * v_dc_offset + 0.02f * v_avg;
-        i_dc_offset = 0.98f * i_dc_offset + 0.02f * i_avg;
-    }
-
-    // Nominal virtual sample period in seconds (used as Δt below).
-    float ts_virtual = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
-    uint32_t proc_start = get_cycle_count();
-
-    // ── Phase extrapolation to present moment ─────────────────────────────────
-    // The last P_sogi update was at time t_last = next_sample_time − ticks_per_sample.
-    // The present moment is now = get_cycle_count().
-    // First-order Taylor: φ(t_now) = φ(t_last) + ω̂ · (t_now − t_last)
-    // This is valid for small lag_sec (< 1 period). For larger lags the
-    // nonlinearity of the wrapped phase requires a full SOGI step, not a
-    // linear approximation.
-    //
-    // NOTE on atan2 argument order: atan2(v_alpha, -v_beta) gives the phase
-    // of the signal (not the internal SOGI oscillator phase). The sign on
-    // v_beta follows from the SOGI state convention: v_alpha leads v_beta by
-    // π/2 at steady state, so atan2(α, −β) = atan2(sin φ, cos φ) = φ.
-    // FIXED: Use double precision and fmod for robust phase extrapolation.
-    double phase_corr_d = fmod((double)pll.omega * (double)lag_sec, 2.0 * M_PI);
-    double phase_d = (double)atan2f(sogi_v.v_alpha, -sogi_v.v_beta) + phase_corr_d;
-    // Account for fractional grid offset in visualization phase
-    phase_d -= (next_sample_frac * (double)pll.omega * (double)inv_cpu_freq);
-    phase_d = fmod(phase_d, 2.0 * M_PI);
-    if (phase_d < 0.0) phase_d += 2.0 * M_PI;
-    float phase = (float)phase_d;
-
-    // ── S¹ → ℝ covering map (phase unwrap) ───────────────────────────────────
-    // Detect a jump of magnitude > π between successive wrapped phases and
-    // correct by updating the winding number.
-    if (phase_track.initialized) {
-        float delta = phase - phase_track.prev_phase;
-        if      (delta < -(float)PI) phase_track.winding++;
-        else if (delta >  (float)PI) phase_track.winding--;
-    } else {
-        phase_track.initialized = true;
-    }
-    phase_track.prev_phase = phase;
-
-    // Use double precision to compute unwrapped phase and normalization to
-    // prevent truncation errors.
-    double unwrapped_d = (double)phase + (double)phase_track.winding * 2.0 * M_PI;
-    double phase_norm_d = fmod(unwrapped_d, 2.0 * M_PI);
-    if (phase_norm_d < 0.0) phase_norm_d += 2.0 * M_PI;
-    float phase_norm = (float)phase_norm_d;
-
-    // ── Cycle-aligned buffer start index ─────────────────────────────────────
-    // Compute how many virtual samples back the last zero-crossing was, then
-    // back-index into the circular buffer to find the cycle start.
-    // samples_per_cycle_f = 1 / (f_pll × Δt_virtual) = virtual samples per period.
-    // samples_back        = fractional sample count corresponding to current phase.
-    float samples_per_cycle_f = 1.0f / (pll.freq * ts_virtual);
-    float samples_back        = (phase_norm / (2.0f * (float)PI)) * samples_per_cycle_f;
-    int   curr_head_idx       = (int)(buf_wr % spc);
-    int   aligned_start       = (int)((curr_head_idx
-                                       + spc
-                                       - (int)(samples_back + 0.5f))
-                                      % spc);
-
-    last_cycle_boundary_samples = buf_wr;
-
-    uint32_t proc_end = get_cycle_count();
-    float    core_us  = (float)(proc_end - proc_start) * inv_cpu_freq * 1e6f;
-
-    // ── Dispatch visualiser snapshot ──────────────────────────────────────────
-    // Use pre-allocated buffer pool to avoid per-cycle heap allocation.
-    int free_idx = -1;
-    for (int i = 0; i < VIS_SNAPSHOT_COUNT; i++) {
-        if (!__atomic_load_n(&vis_snapshots[i].in_use, __ATOMIC_ACQUIRE)) {
-            free_idx = i;
-            break;
-        }
-    }
-
-    if (free_idx != -1) {
-        VisSnapshot &snap = vis_snapshots[free_idx];
-        __atomic_store_n(&snap.in_use, true, __ATOMIC_RELEASE);
-
-        memcpy(snap.v_copy, v_buf, sizeof(float) * spc);
-        memcpy(snap.i_copy, i_buf, sizeof(float) * spc);
-        snap.aligned_start = aligned_start;
-        snap.count = (int)spc;
-        snap.pll_freq = pll.freq;
-        snap.pll_mag  = pll.mag_smooth;
-        snap.vdc = v_dc_offset;
-        snap.idc = i_dc_offset;
-
-        if (xQueueSend(visQueue, &free_idx, 0) != pdTRUE) {
-            __atomic_store_n(&snap.in_use, false, __ATOMIC_RELEASE);
-            __atomic_fetch_add(&dropped_snapshots_count, 1u, __ATOMIC_RELAXED);
-        }
-    } else {
-        __atomic_fetch_add(&dropped_snapshots_count, 1u, __ATOMIC_RELAXED);
-    }
-
-    // ── Dispatch serial log snapshot ─────────────────────────────────────────
-    if (++serial_ctr >= SERIAL_EVERY_N_CYCLES) {
-        serial_ctr = 0;
-        SerialMsg sm;
-        sm.pll_freq = pll.freq;
-        sm.core_us  = core_us;
-        sm.isr_callback_count = __atomic_load_n(&isr_callback_count, __ATOMIC_RELAXED);
-        sm.frames_dropped     = __atomic_load_n(&frames_dropped, __ATOMIC_RELAXED);
-        sm.bad_timestamps     = __atomic_exchange_n(&bad_timestamps_count, 0u, __ATOMIC_ACQ_REL);
-
-        uint32_t snap_ok = __atomic_exchange_n(&interp_ok_count, 0u, __ATOMIC_ACQ_REL);
-        uint32_t snap_fail = __atomic_exchange_n(&interp_fail_count, 0u, __ATOMIC_ACQ_REL);
-        sm.interp_ok = snap_ok;
-        sm.interp_total = snap_ok + snap_fail;
-
-        sm.vdc = v_dc_offset;
-        sm.idc = i_dc_offset;
-        sm.harmonic_ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
-
-        if (xQueueSend(logQueue, &sm, 0) != pdTRUE) {
-            __atomic_fetch_add(&dropped_snapshots_count, 1u, __ATOMIC_RELAXED);
-        }
-    }
-
-    // --- OPTIMIZATION: Choose samples_per_cycle to minimize numerical errors ---
-    // Update samples_per_cycle between cycles to avoid race while resampling.
-    uint32_t target_spc = (uint32_t)lrintf(6400.0f / pll.freq);
-    if (target_spc < 100) target_spc = 100;
-    if (target_spc > MAX_SAMPLES_PER_CYCLE) target_spc = MAX_SAMPLES_PER_CYCLE;
-
-    __atomic_store_n(&samples_per_cycle, target_spc, __ATOMIC_RELEASE);
-    updateTimingParameters(pll.freq);
-
-    yield();
+    SerialMsg sm; sm.pll_freq = fll.freq; sm.h3_ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f); sm.h5_ratio = harmonic_mag5_smooth / (harmonic_mag1_smooth + 1e-9f);
+    sm.isr_count = __atomic_load_n(&isr_callback_count, __ATOMIC_RELAXED); sm.dropped = __atomic_load_n(&frames_dropped, __ATOMIC_RELAXED);
+    sm.core_us = (float)(get_cycle_count() - t_start) * inv_cpu_freq * 1e6f;
+    xQueueSend(logQueue, &sm, 0);
+    uint32_t next_spc = (uint32_t)lrintf(TARGET_VIRTUAL_RATE / fll.freq); if (next_spc < MIN_SAMPLES_PER_CYCLE) next_spc = MIN_SAMPLES_PER_CYCLE; if (next_spc > MAX_SAMPLES_PER_CYCLE) next_spc = MAX_SAMPLES_PER_CYCLE;
+    __atomic_store_n(&samples_per_cycle, next_spc, __ATOMIC_RELEASE); updateTimingParameters(fll.freq);
+    last_boundary = buf_wr; yield();
 }

@@ -27,8 +27,8 @@
  *             Maps irregular hardware timestamps → evenly-spaced virtual samples.
  *             Implemented as a box-filter accumulator (nearest-neighbour window).
  *             The window is Haar-wavelet-like: rectangular, length = decimation ratio.
- *             OPTIMIZED: Using double-precision timing (next_sample_time_d) avoids
- *             the rounding accumulation jitter that plagued integer-only variants.
+ *             OPTIMIZED: Using a split integer/fractional virtual timeline avoids
+ *             the rounding accumulation jitter and handles 32-bit wrap-around.
  *
  *  P_sogi   : Bandpass projection operator onto the 2D quadrature subspace {sin(ωt), cos(ωt)}.
  *             Implemented as a Second-Order Generalised Integrator (SOGI).
@@ -84,9 +84,8 @@
  *     for distortion metrics.
  *  3. FIXED: logTask reads harmonic ratio via snapshot queue to prevent
  *     data races on dual-core ESP32.
- *  4. FIXED: Using double-precision for virtual timeline (next_sample_time_d)
- *     and virtual step (ticks_per_sample_d) eliminates quantization-induced
- *     FM noise.
+ *  4. FIXED: Using a split integer/fractional virtual timeline eliminates
+ *     quantization-induced FM noise and ensures infinite-duration stability.
  *  5. FIXED: SOGI pre-warping ensures exact frequency domain matching at
  *     the tracked frequency.
  * =============================================================================
@@ -693,7 +692,7 @@ void IRAM_ATTR loop() {
     }
 
     // Nominal virtual sample period in seconds (used as Δt below).
-    float ts_virtual = (float)ticks_per_sample_d * inv_cpu_freq;
+    float ts_virtual = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
     uint32_t proc_start = get_cycle_count();
 
     // ── Phase extrapolation to present moment ─────────────────────────────────

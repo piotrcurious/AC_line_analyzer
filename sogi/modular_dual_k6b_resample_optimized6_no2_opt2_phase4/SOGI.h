@@ -14,7 +14,7 @@
 #endif
 
 /* =============================================================================
- * UNIFIED TRANSFORM FRAMEWORK — Phase 4 Refined
+ * UNIFIED TRANSFORM FRAMEWORK — Phase 4 Refined (Distortion Correction)
  * =============================================================================
  */
 
@@ -34,7 +34,7 @@ public:
     float getFllError(float input) const;
 
 private:
-    float wz1, wz2;
+    double wz1, wz2; // Double precision for recursive state
     float v_alpha_prev, v_beta_prev;
     float w_rot;
     bool  has_prev_phi;
@@ -55,13 +55,19 @@ public:
     AdaptiveFLL(float nominal_freq, float gamma, float learn_rate = 0.1f);
     void init();
 
+    /**
+     * @brief Update frequency estimate using fused error logic.
+     * @param fll_err Dimensionless phase error from SOGI-FLL law
+     * @param rot_err Dimensionless frequency deviation from phase rotation
+     */
     void update(float fll_err, float rot_err, float ts);
+
     void setDistortionDamping(float p_scale, float learn_scale);
 
-    float freq;
-    float omega;
+    float freq;         // Hz
+    float omega;        // rad/s
     float nominal_freq;
-    float gamma;
+    float gamma;        // FLL gain
     float gain_est;
 
 private:
@@ -73,6 +79,11 @@ private:
     static constexpr int HIST_LEN = 16;
     float phase_hist[HIST_LEN];
     uint8_t hist_idx;
+
+    // Numerical robustness constants
+    static constexpr float OMEGA_MIN = 31.4159f; // 5Hz
+    static constexpr float FREQ_MAX_P = 1.5f;
+    static constexpr float FREQ_MIN_P = 0.6f;
 };
 
 #endif // SOGI_H

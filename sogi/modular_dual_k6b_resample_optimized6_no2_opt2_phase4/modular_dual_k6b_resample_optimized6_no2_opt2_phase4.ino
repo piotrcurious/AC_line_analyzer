@@ -9,7 +9,7 @@
 #include "esp_heap_caps.h"
 
 /* =============================================================================
- * UNIFIED TRANSFORM FRAMEWORK — Phase 4: Full Harmonic Decoupling & Variable N
+ * UNIFIED TRANSFORM FRAMEWORK — Phase 4 Refined: Active Distortion Correction
  * =============================================================================
  */
 
@@ -37,6 +37,9 @@ SOGIVisualizer vis;
 SOGI           sogi_v1(SOGI_K);         // Fundamental
 SOGI           sogi_v3(SOGI_K);         // 3rd Harmonic
 SOGI           sogi_v5(SOGI_K);         // 5th Harmonic
+SOGI           sogi_v7(SOGI_K);         // 7th Harmonic
+SOGI           sogi_v9(SOGI_K);         // 9th Harmonic
+SOGI           sogi_v11(SOGI_K);        // 11th Harmonic
 AdaptiveFLL    fll(NOMINAL_FREQ, FLL_GAMMA, FLL_LEARN_RATE);
 
 // ── DMA frame ring ──────────────────────────────────────────────────────────
@@ -70,7 +73,8 @@ float v_dc_offset = 1650.0f; float i_dc_offset = 1650.0f; bool dc_bootstrap_done
 
 struct PhaseTrack { float prev_phase = 0.0f; int32_t winding = 0; bool initialized = false; } phase_track;
 #define HARMONIC_SMOOTH_ALPHA 0.02f
-float harmonic_mag1_smooth = 1e-6f; float harmonic_mag3_smooth = 1e-6f; float harmonic_mag5_smooth = 1e-6f;
+float harmonic_mag1_smooth = 1e-6f; float harmonic_mag3_smooth = 1e-6f; float harmonic_mag5_smooth = 1e-6f; float harmonic_mag7_smooth = 1e-6f;
+float harmonic_mag9_smooth = 1e-6f; float harmonic_mag11_smooth = 1e-6f;
 
 TaskHandle_t visTaskHandle = NULL; TaskHandle_t logTaskHandle = NULL;
 QueueHandle_t visQueue = NULL; QueueHandle_t logQueue = NULL;
@@ -79,7 +83,7 @@ struct VisSnapshot { float v_copy[MAX_SAMPLES_PER_CYCLE]; float i_copy[MAX_SAMPL
 #define VIS_SNAPSHOT_COUNT 4
 VisSnapshot vis_snapshots[VIS_SNAPSHOT_COUNT];
 
-struct SerialMsg { float pll_freq; float core_us; uint32_t isr_count; uint32_t dropped; float h3_ratio; float h5_ratio; };
+struct SerialMsg { float pll_freq; float core_us; uint32_t isr_count; uint32_t dropped; float h3_ratio; float h5_ratio; float h7_ratio; float h9_ratio; float h11_ratio; };
 
 static inline uint32_t IRAM_ATTR get_cycle_count() { uint32_t ccount; asm volatile("rsr %0, ccount" : "=a"(ccount)); return ccount; }
 static inline float IRAM_ATTR adcRawToMillivolts(uint16_t raw) { return (float)raw * (3300.0f / 4095.0f); }
@@ -124,23 +128,38 @@ void IRAM_ATTR processIncomingDMA() {
                     float v_val = (float)(resamp.acc_v / resamp.acc_weight); float i_val = (float)(resamp.acc_i / resamp.acc_weight);
                     v_buf[buf_wr % spc] = v_val; i_buf[buf_wr % spc] = i_val;
                     float u = v_val - v_dc_offset;
-                    // Full Harmonic Decoupling: Fundamental - 3rd - 5th
-                    float u1 = u - sogi_v3.v_alpha - sogi_v5.v_alpha;
-                    float u3 = u - sogi_v1.v_alpha - sogi_v5.v_alpha;
-                    float u5 = u - sogi_v1.v_alpha - sogi_v3.v_alpha;
+                    // Full Harmonic Decoupling: Fundamental - 3rd - 5th - 7th
+                    float v_sum_harmonics = sogi_v3.v_alpha + sogi_v5.v_alpha + sogi_v7.v_alpha + sogi_v9.v_alpha + sogi_v11.v_alpha;
+                    float u1 = u - v_sum_harmonics;
+                    float u3 = u - (v_sum_harmonics - sogi_v3.v_alpha + sogi_v1.v_alpha);
+                    float u5 = u - (v_sum_harmonics - sogi_v5.v_alpha + sogi_v1.v_alpha);
+                    float u7 = u - (v_sum_harmonics - sogi_v7.v_alpha + sogi_v1.v_alpha);
+                    float u9 = u - (v_sum_harmonics - sogi_v9.v_alpha + sogi_v1.v_alpha);
+                    float u11 = u - (v_sum_harmonics - sogi_v11.v_alpha + sogi_v1.v_alpha);
+
                     float ts_v = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
-                    sogi_v1.step(u1, fll.omega, ts_v); sogi_v3.step(u3, 3.0f * fll.omega, ts_v); sogi_v5.step(u5, 5.0f * fll.omega, ts_v);
+                    sogi_v1.step(u1, fll.omega, ts_v);
+                    sogi_v3.step(u3, 3.0f * fll.omega, ts_v);
+                    sogi_v5.step(u5, 5.0f * fll.omega, ts_v);
+                    sogi_v7.step(u7, 7.0f * fll.omega, ts_v);
+                    sogi_v9.step(u9, 9.0f * fll.omega, ts_v);
+                    sogi_v11.step(u11, 11.0f * fll.omega, ts_v);
+
                     float mag1 = sqrtf(sogi_v1.v_alpha*sogi_v1.v_alpha + sogi_v1.v_beta*sogi_v1.v_beta + 1e-3f);
                     float mag3 = sqrtf(sogi_v3.v_alpha*sogi_v3.v_alpha + sogi_v3.v_beta*sogi_v3.v_beta + 1e-3f);
                     float mag5 = sqrtf(sogi_v5.v_alpha*sogi_v5.v_alpha + sogi_v5.v_beta*sogi_v5.v_beta + 1e-3f);
+                    float mag7 = sqrtf(sogi_v7.v_alpha*sogi_v7.v_alpha + sogi_v7.v_beta*sogi_v7.v_beta + 1e-3f);
+                    float mag9 = sqrtf(sogi_v9.v_alpha*sogi_v9.v_alpha + sogi_v9.v_beta*sogi_v9.v_beta + 1e-3f);
+                    float mag11 = sqrtf(sogi_v11.v_alpha*sogi_v11.v_alpha + sogi_v11.v_beta*sogi_v11.v_beta + 1e-3f);
+
                     harmonic_mag1_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag1_smooth + HARMONIC_SMOOTH_ALPHA * mag1;
                     harmonic_mag3_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag3_smooth + HARMONIC_SMOOTH_ALPHA * mag3;
                     harmonic_mag5_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag5_smooth + HARMONIC_SMOOTH_ALPHA * mag5;
-                    float ratio = (harmonic_mag3_smooth + harmonic_mag5_smooth) / (harmonic_mag1_smooth + 1e-9f);
-                    float damp = 1.0f; if (ratio > 0.1f) damp = 1.0f - (ratio - 0.1f) * 2.5f; if (damp < 0.01f) damp = 0.01f;
+                    harmonic_mag7_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag7_smooth + HARMONIC_SMOOTH_ALPHA * mag7;
+                    harmonic_mag9_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag9_smooth + HARMONIC_SMOOTH_ALPHA * mag9;
+                    harmonic_mag11_smooth = (1.0f - HARMONIC_SMOOTH_ALPHA) * harmonic_mag11_smooth + HARMONIC_SMOOTH_ALPHA * mag11;
                     float fll_err = sogi_v1.getFllError(u1);
-                    float rot_err = (sogi_v1.getRotationRate() - fll.omega) / (fll.omega + 1.0f); // Normalized dimensionless rot_err
-                    fll.setDistortionDamping(damp, (ratio > 0.2f ? 0.0f : 1.0f));
+                    float rot_err = (sogi_v1.getRotationRate() - fll.omega) / (fll.omega + 1.0f);
                     fll.update(fll_err, rot_err, ts_v);
                     buf_wr++;
                 }
@@ -165,8 +184,8 @@ void visTask(void *pv) {
 
 void logTask(void *pv) {
     SerialMsg msg; for (;;) { if (xQueueReceive(logQueue, &msg, portMAX_DELAY) == pdTRUE) {
-        Serial.printf("F:%.4fHz  H3:%.3f  H5:%.3f  Core:%.1fus  ISR:%lu  Drop:%lu\n",
-            msg.pll_freq, msg.h3_ratio, msg.h5_ratio, msg.core_us, (unsigned long)msg.isr_count, (unsigned long)msg.dropped);
+        Serial.printf("F:%.4fHz  H3:%.3f  H5:%.3f  H7:%.3f  H9:%.3f  H11:%.3f  Core:%.1fus  ISR:%lu\n",
+            msg.pll_freq, msg.h3_ratio, msg.h5_ratio, msg.h7_ratio, msg.h9_ratio, msg.h11_ratio, msg.core_us, (unsigned long)msg.isr_count);
     } }
 }
 
@@ -203,7 +222,12 @@ void loop() {
         s.aligned_start = start; s.count = spc; s.pll_freq = fll.freq; s.vdc = v_dc_offset; s.idc = i_dc_offset;
         xQueueSend(visQueue, &f_idx, 0);
     }
-    SerialMsg sm; sm.pll_freq = fll.freq; sm.h3_ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f); sm.h5_ratio = harmonic_mag5_smooth / (harmonic_mag1_smooth + 1e-9f);
+    SerialMsg sm; sm.pll_freq = fll.freq;
+    sm.h3_ratio = harmonic_mag3_smooth / (harmonic_mag1_smooth + 1e-9f);
+    sm.h5_ratio = harmonic_mag5_smooth / (harmonic_mag1_smooth + 1e-9f);
+    sm.h7_ratio = harmonic_mag7_smooth / (harmonic_mag1_smooth + 1e-9f);
+    sm.h9_ratio = harmonic_mag9_smooth / (harmonic_mag1_smooth + 1e-9f);
+    sm.h11_ratio = harmonic_mag11_smooth / (harmonic_mag1_smooth + 1e-9f);
     sm.isr_count = __atomic_load_n(&isr_callback_count, __ATOMIC_RELAXED); sm.dropped = __atomic_load_n(&frames_dropped, __ATOMIC_RELAXED);
     sm.core_us = (float)(get_cycle_count() - t_start) * inv_cpu_freq * 1e6f;
     xQueueSend(logQueue, &sm, 0);

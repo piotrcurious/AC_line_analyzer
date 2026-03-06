@@ -49,9 +49,13 @@ void IRAM_ATTR SOGI::step(float input, float omega, float ts) {
         updateCoefficients(omega, ts);
     }
     v_alpha_prev = v_alpha; v_beta_prev  = v_beta;
-    float w0 = input - a_a1 * wz1 - a_a2 * wz2;
-    v_alpha = a_b0 * w0 + a_b2 * wz2;
-    v_beta = b_b0 * w0 + b_b1 * wz1 + b_b2 * wz2;
+
+    // Recursive update in double precision to minimize noise floor
+    double u = (double)input;
+    double w0 = u - (double)a_a1 * wz1 - (double)a_a2 * wz2;
+    v_alpha = (float)( (double)a_b0 * w0 + (double)a_b2 * wz2 );
+    v_beta  = (float)( (double)b_b0 * w0 + (double)b_b1 * wz1 + (double)b_b2 * wz2 );
+
     wz2 = wz1; wz1 = w0;
 
     float mag_sq = v_alpha * v_alpha + v_beta * v_beta;
@@ -70,8 +74,9 @@ void IRAM_ATTR SOGI::step(float input, float omega, float ts) {
 
 float SOGI::getFllError(float input) const {
     float mag_sq = v_alpha * v_alpha + v_beta * v_beta + MAG_EPS;
-    // Reversed sign: positive means input is FASTER than tuned omega
-    return (v_alpha - input) * v_beta / mag_sq;
+    // Dimensionally consistent FLL error (multiplying by k)
+    // Positive means input is FASTER than tuned omega
+    return k * (v_alpha - input) * v_beta / mag_sq;
 }
 
 // ── AdaptiveFLL Implementation ───────────────────────────────────────────────
@@ -94,22 +99,28 @@ void AdaptiveFLL::setDistortionDamping(float p_scale, float learn_scale) {
 }
 
 void AdaptiveFLL::update(float fll_err, float rot_err, float ts) {
-    // Both inputs are dimensionless frequency deviations (positive = input is faster)
+    // Both inputs are frequency deviations (positive = input is faster)
     float diff = fll_err - rot_err;
-    float agree = 1.0f / (1.0f + 25.0f * diff * diff);
-    float fused_err = fll_err * agree + rot_err * (1.0f - agree) * 0.1f;
+    // Refined agreement logic: sharp rejection of transients
+    float agree = 1.0f / (1.0f + 100.0f * diff * diff);
 
+    // If the SOGI phase error (fll_err) disagrees with the phase rotation rate (rot_err),
+    // it means the SOGI state is being jerked by a waveform shape change (distortion).
+    // We TRUST the rotation rate (rot_err) more during these periods.
+    float fused_err = fll_err * agree + rot_err * (1.0f - agree);
+
+    // NLMS Gain Identification
     uint8_t prev_idx = (hist_idx + HIST_LEN - 1) & (HIST_LEN - 1);
     float prev_phase = phase_hist[prev_idx];
     float dy = fused_err - prev_phase;
-    float control = (gamma * p_scale_factor) * prev_phase * ts;
+    float control = gamma * prev_phase * ts;
     float denom = control * control + 1e-9f;
     float err_gain = dy - gain_est * control;
     gain_est += (learn_rate * learn_scale_factor) * (control * err_gain) / denom;
     if (gain_est < 0.01f) gain_est = 0.01f; if (gain_est > 5.0f) gain_est = 5.0f;
 
-    // SOGI-FLL Law: ω̇ = γ · ε
-    float d_omega = (gamma * p_scale_factor) * fused_err * ts;
+    // SOGI-FLL Law: ω̇ = γ · fused_err
+    float d_omega = gamma * fused_err * ts;
 
     // Kahan summation frequency integrator
     float y = d_omega - integral_err_c;
@@ -117,7 +128,9 @@ void AdaptiveFLL::update(float fll_err, float rot_err, float ts) {
     integral_err_c = (t - omega) - y;
     omega = t;
 
-    float f_max = nominal_freq * 1.5f; float f_min = nominal_freq * 0.6f;
+    // Numerical Clamping
+    float f_max = nominal_freq * FREQ_MAX_P;
+    float f_min = nominal_freq * FREQ_MIN_P;
     freq = omega / TWO_PI_F;
     if (freq > f_max) { freq = f_max; omega = TWO_PI_F * freq; }
     else if (freq < f_min) { freq = f_min; omega = TWO_PI_F * freq; }

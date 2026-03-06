@@ -47,6 +47,9 @@ uint32_t last_cycle_boundary_samples = 0;
 SOGI sogi_v1(SOGI_K);
 SOGI sogi_v3(SOGI_K);
 SOGI sogi_v5(SOGI_K);
+SOGI sogi_v7(SOGI_K);
+SOGI sogi_v9(SOGI_K);
+SOGI sogi_v11(SOGI_K);
 AdaptiveFLL fll(NOMINAL_FREQ, FLL_GAMMA, 0.1f);
 
 struct ResamplerState {
@@ -113,32 +116,32 @@ void processFrame(const std::vector<adc_digi_output_data_t>& frame_data, uint32_
                 v_buf[buf_wr % spc] = v_val; i_buf[buf_wr % spc] = i_val;
 
                 float u = v_val - v_dc_offset;
-                float u1 = u - sogi_v3.v_alpha - sogi_v5.v_alpha;
-                float u3 = u - sogi_v1.v_alpha - sogi_v5.v_alpha;
-                float u5 = u - sogi_v1.v_alpha - sogi_v3.v_alpha;
+                float v_sum_harmonics = sogi_v3.v_alpha + sogi_v5.v_alpha + sogi_v7.v_alpha + sogi_v9.v_alpha + sogi_v11.v_alpha;
+                float u1 = u - v_sum_harmonics;
+                float u3 = u - (v_sum_harmonics - sogi_v3.v_alpha + sogi_v1.v_alpha);
+                float u5 = u - (v_sum_harmonics - sogi_v5.v_alpha + sogi_v1.v_alpha);
+                float u7 = u - (v_sum_harmonics - sogi_v7.v_alpha + sogi_v1.v_alpha);
+                float u9 = u - (v_sum_harmonics - sogi_v9.v_alpha + sogi_v1.v_alpha);
+                float u11 = u - (v_sum_harmonics - sogi_v11.v_alpha + sogi_v1.v_alpha);
+
                 float ts_v = (float)((double)ticks_per_sample_int + ticks_per_sample_frac) * inv_cpu_freq;
 
                 sogi_v1.step(u1, fll.omega, ts_v);
                 sogi_v3.step(u3, 3.0f * fll.omega, ts_v);
                 sogi_v5.step(u5, 5.0f * fll.omega, ts_v);
+                sogi_v7.step(u7, 7.0f * fll.omega, ts_v);
+                sogi_v9.step(u9, 9.0f * fll.omega, ts_v);
+                sogi_v11.step(u11, 11.0f * fll.omega, ts_v);
 
                 float mag1 = sqrt(sogi_v1.v_alpha*sogi_v1.v_alpha + sogi_v1.v_beta*sogi_v1.v_beta + 1e-3);
-                float mag3 = sqrt(sogi_v3.v_alpha*sogi_v3.v_alpha + sogi_v3.v_beta*sogi_v3.v_beta + 1e-3);
-                float mag5 = sqrt(sogi_v5.v_alpha*sogi_v5.v_alpha + sogi_v5.v_beta*sogi_v5.v_beta + 1e-3);
-                float ratio = (mag3 + mag5) / (mag1 + 1e-3);
-
-                float damp = 1.0f;
-                if (ratio > 0.1f) damp = 1.0f - (ratio - 0.1f) * 2.5f;
-                if (damp < 0.01f) damp = 0.01f;
 
                 float fll_err = sogi_v1.getFllError(u1);
                 float rot_err = (sogi_v1.getRotationRate() - fll.omega) / (fll.omega + 1.0f);
 
-                fll.setDistortionDamping(damp, (ratio > 0.2f ? 0.0f : 1.0f));
                 fll.update(fll_err, rot_err, ts_v);
 
                 buf_wr++;
-                std::cout << std::fixed << std::setprecision(6) << "V_SAMPLE," << v_val << "," << fll.freq << "," << mag1 << "," << ratio << "," << fll.gain_est << std::endl;
+                std::cout << std::fixed << std::setprecision(6) << "V_SAMPLE," << v_val << "," << fll.freq << "," << mag1 << "," << fll_err << "," << fll.gain_est << std::endl;
             }
 
             resamp.acc_v = 0.0; resamp.acc_i = 0.0; resamp.acc_weight = 0.0;

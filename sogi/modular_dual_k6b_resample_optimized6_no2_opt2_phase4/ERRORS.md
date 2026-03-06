@@ -23,16 +23,16 @@ The system adaptively adjusts the number of virtual samples per cycle $N \in [10
     - **Double-Precision Accumulators:** `acc_v`, `acc_i`, and `acc_weight` are now `double` precision. This ensures that the integration of the box filter maintains 12-bit ADC fidelity even at high oversampling rates.
 
 ### C. Harmonic Leakage & Distortion
-- **Source:** Standard SOGI filters leak harmonic energy into the fundamental estimate, causing frequency rippling.
+- **Source:** Standard SOGI filters leak harmonic energy into the fundamental estimate, causing frequency rippling. Square waves contain significant energy in high-order odd harmonics (3, 5, 7, 9, 11...).
 - **Mitigation:**
-    - **Full Structural Decoupling:** Implemented a recursive isolation structure ($u_1 = u - v_{\alpha 3} - v_{\alpha 5}$). By subtracting the estimated 3rd and 5th harmonics from the fundamental's input, the "clean" fundamental is isolated without high-order filters.
-    - **Distortion Verification:** A fused error logic compares the SOGI phase-error estimate with the instantaneous phase rotation rate. Updates are gated by an "Agreement" factor, preventing waveform shape changes (e.g., Sine -> Square) from being misidentified as frequency shifts.
+    - **High-Order Structural Decoupling:** Expanded the recursive isolation structure to include the 3rd, 5th, 7th, 9th, and 11th harmonics. Each SOGI stage $H_n$ is driven by $u_n = u - \sum_{i \neq n} v_{\alpha i}$, effectively creating a notch-filter effect for all other modeled harmonics without adding group delay.
+    - **Active Phase Distortion Correction:** Replaced the "damping" approach with a "Verification" logic. The FLL fused error is $e_{fused} = e_{fll} \cdot A + e_{rot} \cdot (1-A)$, where $A$ is the "Agreement" factor between SOGI phase-error ($e_{fll}$) and instantaneous rotation rate ($e_{rot}$). This prioritizes the physically-anchored period measurement during rapid waveform shape transitions.
 
 ### D. SOGI Numerical Stability
-- **Source:** Recursive IIR filters are sensitive to coefficient quantization and state precision.
+- **Source:** Recursive IIR filters are sensitive to coefficient quantization and state precision. Small errors in the state can accumulate, raising the noise floor and preventing high-precision frequency lock.
 - **Mitigation:**
-    - **Tustin Transform:** The SOGI coefficients are derived via the bilinear transform, ensuring stability and mapping the analog resonance perfectly to the digital domain.
-    - **Shared State Implementation:** Using a single Direct-Form II state pair $(w_{z1}, w_{z2})$ for both $\alpha$ and $\beta$ outputs reduces the total number of operations and prevents numerical divergence between the quadrature components.
+    - **Double-Precision Recursive State:** The SOGI delay registers ($w_{z1}, w_{z2}$) now use `double` precision. This provides 53 bits of mantissa, ensuring that the resonant accumulation of signal energy does not lose precision even when oversampled at 250kHz.
+    - **Shared State Implementation:** A single Direct-Form II state pair is used for both $\alpha$ and $\beta$ outputs.
 
 ### E. PLL Convergence and Steady-State Error
 - **Source:** A standard Type-1 PLL has zero steady-state error for phase but non-zero for frequency if the integrator is missing.

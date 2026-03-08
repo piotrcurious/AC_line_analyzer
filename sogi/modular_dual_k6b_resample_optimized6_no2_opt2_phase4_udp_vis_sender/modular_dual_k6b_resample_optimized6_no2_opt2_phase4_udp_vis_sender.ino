@@ -215,6 +215,8 @@ void visTask(void *pv) {
                 udp.beginPacket(udpAddress, udpPort);
                 udp.write((uint8_t*)&packet, sizeof(packet));
                 udp.endPacket();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
 
             // Local visualization (optional)
@@ -238,22 +240,33 @@ void logTask(void *pv) {
 void setup() {
     Serial.begin(115200); delay(100);
 
+    // Initialize WiFi first and wait for connection to avoid Flash bus contention
+    // with high-rate ADC interrupts/code later.
     Serial.printf("Connecting to %s\n", ssid);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
-    // We don't block here forever to allow ADC to start if needed,
-    // but visTask checks status before sending.
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
 
     cpu_freq_hz = (uint32_t)ESP.getCpuFreqMHz() * 1000000U; inv_cpu_freq = 1.0f / (float)cpu_freq_hz;
     cycles_per_adc_sample = cpu_freq_hz / (ADC_OVERSAMPLE_RATE / 2); updateTimingParameters(NOMINAL_FREQ); vis.begin();
+
     adc_continuous_handle_cfg_t cfg = { .max_store_buf_size = 4096, .conv_frame_size = CONV_FRAME_SIZE }; adc_continuous_new_handle(&cfg, &adc_handle);
     adc_digi_pattern_config_t pat[2]; pat[0] = { .atten = ADC_ATTEN_DB_12, .channel = V_CHANNEL, .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 };
     pat[1] = { .atten = ADC_ATTEN_DB_12, .channel = I_CHANNEL, .unit = ADC_UNIT_1, .bit_width = ADC_BITWIDTH_12 };
     adc_continuous_config_t dig = { .pattern_num = 2, .adc_pattern = pat, .sample_freq_hz = ADC_OVERSAMPLE_RATE, .conv_mode = ADC_CONV_SINGLE_UNIT_1, .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1 };
     adc_continuous_config(adc_handle, &dig);
     adc_continuous_evt_cbs_t cbs = { .on_conv_done = adc_conv_done_callback }; adc_continuous_register_event_callbacks(adc_handle, &cbs, NULL); adc_continuous_start(adc_handle);
+
     visQueue = xQueueCreate(VIS_SNAPSHOT_COUNT, sizeof(int)); logQueue = xQueueCreate(8, sizeof(SerialMsg));
     for (int i=0; i<VIS_SNAPSHOT_COUNT; i++) vis_snapshots[i].in_use = false;
-    xTaskCreatePinnedToCore(visTask, "vis", 8192, NULL, 2, &visTaskHandle, 0); xTaskCreatePinnedToCore(logTask, "log", 4096, NULL, 1, &logTaskHandle, 0);
+
+    // Pinning to Core 1 to keep Core 0 free for WiFi and avoiding cache conflicts
+    xTaskCreatePinnedToCore(visTask, "vis", 8192, NULL, 2, &visTaskHandle, 1);
+    xTaskCreatePinnedToCore(logTask, "log", 4096, NULL, 1, &logTaskHandle, 1);
 }
 
 void loop() {

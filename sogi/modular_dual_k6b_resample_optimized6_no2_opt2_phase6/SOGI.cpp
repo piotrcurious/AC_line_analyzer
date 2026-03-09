@@ -106,10 +106,12 @@ void IRAM_ATTR AdaptiveFLL::update(float u, float v_alpha, float v_beta, float t
     }
 
     // 2. Normalized FLL Discriminator
-    // e = (v_alpha - u) * v_beta / (|v|^2 + 1)
-    // Reframed as projection error cross-product. Sign corrected for negative feedback.
+    // e = -(u - v_alpha) * v_beta / (|v|^2 + 1)
+    // Reframed as projection error cross-product.
+    // If omega < omega_grid, v_alpha lags u -> (u - v_alpha) has positive projection on v_beta.
+    // In our coordinate system, v_beta lags v_alpha by 90 deg.
     float mag_sq = v_alpha * v_alpha + v_beta * v_beta;
-    float raw_err = (v_alpha - u) * v_beta / (mag_sq + 1.0f);
+    float raw_err = -(u - v_alpha) * v_beta / (mag_sq + 1.0f);
 
     // 3. Cycle Averaging (2w ripple rejection)
     avg_sum -= (double)avg_buf[avg_idx];

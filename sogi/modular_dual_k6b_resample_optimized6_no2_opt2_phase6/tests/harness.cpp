@@ -5,7 +5,7 @@
 #include "../SOGI.h"
 
 int main() {
-    UnifiedSOGIAnalyzer analyzer(50.0f, 0.7071f, 2500.0f);
+    UnifiedSOGIAnalyzer analyzer(50.0f, 0.7071f, 100.0f);
 
     double v_raw, i_raw;
     const double fs_hw = 250000.0;
